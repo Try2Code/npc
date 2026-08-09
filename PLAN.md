@@ -648,9 +648,9 @@ the suite passes here.
    empty strings, absent EXIF, and a NEF with no embedded preview. Under Miri where
    applicable, ASan for the C++ side. FFI is the risk this design adds, so it's tested as one.
 8. **Stacking against real data** — scanning `test-data` must produce 1722 stacks, not 2904.
-   Every `_NEF_embedded.jpg` folds into its parent, every `.pp3` attaches as a `profile`
-   member, and `08/09` resolves to exactly 71 stacks of three members each. This is the
-   assertion that catches the phantom-stack bug, and it can only be written against your data.
+   Every `_NEF_embedded.jpg` folds into its parent and `08/09` resolves to exactly 71 stacks
+   of three members each. This is the assertion that catches the phantom-stack bug, and it can
+   only be written against your data.
 9. **Unit tests** — query parser against golden SQL; volume resolution against synthetic
    mountinfo; change detection against fabricated stat data; event derivation across gap
    boundaries; cache-key invalidation on mtime.

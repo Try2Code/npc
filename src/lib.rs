@@ -8,6 +8,7 @@
 pub mod action;
 pub mod config;
 pub mod db;
+pub mod doctor;
 pub mod dupes;
 pub mod edit;
 pub mod export;

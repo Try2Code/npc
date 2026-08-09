@@ -171,6 +171,14 @@ enum Cmd {
         #[arg(long, num_args = 2, value_names = ["ID", "NAME"])]
         name: Option<Vec<String>>,
     },
+    /// Check the catalog against what is actually on disk.
+    Doctor {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Exit non-zero if anything needs attention, for scripting
+        #[arg(long)]
+        strict: bool,
+    },
     /// Report shots that appear more than once.
     Dupes {
         #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
@@ -655,6 +663,52 @@ fn main() -> Result<()> {
                 println!("no events yet; run `photo scan` first");
             } else {
                 println!("\nname one with: photo events --name <id> \"<name>\"");
+            }
+        }
+
+        Cmd::Doctor { root, strict } => {
+            let config = npc::config::Config::load()?;
+            let cat = open_for(&root)?;
+            println!("{}\n", cat.path.display());
+
+            let findings = npc::doctor::run(&cat, &root, &config)?;
+            let mut warnings = 0;
+
+            for f in &findings {
+                println!("{}  {}", f.severity.marker(), f.title);
+                for line in &f.detail {
+                    println!("        {line}");
+                }
+                if f.severity != npc::doctor::Severity::Fine {
+                    if let Some(r) = &f.remedy {
+                        // Wrap the remedy so it reads as prose rather than one
+                        // very long line.
+                        let mut col = 0;
+                        print!("        ");
+                        for word in r.split_whitespace() {
+                            if col + word.len() > 66 {
+                                print!("\n        ");
+                                col = 0;
+                            }
+                            print!("{word} ");
+                            col += word.len() + 1;
+                        }
+                        println!();
+                    }
+                }
+                if f.severity == npc::doctor::Severity::Warn {
+                    warnings += 1;
+                }
+                println!();
+            }
+
+            if warnings == 0 {
+                println!("nothing needs attention");
+            } else {
+                println!("{warnings} thing(s) need attention");
+            }
+            if strict && warnings > 0 {
+                std::process::exit(1);
             }
         }
 

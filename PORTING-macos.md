@@ -54,9 +54,32 @@ test that does not touch sidecars and *then destroys metadata in the field*:
 exiv2 --verbose --version | grep xmptoolkit    # expect have_xmptoolkit=1
 ```
 
-A terminal with the kitty graphics protocol, for thumbnails: **kitty**,
-**Ghostty** or **WezTerm**. iTerm2 has its own protocol which `ratatui-image`
-also speaks. Terminal.app has no image support at all.
+### A terminal that can draw images
+
+Thumbnails need a terminal graphics protocol. This is the one area where macOS
+is *better served* than Linux — several good options, all natively supported.
+
+| terminal | install | protocol |
+|---|---|---|
+| **kitty** | `brew install --cask kitty` | kitty graphics — the reference implementation |
+| **Ghostty** | `brew install --cask ghostty` | kitty graphics; macOS-native, arguably the best fit |
+| **WezTerm** | `brew install --cask wezterm` | kitty + iTerm2 + sixel |
+| **iTerm2** | `brew install --cask iterm2` | its own inline-image protocol, which `ratatui-image` speaks |
+| Terminal.app | preinstalled | **none** — thumbnails degrade to unreadable half-blocks |
+
+kitty is a *cask* rather than a formula, because on macOS it ships as an app
+bundle. Nothing about the thumbnail path needs porting; it is the same code
+negotiating the same protocol.
+
+**Run `npc term` before judging thumbnail quality.** It reports which protocol
+was actually negotiated, the cell size in pixels, and the resulting tile size.
+
+This is not a formality. On the Linux machine this was built on, three rounds
+went into tuning thumbnail resolution before anyone discovered the program was
+not running inside kitty at all — kitty was installed, but the TUI had been
+launched from a terminal with no image support, and the half-block fallback
+looks exactly like a resolution problem. `npc term` answers in one line what
+took hours to work out.
 
 ## 2. First build
 
@@ -220,7 +243,28 @@ top of each script and set a variable.
   Worth knowing only if that convention changes. A `doctor` check for
   case-colliding names would be cheap insurance if it ever does.
 
-## 6. Order of work
+## 6. Checking the thumbnails
+
+Once `vol.rs` is done and a library scans, verify the display path
+independently of it:
+
+```sh
+npc term                      # which protocol, cell size, resulting tile size
+npc thumbs                    # pre-warm; reports throughput
+npc tui                       # grid view, run inside one of the terminals above
+```
+
+Expect the tile sizing to want retuning. `grid_px` and `view_px` in the config
+were derived from a 3440x1440 display; on a Retina panel the pixel-per-cell
+ratio is different and the defaults will be conservative. `-` and `+` change
+the number of tiles across while the TUI is running, which is the fastest way
+to find the right value before writing it into the config.
+
+`view_px` should match the preview tier your camera embeds — 1620 for a D750.
+Asking for more forces a full-resolution decode per frame, which is a 6x
+slowdown for no visible gain.
+
+## 7. Order of work
 
 1. Install prerequisites; confirm `pkg-config --modversion exiv2` and
    `have_xmptoolkit=1`.
@@ -232,6 +276,7 @@ top of each script and set a variable.
 6. `./check` — green, except the two script fixes.
 7. Fix `check` and `fetch-test-data` for BSD tools.
 8. Verify against a real removable drive, **including ejected**.
+9. `npc term`, then the TUI, in one of the image-capable terminals.
 
 Steps 1–4 are an hour. Step 5 is the port. Step 8 is the one that will find
 the bug.

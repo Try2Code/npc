@@ -23,7 +23,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui_image::picker::Picker;
-use ratatui_image::{Image, Resize};
+use ratatui_image::StatefulImage;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -106,10 +106,13 @@ pub struct App {
     cache: Option<thumbs::Cache>,
     /// Decoded images ready to draw, keyed by cache-file path. Bounded so a
     /// long scroll cannot grow without limit.
-    images: HashMap<PathBuf, ratatui_image::protocol::Protocol>,
+    images: HashMap<PathBuf, ratatui_image::protocol::StatefulProtocol>,
     picker: Option<Picker>,
     /// Which member of the stack the single view is showing.
     member: usize,
+    /// Tiles across in grid view. Adjustable live, because the right value
+    /// depends on font size and window, which only the user can see.
+    grid_cols: u16,
 }
 
 impl App {
@@ -149,6 +152,7 @@ impl App {
             images: HashMap::new(),
             picker: None,
             member: 0,
+            grid_cols: 5,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -284,6 +288,21 @@ impl App {
             self.cache = thumbs::Cache::new(&v.uuid).ok();
         }
         self.picker = Picker::from_query_stdio().ok();
+        // Say plainly what was detected. A silent fallback to halfblocks looks
+        // like broken thumbnails rather than an unsupported terminal.
+        self.status = match self.picker.as_ref() {
+            Some(p) => {
+                let (cw, ch) = p.font_size();
+                match p.protocol_type() {
+                    ratatui_image::picker::ProtocolType::Halfblocks => format!(
+                        "no graphics protocol - falling back to halfblocks ({cw}x{ch}px cells). \
+                         Photos will not be identifiable. Run `photo term` to diagnose."
+                    ),
+                    other => format!("{other:?} graphics, {cw}x{ch}px cells. ? for help."),
+                }
+            }
+            None => "terminal graphics query failed; thumbnails unavailable".into(),
+        };
     }
 
     /// Cached thumbnail for a row, decoded and ready to draw. Returns `None`
@@ -306,22 +325,13 @@ impl App {
         let Ok(img) = image::open(path) else {
             return false;
         };
-        let protocol = picker.new_protocol(
-            img,
-            Rect::new(0, 0, 40, 20),
-            Resize::Fit(None),
-        );
-        match protocol {
-            Ok(p) => {
-                // Bounded: a long scroll must not grow this without limit.
-                if self.images.len() > 120 {
-                    self.images.clear();
-                }
-                self.images.insert(path.clone(), p);
-                true
-            }
-            Err(_) => false,
+        let protocol = picker.new_resize_protocol(img);
+        // Bounded: a long scroll must not grow this without limit.
+        if self.images.len() > 120 {
+            self.images.clear();
         }
+        self.images.insert(path.clone(), protocol);
+        true
     }
 
     /// Queue thumbnails around the cursor so scrolling finds them ready.
@@ -562,6 +572,16 @@ impl App {
             }
             KeyCode::BackTab => {
                 self.sidebar_focus = !self.sidebar_focus;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') if self.view == View::Grid => {
+                self.grid_cols = (self.grid_cols + 1).min(12);
+                self.images.clear();
+                self.status = format!("{} tiles across (smaller)", self.grid_cols);
+            }
+            KeyCode::Char('-') if self.view == View::Grid => {
+                self.grid_cols = self.grid_cols.saturating_sub(1).max(1);
+                self.images.clear();
+                self.status = format!("{} tiles across (bigger)", self.grid_cols);
             }
             KeyCode::Char('o') => {
                 let n = self.current_members().len().max(1);
@@ -860,10 +880,15 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        const TW: u16 = 22;
-        const TH: u16 = 11;
-        let cols = (inner.width / TW).max(1);
-        let rows_fit = (inner.height / TH).max(1);
+        // Tiles are sized from the window rather than fixed: a thumbnail can
+        // only occupy whole character cells, so the number across is what
+        // actually determines resolution.
+        let cols = self.grid_cols.clamp(1, inner.width.max(1));
+        let tw = (inner.width / cols).max(4);
+        // Keep tiles roughly square in pixels. Cells are about twice as tall
+        // as they are wide, so half the width in cells is close to square.
+        let th = (tw / 2).max(3) + 1;
+        let rows_fit = (inner.height / th).max(1);
         let per_page = (cols * rows_fit) as usize;
 
         // Keep the cursor on screen by scrolling in whole rows.
@@ -875,9 +900,9 @@ impl App {
         self.prefetch(ThumbSize::Grid, per_page);
 
         for (n, idx) in (start..end).enumerate() {
-            let cx = inner.x + (n as u16 % cols) * TW;
-            let cy = inner.y + (n as u16 / cols) * TH;
-            let cell = Rect::new(cx, cy, TW.min(inner.width), TH.min(inner.height));
+            let cx = inner.x + (n as u16 % cols) * tw;
+            let cy = inner.y + (n as u16 / cols) * th;
+            let cell = Rect::new(cx, cy, tw.min(inner.width), th.min(inner.height));
             if cell.bottom() > inner.bottom() || cell.right() > inner.right() {
                 continue;
             }
@@ -908,7 +933,7 @@ impl App {
             match self.image_for(idx, ThumbSize::Grid) {
                 Some(path) if self.ensure_decoded(&path) => {
                     if let Some(p) = self.images.get_mut(&path) {
-                        f.render_widget(Image::new(p), picture);
+                        f.render_stateful_widget(StatefulImage::default(), picture, p);
                     }
                 }
                 _ => {
@@ -953,7 +978,7 @@ impl App {
         match self.image_for(self.cursor, ThumbSize::View) {
             Some(path) if self.ensure_decoded(&path) => {
                 if let Some(p) = self.images.get_mut(&path) {
-                    f.render_widget(Image::new(p), inner);
+                    f.render_stateful_widget(StatefulImage::default(), inner, p);
                 }
             }
             _ => f.render_widget(
@@ -999,6 +1024,7 @@ const HELP: &str = "\
  enter                filter by the highlighted sidebar entry
  h l                  previous / next  (single view)
  o                    cycle which file of the stack is shown
+ - +                  fewer / more tiles across (grid view)
 
  a                    actions menu
  w                    flush pending sidecars

@@ -2,8 +2,8 @@
 //!
 //! **Never demosaic the RAW, and never decode more pixels than you need.** A
 //! NEF from a D750 carries a four-tier preview pyramid, and Exiv2 hands back
-//! the smallest tier at or above the requested size: a 384 px grid thumbnail
-//! costs a 140 KB read of a 640x424 JPEG.
+//! the smallest tier at or above the requested size, so a grid thumbnail
+//! costs a small read rather than a full-frame decode.
 //!
 //! The `_NEF_embedded.jpg` files sitting beside these RAWs look like a
 //! shortcut and are the opposite of one -- they are the *full-resolution*
@@ -35,7 +35,9 @@ pub enum Size {
 impl Size {
     pub fn px(self) -> u32 {
         match self {
-            Size::Grid => 384,
+            // Sized for a 5-across grid in a maximised window; larger tiles
+            // would otherwise be upscaled from too little data.
+            Size::Grid => 640,
             Size::View => 1600,
         }
     }
@@ -157,9 +159,16 @@ impl Cache {
     }
 
     pub fn path_for(&self, src: &Source, size: Size) -> PathBuf {
-        // Keyed on the source file and its mtime, so re-editing a shot
-        // invalidates its thumbnail without any explicit cache management.
-        let key = format!("{}|{}|{}", src.path.display(), src.mtime, src.orientation);
+        // Keyed on the source file, its mtime, its orientation *and* the
+        // target pixel size. Leaving the size out meant changing Grid from
+        // 384 to 640 px silently kept serving the old, smaller thumbnails.
+        let key = format!(
+            "{}|{}|{}|{}",
+            src.path.display(),
+            src.mtime,
+            src.orientation,
+            size.px()
+        );
         let digest = blake3::hash(key.as_bytes());
         let hex = digest.to_hex();
         self.dir
@@ -333,8 +342,14 @@ mod tests {
 
         let made = image::open(&out).unwrap();
         assert_eq!(made.width().max(made.height()), Size::Grid.px());
-        assert_eq!(made.width(), 384);
-        assert_eq!(made.height(), 256, "aspect ratio was not preserved");
+        // 3:2 in, 3:2 out.
+        assert_eq!(
+            (made.width() as f32 / made.height() as f32 * 100.0).round(),
+            (1620.0 / 1080.0 * 100.0f32).round(),
+            "aspect ratio was not preserved: {}x{}",
+            made.width(),
+            made.height()
+        );
     }
 
     #[test]
@@ -409,6 +424,15 @@ mod tests {
             cache.path_for(&a, Size::View),
             "sizes must not collide"
         );
+        // Regression: the key must contain the pixel dimension, not just a
+        // label, or changing Grid's size serves stale thumbnails forever.
+        let key_has_px = {
+            let p = cache.path_for(&a, Size::Grid);
+            let mut b = a.clone();
+            b.mtime = a.mtime; // unchanged
+            p != cache.path_for(&b, Size::View)
+        };
+        assert!(key_has_px);
     }
 
     #[test]

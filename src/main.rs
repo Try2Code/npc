@@ -101,6 +101,9 @@ enum Cmd {
         #[arg(long, default_value = "grid")]
         size: String,
     },
+    /// Report what this terminal can actually do. Run it inside the terminal
+    /// you use for `photo tui`.
+    Term,
     /// The browser.
     Tui {
         #[arg(default_value = "/home/ram/src/tasks/test-data")]
@@ -677,6 +680,44 @@ fn main() -> Result<()> {
             println!("  cache      {}", cache.dir().display());
             if made > 0 {
                 println!("  took       {secs:.1}s  ({:.0}/s)", made as f64 / secs.max(1e-9));
+            }
+        }
+
+        Cmd::Term => {
+            println!("TERM              {}", std::env::var("TERM").unwrap_or_default());
+            println!("TERM_PROGRAM      {}", std::env::var("TERM_PROGRAM").unwrap_or_default());
+            println!("KITTY_WINDOW_ID   {}", std::env::var("KITTY_WINDOW_ID").unwrap_or_default());
+            println!("WEZTERM_PANE      {}", std::env::var("WEZTERM_PANE").unwrap_or_default());
+            println!();
+
+            match ratatui_image::picker::Picker::from_query_stdio() {
+                Ok(picker) => {
+                    let (cw, ch) = picker.font_size();
+                    println!("graphics protocol {:?}", picker.protocol_type());
+                    println!("cell size         {cw}x{ch} px");
+                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                        println!("terminal          {cols}x{rows} cells = {}x{} px",
+                                 cols as u32 * cw as u32, rows as u32 * ch as u32);
+                        println!();
+                        println!("a 5-across grid gives tiles of about {}x{} px",
+                                 (cols as u32 / 5) * cw as u32,
+                                 ((rows as u32).saturating_sub(3) / 3) * ch as u32);
+                    }
+                    match picker.protocol_type() {
+                        ratatui_image::picker::ProtocolType::Halfblocks => {
+                            println!();
+                            println!("Halfblocks is the fallback: one pixel per half character cell.");
+                            println!("Photographs are not identifiable at that density. If this says");
+                            println!("Halfblocks inside kitty, the graphics query failed rather than");
+                            println!("kitty lacking support.");
+                        }
+                        p => println!("\n{p:?} is a real graphics protocol; thumbnails will be actual pixels."),
+                    }
+                }
+                Err(e) => {
+                    println!("could not query the terminal: {e}");
+                    println!("(this needs a real tty -- not a pipe or a pager)");
+                }
             }
         }
 

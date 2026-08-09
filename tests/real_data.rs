@@ -1,38 +1,73 @@
-//! Assertions that can only be written against the real library.
+//! Assertions that can only be written against real photographs.
 //!
 //! Synthetic fixtures would not have caught the phantom-stack bug: it only
-//! shows up when 1182 already-extracted previews sit beside their RAWs, which
-//! is what this library actually looks like. The expected numbers here were
-//! computed independently of the implementation, by classifying filenames in
-//! shell, so this is a comparison against ground truth rather than against
-//! whatever the code happens to do.
+//! appears when already-extracted previews sit beside their RAWs, which is
+//! what a real Nikon library looks like. Nor would they carry maker notes,
+//! preview pyramids, or the orientation tag that decides half the UI.
+//!
+//! **The set is deliberately minimal**: 11 files, 98 MB, chosen so every
+//! property under test is present exactly once. The full 41 GB library is 428x
+//! larger and asserts nothing extra. Point `NPC_TEST_LIBRARY` at it to run
+//! these against the whole thing.
+//!
+//! What each file is here for:
+//!
+//! | file | why |
+//! |---|---|
+//! | `750_5744.{NEF,JPG,_NEF_embedded.jpg}` | a complete three-member stack |
+//! | `750_5744.NEF.pp3` | a profile that must be ignored, not cataloged |
+//! | `750_5744_1.NEF` | `_1` is a name, not a derived marker; and a byte-identical twin, so duplicate detection has a real pair |
+//! | `750_6278.{NEF,JPG,_NEF_embedded.jpg}` | a second complete stack |
+//! | `750_5770_modified.JPG.pp3` | an orphan profile whose image is long gone |
+//! | `08/06/750_6338.JPG` | a JPG with no RAW -- the case that makes stack count exceed RAW count |
+//! | `08/06/750_6378.JPG` | orientation 1, so both landscape and portrait are covered |
+//!
+//! Two directories, so events derive into two shooting days.
 
 use npc::db::Catalog;
 use npc::scan;
 use npc::stack::{classify, Role};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-const LIBRARY: &str = "/home/ram/src/tasks/test-data";
-
-// Ground truth, computed by shell over the actual files:
-//   1722 distinct .NEF basenames
-//   +  68 .JPG with no matching .NEF
-//   = 1790 stacks
-// RawTherapee .pp3 profiles are not cataloged at all, so the three leftover
-// ones whose images no longer exist are simply invisible rather than orphans.
-const EXPECTED_STACKS: i64 = 1790;
+/// Ground truth, computed in shell over the files rather than from the code:
+///
+/// ```text
+/// 5 distinct stacks; 3 .NEF, 4 .JPG, 2 _NEF_embedded.jpg, 2 .pp3
+/// ```
+const EXPECTED_STACKS: i64 = 5;
+const EXPECTED_RAW: i64 = 3;
+const EXPECTED_OOCJPG: i64 = 4;
+const EXPECTED_DERIVED: i64 = 2;
 const EXPECTED_ORPHANS: i64 = 0;
-// Image members only. Deliberately *not* total files: .pp3 profiles and .xmp
-// sidecars accumulate as the library is used -- RawTherapee writes a profile
-// whenever a shot is opened -- and a test that breaks because the tool was
-// used is a broken test, not a broken library.
-const EXPECTED_RAW: i64 = 1722;
-const EXPECTED_OOCJPG: i64 = 1250;
-const EXPECTED_DERIVED: i64 = 1182;
-const EXPECTED_STACKS_0809: i64 = 71;
+const EXPECTED_EVENTS: usize = 2;
 
-fn library() -> Option<&'static Path> {
-    let p = Path::new(LIBRARY);
+fn library_path() -> PathBuf {
+    std::env::var_os("NPC_TEST_LIBRARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/ram/src/tasks/test-data-min"))
+}
+
+/// True when running against the set these counts were computed from.
+///
+/// The exact numbers below are ground truth for one specific directory. Point
+/// `NPC_TEST_LIBRARY` elsewhere and they are meaningless -- but the *property*
+/// tests (nothing is written, rescanning is idempotent, derived previews fold,
+/// events key on capture time) hold for any real library and still run.
+fn counts_apply() -> bool {
+    std::env::var_os("NPC_TEST_LIBRARY").is_none()
+}
+
+macro_rules! require_ground_truth {
+    () => {
+        if !counts_apply() {
+            eprintln!("skipping: exact counts apply only to the bundled minimal set");
+            return;
+        }
+    };
+}
+
+fn library() -> Option<PathBuf> {
+    let p = library_path();
     p.is_dir().then_some(p)
 }
 
@@ -41,7 +76,7 @@ macro_rules! require_library {
         match library() {
             Some(p) => p,
             None => {
-                eprintln!("skipping: {LIBRARY} not present");
+                eprintln!("skipping: {} not present", library_path().display());
                 return;
             }
         }
@@ -51,7 +86,7 @@ macro_rules! require_library {
 fn scanned() -> Option<Catalog> {
     let root = library()?;
     let mut cat = Catalog::open_memory().unwrap();
-    scan::scan(&mut cat, root, true).unwrap();
+    scan::scan(&mut cat, &root, true).unwrap();
     Some(cat)
 }
 
@@ -59,6 +94,7 @@ fn scanned() -> Option<Catalog> {
 /// folding into their parent, this jumps to 2904 and fails loudly.
 #[test]
 fn stack_count_matches_ground_truth() {
+    require_ground_truth!();
     require_library!();
     let cat = scanned().unwrap();
 
@@ -90,6 +126,7 @@ fn stack_count_matches_ground_truth() {
 /// still exists for a sidecar whose images have all gone.
 #[test]
 fn stray_profiles_are_invisible_rather_than_orphans() {
+    require_ground_truth!();
     require_library!();
     let cat = scanned().unwrap();
     assert_eq!(cat.orphan_count().unwrap(), EXPECTED_ORPHANS);
@@ -105,53 +142,35 @@ fn stray_profiles_are_invisible_rather_than_orphans() {
     assert_eq!(profiles, 0, "a .pp3 was cataloged");
 }
 
-/// A directory whose composition is known exactly: 71 shots, each with a RAW,
-/// an out-of-camera JPG and an extracted preview.
+/// The two complete stacks each hold a RAW, an out-of-camera JPG and an
+/// extracted preview -- and hold them as *one* stack, which is the assertion
+/// that catches the phantom-stack bug. If derived previews stop folding, this
+/// becomes four stacks of two.
 #[test]
-fn a_known_directory_resolves_to_three_member_stacks() {
-    let root = require_library!();
+fn complete_stacks_hold_all_three_image_roles() {
+    require_ground_truth!();
+    require_library!();
     let cat = scanned().unwrap();
-    let dir = root.join("08/09");
 
-    let stacks: i64 = cat
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM stack WHERE dir = ?1",
-            [dir.to_str().unwrap()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(stacks, EXPECTED_STACKS_0809);
-
-    // Every one of them holds a RAW, an out-of-camera JPG and an extracted
-    // preview. Profiles and sidecars may also be present -- those come and go
-    // with use -- so the assertion is on the image members, not the total.
-    let odd: i64 = cat
+    let complete: i64 = cat
         .conn
         .query_row(
             "SELECT COUNT(*) FROM (
                SELECT s.id FROM stack s JOIN file f ON f.stack_id = s.id
-               WHERE s.dir = ?1 AND f.role IN ('raw','oocjpg','derived')
-               GROUP BY s.id HAVING COUNT(*) != 3)",
-            [dir.to_str().unwrap()],
+               WHERE f.role IN ('raw','oocjpg','derived')
+               GROUP BY s.id
+               HAVING COUNT(DISTINCT f.role) = 3)",
+            [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        odd, 0,
-        "{odd} stacks in 08/09 lack the expected image members"
-    );
+    assert_eq!(complete, 2, "expected two complete three-role stacks");
 
-    // Exactly the three image roles. Profiles are no longer cataloged, so
-    // opening a shot in RawTherapee can no longer change this.
     let roles: Vec<String> = cat
         .conn
-        .prepare(
-            "SELECT DISTINCT role FROM file f JOIN stack s ON s.id = f.stack_id
-             WHERE s.dir = ?1 ORDER BY role",
-        )
+        .prepare("SELECT DISTINCT role FROM file ORDER BY role")
         .unwrap()
-        .query_map([dir.to_str().unwrap()], |r| r.get(0))
+        .query_map([], |r| r.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect();
@@ -160,6 +179,40 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         vec!["derived", "oocjpg", "raw"],
         "with profiles ignored, only the three image roles remain"
     );
+}
+
+/// Both orientations are present, because the UI branches on it: a portrait
+/// frame puts its metadata panel beside the image, a landscape one below.
+#[test]
+fn both_orientations_are_represented() {
+    require_library!();
+    let cat = scanned().unwrap();
+
+    let mut orientations: Vec<i64> = cat
+        .conn
+        .prepare("SELECT DISTINCT exif_orientation FROM file WHERE exif_orientation IS NOT NULL")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    orientations.sort();
+    assert!(
+        orientations.contains(&1) && orientations.contains(&8),
+        "need a landscape and a portrait frame, got {orientations:?}"
+    );
+}
+
+/// A byte-identical pair is in the set on purpose, so duplicate detection is
+/// exercised against real files rather than only fabricated rows.
+#[test]
+fn the_duplicate_pair_is_found() {
+    require_ground_truth!();
+    require_library!();
+    let cat = scanned().unwrap();
+    let groups = npc::dupes::find(&cat).unwrap();
+    assert_eq!(groups.len(), 1, "expected exactly one duplicate group: {groups:?}");
+    assert_eq!(groups[0].paths.len(), 2);
 }
 
 /// EXIF came off real files, not fixtures: the D750 body and its maker-note
@@ -177,9 +230,14 @@ fn real_exif_lands_in_the_catalog() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(
-        with_capture > 4000,
-        "only {with_capture} files got a capture time; EXIF parsing regressed"
+    // Every image in the set is a real camera file, so every one must date
+    // itself. Relative rather than a threshold: the assertion should hold on
+    // eleven files or on forty thousand.
+    let total = cat.file_count().unwrap();
+    assert_eq!(
+        with_capture, total,
+        "{} of {total} files have no capture time; EXIF parsing regressed",
+        total - with_capture
     );
 
     let cameras: Vec<String> = cat
@@ -212,21 +270,25 @@ fn rescanning_changes_nothing() {
     let root = require_library!();
     let mut cat = Catalog::open_memory().unwrap();
 
-    scan::scan(&mut cat, root, true).unwrap();
+    scan::scan(&mut cat, &root, true).unwrap();
     let (s1, f1) = (cat.stack_count().unwrap(), cat.file_count().unwrap());
 
-    let stats = scan::scan(&mut cat, root, false).unwrap();
+    let stats = scan::scan(&mut cat, &root, false).unwrap();
     let (s2, f2) = (cat.stack_count().unwrap(), cat.file_count().unwrap());
 
     assert_eq!((s1, f1), (s2, f2), "a rescan changed the catalog");
     assert_eq!(stats.parsed, 0, "a rescan re-parsed unchanged files");
-    assert!(stats.unchanged > 4000);
+    assert_eq!(
+        stats.unchanged as i64, f1,
+        "a rescan should see every file as unchanged"
+    );
 }
 
 /// Every filename in the library classifies, or is deliberately ignored --
 /// nothing silently falls through into a wrong role.
 #[test]
 fn every_real_filename_classifies_as_expected() {
+    require_ground_truth!();
     let root = require_library!();
     let mut counts = std::collections::BTreeMap::new();
 
@@ -269,10 +331,10 @@ fn every_real_filename_classifies_as_expected() {
 fn scanning_never_writes_to_the_library() {
     let root = require_library!();
 
-    let before = fingerprint_tree(root);
+    let before = fingerprint_tree(&root);
     let mut cat = Catalog::open_memory().unwrap();
-    scan::scan(&mut cat, root, true).unwrap();
-    let after = fingerprint_tree(root);
+    scan::scan(&mut cat, &root, true).unwrap();
+    let after = fingerprint_tree(&root);
 
     assert_eq!(
         before.len(),
@@ -305,10 +367,10 @@ fn fingerprint_tree(root: &Path) -> std::collections::BTreeMap<String, (u64, i64
 }
 
 /// Events are days of shooting, derived from capture time rather than from
-/// the directory layout. This library's folders run 08/01..08/09 but only
-/// seven of those days actually have frames, which is the distinction.
+/// the directory layout.
 #[test]
 fn events_are_one_per_day_of_shooting() {
+    require_ground_truth!();
     require_library!();
     let cat = scanned().unwrap();
 
@@ -325,7 +387,7 @@ fn events_are_one_per_day_of_shooting() {
         .map(Result::unwrap)
         .collect();
 
-    assert_eq!(days.len(), 7, "expected seven shooting days, got {days:?}");
+    assert_eq!(days.len(), EXPECTED_EVENTS, "got {days:?}");
     assert_eq!(
         days.iter().map(|(_, n)| n).sum::<i64>(),
         EXPECTED_STACKS,

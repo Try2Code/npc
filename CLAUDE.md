@@ -73,9 +73,9 @@ Each of these was got wrong first, then measured:
   Exiv2 pick a tier is 4.7× faster (105s → 22s over the library).
 - **`view_px` is 1620 to match the NEF's preview tier.** Anything higher forces
   the 24 MP tier and costs 140 ms/frame instead of 24 ms.
-- **Derived previews must fold into their parent stack**, or the library grows
-  1182 phantom stacks. `tests/real_data.rs` asserts 1790 stacks — ground truth
-  computed in shell, not from the code.
+- **Derived previews must fold into their parent stack**, or every shot with
+  an extracted preview becomes two. `tests/real_data.rs` asserts this on real
+  files, with ground truth computed in shell rather than from the code.
 - **exiv2 is 0.27.6, not 0.28.** `Image::AutoPtr`, not `UniquePtr`. XMP
   toolkit is present and verified.
 - **Cache keys include the pixel size.** Omitting it silently served stale
@@ -91,8 +91,13 @@ Each of these was got wrong first, then measured:
 - **`/media/ram/MyPics` is the real library and must stay untouched.** It is a
   protected root. It is exFAT, so `chmod -R a-w` is not available as a
   backstop — the code is the only guard.
-- **`/home/ram/src/tasks/test-data` is a throwaway copy.** Free to write to.
-  It holds 1790 stacks, 4188 files, 41 GB.
+- **`/home/ram/src/tasks/test-data-min` is the test set the suite uses.**
+  11 files, 98 MB, chosen so every property under test appears exactly once.
+  Ground truth for it is 5 stacks / 3 raw / 4 oocjpg / 2 derived / 2 events.
+- **`/home/ram/src/tasks/test-data` is the full throwaway copy**, 4188 files
+  and 41 GB. `NPC_TEST_LIBRARY=<path> cargo test` runs the property tests
+  against it; the exact-count tests skip themselves, because those numbers are
+  ground truth for one directory and meaningless anywhere else.
 - **Run `./check` before reporting anything as done.** Twice in this project a
   commit was made before reading test output, and twice the tests were right.
 - Report failures plainly, with the output. Don't soften.

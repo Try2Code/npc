@@ -13,7 +13,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-LIBRARY=${PHOTO_TEST_LIBRARY:-/home/ram/src/tasks/test-data}
+LIBRARY=${NPC_TEST_LIBRARY:-/home/ram/src/tasks/test-data-min}
 MODE=${1:-all}
 fail=0
 

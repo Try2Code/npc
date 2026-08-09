@@ -1,0 +1,31 @@
+[package]
+name = "npc"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
+
+[[bin]]
+name = "photo"
+path = "src/main.rs"
+
+[dependencies]
+cxx = "1.0"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+rayon = "1"
+directories = "5"
+rustix = { version = "0.38", features = ["fs"] }
+
+[build-dependencies]
+cxx-build = "1.0"
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+walkdir = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

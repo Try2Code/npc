@@ -579,6 +579,14 @@ impl App {
                     }
                 }
             }
+            // Esc zooms out of the single view, pairing with Enter zooming in.
+            // Elsewhere it clears the selection, which is what it is for when
+            // there is nothing to back out of.
+            KeyCode::Esc if self.view == View::Single => {
+                self.view = View::Grid;
+                self.member = 0;
+                self.status = "grid".into();
+            }
             KeyCode::Esc => {
                 self.selected.clear();
                 self.anchor = None;
@@ -632,7 +640,21 @@ impl App {
                 self.status = format!("{:?} view", self.view);
             }
             KeyCode::BackTab => {
-                self.sidebar_focus = !self.sidebar_focus;
+                self.view = match self.view {
+                    View::List => View::Single,
+                    View::Grid => View::List,
+                    View::Single => View::Grid,
+                };
+                self.member = 0;
+                self.status = format!("{:?} view", self.view);
+            }
+            // Sidebar focus moves to the arrows: in a two-pane layout, left
+            // and right are what a hand reaches for anyway.
+            KeyCode::Left if self.view != View::Single => {
+                self.sidebar_focus = true;
+            }
+            KeyCode::Right if self.view != View::Single => {
+                self.sidebar_focus = false;
             }
             KeyCode::Char('+') | KeyCode::Char('=') if self.view == View::Grid => {
                 self.grid_cols = (self.grid_cols + 1).min(12);
@@ -655,6 +677,12 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right if self.view == View::Single => {
                 self.move_cursor(1);
                 self.member = 0;
+            }
+            // Enter zooms into whatever is under the cursor.
+            KeyCode::Enter if !self.sidebar_focus && self.view != View::Single => {
+                self.view = View::Single;
+                self.member = 0;
+                self.status = "single".into();
             }
             KeyCode::Enter if self.sidebar_focus => {
                 if let Some((name, _)) = self.sidebar_items.get(self.sidebar_cursor) {
@@ -1280,7 +1308,7 @@ const HELP: &str = "\
  ctrl-d ctrl-u        page
  space                select / deselect
  v                    range: press once to start, again to close
- esc                  clear selection
+ esc                  clear selection (outside single view)
 
  /                    query  (same syntax as `photo find`)
  t  T                 add / remove tags (comma separated)
@@ -1288,9 +1316,12 @@ const HELP: &str = "\
  1-5                  rate    0  clear rating
  f  x  c              flag / reject / clear marks
 
- tab                  list -> grid -> single
- shift-tab            focus sidebar    s  tags <-> dates
- enter                filter by the highlighted sidebar entry
+ enter                zoom in   (-> single view)
+ esc                  zoom out  (single -> grid)
+ tab / shift-tab      cycle views forward / backward
+ left right           focus / leave the sidebar
+ s                    sidebar: tags <-> dates
+ enter                (sidebar focused) filter by the highlighted entry
  h l                  previous / next  (single view)
  o                    cycle which file of the stack is shown
  - +                  fewer / more tiles across (grid view)
@@ -1591,7 +1622,7 @@ mod tests {
             app.sidebar_items
         );
 
-        press_code(&mut app, KeyCode::BackTab); // focus sidebar
+        press_code(&mut app, KeyCode::Left); // focus sidebar
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.query, "date=2026-08-09");
         assert_eq!(app.total, 3);
@@ -1712,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_views_and_shift_tab_focuses_the_sidebar() {
+    fn tab_cycles_forward_shift_tab_backward_and_arrows_reach_the_sidebar() {
         let (_d, mut app) = app();
         assert_eq!(app.view, View::List);
         press_code(&mut app, KeyCode::Tab);
@@ -1722,9 +1753,19 @@ mod tests {
         press_code(&mut app, KeyCode::Tab);
         assert_eq!(app.view, View::List);
 
-        assert!(!app.sidebar_focus);
+        // ..and backwards, so a two-key detour is never needed.
         press_code(&mut app, KeyCode::BackTab);
+        assert_eq!(app.view, View::Single);
+        press_code(&mut app, KeyCode::BackTab);
+        assert_eq!(app.view, View::Grid);
+        press_code(&mut app, KeyCode::BackTab);
+        assert_eq!(app.view, View::List);
+
+        assert!(!app.sidebar_focus);
+        press_code(&mut app, KeyCode::Left);
         assert!(app.sidebar_focus);
+        press_code(&mut app, KeyCode::Right);
+        assert!(!app.sidebar_focus);
     }
 
     /// The culling loop: h/l walk the result set in single view, and each move
@@ -1914,6 +1955,49 @@ mod tests {
         for want in ["S 1/400", "A f/4.5", "I 2500", "EV -0.7"] {
             assert!(screen.contains(want), "`{want}` missing:\n{screen}");
         }
+    }
+
+    /// Enter and Esc are a zoom pair: one key each way, rather than cycling
+    /// through an unwanted view to get back.
+    #[test]
+    fn enter_zooms_in_and_esc_zooms_back_to_the_grid() {
+        let (_d, mut app) = app();
+        assert_eq!(app.view, View::List);
+
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::Single);
+
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Grid, "one key must get back to the grid");
+
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::Single);
+    }
+
+    /// ..but Esc must still clear a selection where there is nothing to back
+    /// out of, which is what it does everywhere else.
+    #[test]
+    fn esc_still_clears_selection_outside_the_single_view() {
+        let (_d, mut app) = app();
+        press(&mut app, ' ');
+        press(&mut app, ' ');
+        assert_eq!(app.selected.len(), 2);
+
+        press_code(&mut app, KeyCode::Esc);
+        assert!(app.selected.is_empty());
+        assert_eq!(app.view, View::List, "Esc changed view outside single");
+    }
+
+    /// Enter belongs to the sidebar when the sidebar has focus -- it filters
+    /// by the highlighted entry, and must not be stolen by the zoom.
+    #[test]
+    fn enter_still_filters_when_the_sidebar_has_focus() {
+        let (_d, mut app) = app();
+        press(&mut app, 's'); // dates
+        press_code(&mut app, KeyCode::Left); // focus sidebar
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::List, "zoom stole the sidebar's Enter");
+        assert!(app.query.starts_with("date="), "query: {}", app.query);
     }
 
     #[test]

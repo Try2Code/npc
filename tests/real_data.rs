@@ -21,7 +21,13 @@ const LIBRARY: &str = "/home/ram/src/tasks/test-data";
 // and 3 leftover RawTherapee profiles whose images no longer exist.
 const EXPECTED_STACKS: i64 = 1790;
 const EXPECTED_ORPHANS: i64 = 3;
-const EXPECTED_FILES: i64 = 4185; // 4188 on disk, minus the 3 orphan profiles
+// Image members only. Deliberately *not* total files: .pp3 profiles and .xmp
+// sidecars accumulate as the library is used -- RawTherapee writes a profile
+// whenever a shot is opened -- and a test that breaks because the tool was
+// used is a broken test, not a broken library.
+const EXPECTED_RAW: i64 = 1722;
+const EXPECTED_OOCJPG: i64 = 1250;
+const EXPECTED_DERIVED: i64 = 1182;
 const EXPECTED_STACKS_0809: i64 = 71;
 
 fn library() -> Option<&'static Path> {
@@ -61,7 +67,21 @@ fn stack_count_matches_ground_truth() {
         "stack count drifted. If this is 2904, derived previews stopped folding \
          into their parent stack and every shot is duplicated."
     );
-    assert_eq!(cat.file_count().unwrap(), EXPECTED_FILES);
+    for (role, expected) in [
+        ("raw", EXPECTED_RAW),
+        ("oocjpg", EXPECTED_OOCJPG),
+        ("derived", EXPECTED_DERIVED),
+    ] {
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file WHERE role = ?1 AND present = 1",
+                [role],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, expected, "{role} count drifted");
+    }
 }
 
 /// Leftover profiles whose image is gone must not conjure a stack out of
@@ -105,19 +125,24 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         .unwrap();
     assert_eq!(stacks, EXPECTED_STACKS_0809);
 
-    // Every one of them should hold exactly raw + oocjpg + derived.
+    // Every one of them holds a RAW, an out-of-camera JPG and an extracted
+    // preview. Profiles and sidecars may also be present -- those come and go
+    // with use -- so the assertion is on the image members, not the total.
     let odd: i64 = cat
         .conn
         .query_row(
             "SELECT COUNT(*) FROM (
                SELECT s.id FROM stack s JOIN file f ON f.stack_id = s.id
-               WHERE s.dir = ?1 GROUP BY s.id HAVING COUNT(*) != 3)",
+               WHERE s.dir = ?1 AND f.role IN ('raw','oocjpg','derived')
+               GROUP BY s.id HAVING COUNT(*) != 3)",
             [dir.to_str().unwrap()],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(odd, 0, "{odd} stacks in 08/09 do not have exactly 3 members");
+    assert_eq!(odd, 0, "{odd} stacks in 08/09 lack the expected image members");
 
+    // All three image roles are represented. `profile` may or may not appear
+    // depending on what has been opened in RawTherapee since.
     let roles: Vec<String> = cat
         .conn
         .prepare(
@@ -129,7 +154,12 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(roles, vec!["derived", "oocjpg", "raw"]);
+    for expected in ["raw", "oocjpg", "derived"] {
+        assert!(
+            roles.iter().any(|r| r == expected),
+            "role `{expected}` missing from 08/09: {roles:?}"
+        );
+    }
 }
 
 /// EXIF came off real files, not fixtures: the D750 body and its maker-note
@@ -209,10 +239,12 @@ fn every_real_filename_classifies_as_expected() {
         }
     }
 
-    assert_eq!(counts.get("raw").copied().unwrap_or(0), 1722);
-    assert_eq!(counts.get("oocjpg").copied().unwrap_or(0), 1250);
-    assert_eq!(counts.get("derived").copied().unwrap_or(0), 1182);
-    assert_eq!(counts.get("profile").copied().unwrap_or(0), 34);
+    assert_eq!(counts.get("raw").copied().unwrap_or(0) as i64, EXPECTED_RAW);
+    assert_eq!(counts.get("oocjpg").copied().unwrap_or(0) as i64, EXPECTED_OOCJPG);
+    assert_eq!(counts.get("derived").copied().unwrap_or(0) as i64, EXPECTED_DERIVED);
+    // Profiles and sidecars are not asserted: RawTherapee adds a .pp3 whenever
+    // a shot is opened, and this tool adds .xmp whenever anything is tagged.
+    // Both are correct behaviour and neither must break the suite.
     // Sidecars are not asserted: test-data is a working sandbox and
     // accumulates them. They are metadata, never counted as photographs --
     // which is exactly what the stack and file counts above verify.

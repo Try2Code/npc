@@ -15,6 +15,7 @@ pub mod meta;
 pub mod query;
 pub mod scan;
 pub mod stack;
+pub mod thumbs;
 pub mod trash;
 pub mod tui;
 pub mod vol;

@@ -90,6 +90,17 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Generate thumbnails ahead of time.
+    Thumbs {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Restrict to the stacks a query selects
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// `grid` (384px) or `view` (1600px)
+        #[arg(long, default_value = "grid")]
+        size: String,
+    },
     /// The browser.
     Tui {
         #[arg(default_value = "/home/ram/src/tasks/test-data")]
@@ -631,6 +642,41 @@ fn main() -> Result<()> {
             println!("deleted {} stack(s), {} files", stats.stacks, stats.files);
             for e in &stats.errors {
                 eprintln!("error: {e}");
+            }
+        }
+
+        Cmd::Thumbs { root, query, size } => {
+            let size = match size.as_str() {
+                "grid" => npc::thumbs::Size::Grid,
+                "view" => npc::thumbs::Size::View,
+                other => anyhow::bail!("unknown size `{other}`; use grid or view"),
+            };
+            let v = vol::identify(&root)?;
+            let cat = open_for(&root)?;
+            let cache = npc::thumbs::Cache::new(&v.uuid)?;
+
+            let compiled = npc::query::compile(query.as_deref().unwrap_or(""))?;
+            let stmt = compiled.select_stacks(None);
+            let mut prepared = cat.conn.prepare(&stmt)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                compiled.params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let ids: Vec<i64> = prepared
+                .query_map(params.as_slice(), |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+
+            let started = std::time::Instant::now();
+            let (made, skipped, failed) = npc::thumbs::prewarm(&cat, &cache, &ids, size);
+            let secs = started.elapsed().as_secs_f64();
+
+            println!("thumbnails ({} px) for {} stack(s)", size.px(), ids.len());
+            println!("  generated  {made}");
+            println!("  cached     {skipped}");
+            if failed > 0 {
+                println!("  failed     {failed}");
+            }
+            println!("  cache      {}", cache.dir().display());
+            if made > 0 {
+                println!("  took       {secs:.1}s  ({:.0}/s)", made as f64 / secs.max(1e-9));
             }
         }
 

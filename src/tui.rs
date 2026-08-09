@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::db::Catalog;
 use crate::edit::{self, Change};
 use crate::query;
+use crate::thumbs::{self, Size as ThumbSize};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -21,8 +22,11 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use std::collections::HashSet;
+use ratatui_image::picker::Picker;
+use ratatui_image::{Image, Resize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 const PAGE: usize = 500;
 
@@ -37,6 +41,14 @@ struct Row {
     captured: Option<i64>,
     roles: String,
     tags: String,
+}
+
+/// How the stacks are shown. Tagging and rating keys stay live in all three.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum View {
+    List,
+    Grid,
+    Single,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -89,6 +101,15 @@ pub struct App {
     show_actions: bool,
     undo: Vec<UndoStep>,
     quit: bool,
+
+    view: View,
+    cache: Option<thumbs::Cache>,
+    /// Decoded images ready to draw, keyed by cache-file path. Bounded so a
+    /// long scroll cannot grow without limit.
+    images: HashMap<PathBuf, ratatui_image::protocol::Protocol>,
+    picker: Option<Picker>,
+    /// Which member of the stack the single view is showing.
+    member: usize,
 }
 
 impl App {
@@ -123,6 +144,11 @@ impl App {
             show_actions: false,
             undo: Vec::new(),
             quit: false,
+            view: View::List,
+            cache: None,
+            images: HashMap::new(),
+            picker: None,
+            member: 0,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -249,6 +275,82 @@ impl App {
             self.sidebar_cursor = 0;
         }
         Ok(())
+    }
+
+    /// Attach the thumbnail cache and terminal graphics protocol. Only done
+    /// when a real terminal is present, so headless tests stay unaffected.
+    pub fn enable_images(&mut self) {
+        if let Ok(v) = crate::vol::identify(&self.root) {
+            self.cache = thumbs::Cache::new(&v.uuid).ok();
+        }
+        self.picker = Picker::from_query_stdio().ok();
+    }
+
+    /// Cached thumbnail for a row, decoded and ready to draw. Returns `None`
+    /// while generation is still in flight -- the UI shows a placeholder and
+    /// picks it up on a later frame rather than blocking.
+    fn image_for(&mut self, row_index: usize, size: ThumbSize) -> Option<PathBuf> {
+        let id = self.rows.get(row_index)?.id;
+        let cache = self.cache.as_ref()?;
+        let src = thumbs::best_source(&self.cat, id).ok().flatten()?;
+        cache.get(&src, size)
+    }
+
+    fn ensure_decoded(&mut self, path: &PathBuf) -> bool {
+        if self.images.contains_key(path) {
+            return true;
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return false;
+        };
+        let Ok(img) = image::open(path) else {
+            return false;
+        };
+        let protocol = picker.new_protocol(
+            img,
+            Rect::new(0, 0, 40, 20),
+            Resize::Fit(None),
+        );
+        match protocol {
+            Ok(p) => {
+                // Bounded: a long scroll must not grow this without limit.
+                if self.images.len() > 120 {
+                    self.images.clear();
+                }
+                self.images.insert(path.clone(), p);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Queue thumbnails around the cursor so scrolling finds them ready.
+    fn prefetch(&mut self, size: ThumbSize, span: usize) {
+        let start = self.cursor.saturating_sub(span);
+        let end = (self.cursor + span).min(self.rows.len().saturating_sub(1));
+        for i in start..=end {
+            let _ = self.image_for(i, size);
+        }
+    }
+
+    /// Files of the stack under the cursor, for the single view's `o` cycling.
+    fn current_members(&self) -> Vec<(String, String)> {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return Vec::new();
+        };
+        self.cat
+            .conn
+            .prepare(
+                "SELECT name, role FROM file WHERE stack_id = ?1 AND present = 1
+                 ORDER BY CASE role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END, name",
+            )
+            .and_then(|mut st| {
+                let rows = st.query_map([row.id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
     }
 
     // --- editing ---------------------------------------------------------
@@ -450,7 +552,28 @@ impl App {
                 self.reload_sidebar()?;
             }
             KeyCode::Tab => {
+                self.view = match self.view {
+                    View::List => View::Grid,
+                    View::Grid => View::Single,
+                    View::Single => View::List,
+                };
+                self.member = 0;
+                self.status = format!("{:?} view", self.view);
+            }
+            KeyCode::BackTab => {
                 self.sidebar_focus = !self.sidebar_focus;
+            }
+            KeyCode::Char('o') => {
+                let n = self.current_members().len().max(1);
+                self.member = (self.member + 1) % n;
+            }
+            KeyCode::Char('h') | KeyCode::Left if self.view == View::Single => {
+                self.move_cursor(-1);
+                self.member = 0;
+            }
+            KeyCode::Char('l') | KeyCode::Right if self.view == View::Single => {
+                self.move_cursor(1);
+                self.member = 0;
             }
             KeyCode::Enter if self.sidebar_focus => {
                 if let Some((name, _)) = self.sidebar_items.get(self.sidebar_cursor) {
@@ -617,66 +740,11 @@ impl App {
             &mut side_state,
         );
 
-        // list
-        let rows: Vec<ListItem> = self
-            .rows
-            .iter()
-            .map(|r| {
-                let sel = if self.selected.contains(&r.id) { "*" } else { " " };
-                let stars = "*".repeat(r.rating.unwrap_or(0).clamp(0, 5) as usize);
-                let mark = if r.flag {
-                    "F"
-                } else if r.reject {
-                    "X"
-                } else {
-                    " "
-                };
-                let date = r
-                    .captured
-                    .map(|t| format_date(t))
-                    .unwrap_or_else(|| "----------".into());
-                ListItem::new(Line::from(vec![
-                    Span::styled(sel.to_string(), Style::default().fg(Color::Yellow)),
-                    Span::raw(format!(" {:<20}", r.base)),
-                    Span::styled(format!("{:<9}", r.roles), Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{date}  ")),
-                    Span::styled(format!("{stars:<5}"), Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        format!("{mark} "),
-                        Style::default().fg(if r.reject { Color::Red } else { Color::Green }),
-                    ),
-                    Span::styled(r.tags.clone(), Style::default().fg(Color::Blue)),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(Some(self.cursor));
-        let heading = format!(
-            " {} / {} stacks{} ",
-            self.rows.len(),
-            self.total,
-            if self.selected.is_empty() {
-                String::new()
-            } else {
-                format!("  |  {} selected", self.selected.len())
-            }
-        );
-        f.render_stateful_widget(
-            List::new(rows)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(if self.sidebar_focus {
-                            Style::default().fg(Color::DarkGray)
-                        } else {
-                            Style::default().fg(Color::Cyan)
-                        })
-                        .title(heading),
-                )
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-            cols[1],
-            &mut state,
-        );
+        match self.view {
+            View::List => self.draw_list(f, cols[1]),
+            View::Grid => self.draw_grid(f, cols[1]),
+            View::Single => self.draw_single(f, cols[1]),
+        }
 
         // status / input
         let bottom = match self.input {
@@ -725,8 +793,178 @@ impl App {
         }
     }
 
+    fn heading(&self) -> String {
+        format!(
+            " {:?}  {} / {} stacks{} ",
+            self.view,
+            self.rows.len(),
+            self.total,
+            if self.selected.is_empty() {
+                String::new()
+            } else {
+                format!("  |  {} selected", self.selected.len())
+            }
+        )
+    }
+
+    fn frame_block(&self, title: String) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(if self.sidebar_focus {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
+            })
+            .title(title)
+    }
+
+    fn draw_list(&mut self, f: &mut Frame, area: Rect) {
+        let rows: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|r| {
+                let sel = if self.selected.contains(&r.id) { "*" } else { " " };
+                let stars = "*".repeat(r.rating.unwrap_or(0).clamp(0, 5) as usize);
+                let mark = if r.flag { "F" } else if r.reject { "X" } else { " " };
+                let date = r.captured.map(format_date).unwrap_or_else(|| "----------".into());
+                ListItem::new(Line::from(vec![
+                    Span::styled(sel.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(" {:<20}", r.base)),
+                    Span::styled(format!("{:<9}", r.roles), Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!("{date}  ")),
+                    Span::styled(format!("{stars:<5}"), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{mark} "),
+                        Style::default().fg(if r.reject { Color::Red } else { Color::Green }),
+                    ),
+                    Span::styled(r.tags.clone(), Style::default().fg(Color::Blue)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.cursor));
+        let block = self.frame_block(self.heading());
+        f.render_stateful_widget(
+            List::new(rows)
+                .block(block)
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+            area,
+            &mut state,
+        );
+    }
+
+    /// A tiled grid of thumbnails. Tile size is fixed in cells; how many fit
+    /// depends on the window, which is also what bounds image resolution.
+    fn draw_grid(&mut self, f: &mut Frame, area: Rect) {
+        let block = self.frame_block(self.heading());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        const TW: u16 = 22;
+        const TH: u16 = 11;
+        let cols = (inner.width / TW).max(1);
+        let rows_fit = (inner.height / TH).max(1);
+        let per_page = (cols * rows_fit) as usize;
+
+        // Keep the cursor on screen by scrolling in whole rows.
+        let cursor_row = self.cursor / cols as usize;
+        let first_row = cursor_row.saturating_sub(rows_fit as usize - 1);
+        let start = first_row * cols as usize;
+        let end = (start + per_page).min(self.rows.len());
+
+        self.prefetch(ThumbSize::Grid, per_page);
+
+        for (n, idx) in (start..end).enumerate() {
+            let cx = inner.x + (n as u16 % cols) * TW;
+            let cy = inner.y + (n as u16 / cols) * TH;
+            let cell = Rect::new(cx, cy, TW.min(inner.width), TH.min(inner.height));
+            if cell.bottom() > inner.bottom() || cell.right() > inner.right() {
+                continue;
+            }
+
+            let row = self.rows[idx].clone();
+            let is_cursor = idx == self.cursor;
+            let is_sel = self.selected.contains(&row.id);
+
+            let border = if is_cursor {
+                Style::default().fg(Color::Cyan)
+            } else if is_sel {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let stars = "*".repeat(row.rating.unwrap_or(0).clamp(0, 5) as usize);
+            let mark = if row.flag { " F" } else if row.reject { " X" } else { "" };
+            let tile = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border)
+                .title(Line::from(vec![Span::styled(
+                    format!(" {}{} ", stars, mark),
+                    Style::default().fg(if row.reject { Color::Red } else { Color::Yellow }),
+                )]));
+            let picture = tile.inner(cell);
+            f.render_widget(tile, cell);
+
+            match self.image_for(idx, ThumbSize::Grid) {
+                Some(path) if self.ensure_decoded(&path) => {
+                    if let Some(p) = self.images.get_mut(&path) {
+                        f.render_widget(Image::new(p), picture);
+                    }
+                }
+                _ => {
+                    f.render_widget(
+                        Paragraph::new(row.base.clone())
+                            .style(Style::default().fg(Color::DarkGray)),
+                        picture,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One large preview. This is the culling loop: look, rate, advance.
+    fn draw_single(&mut self, f: &mut Frame, area: Rect) {
+        let members = self.current_members();
+        let member = members.get(self.member.min(members.len().saturating_sub(1)));
+
+        let title = match self.rows.get(self.cursor) {
+            Some(r) => {
+                let stars = "*".repeat(r.rating.unwrap_or(0).clamp(0, 5) as usize);
+                let which = member
+                    .map(|(n, role)| format!("  [{n}  {role}]"))
+                    .unwrap_or_default();
+                format!(
+                    " {}  {}  {}/{}  {stars}{which} ",
+                    r.base,
+                    r.captured.map(format_date).unwrap_or_else(|| "--".into()),
+                    self.cursor + 1,
+                    self.rows.len()
+                )
+            }
+            None => " nothing to show ".to_string(),
+        };
+
+        let block = self.frame_block(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        self.prefetch(ThumbSize::View, 2);
+
+        match self.image_for(self.cursor, ThumbSize::View) {
+            Some(path) if self.ensure_decoded(&path) => {
+                if let Some(p) = self.images.get_mut(&path) {
+                    f.render_widget(Image::new(p), inner);
+                }
+            }
+            _ => f.render_widget(
+                Paragraph::new("rendering...").style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+        }
+    }
+
     fn overlay(&self, f: &mut Frame, title: &str, body: &str) {
-        let area = centered(64, 70, f.area());
+        let area = centered(68, 92, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(body)
@@ -756,8 +994,11 @@ const HELP: &str = "\
  1-5                  rate    0  clear rating
  f  x  c              flag / reject / clear marks
 
- tab                  focus sidebar    s  tags <-> dates
+ tab                  list -> grid -> single
+ shift-tab            focus sidebar    s  tags <-> dates
  enter                filter by the highlighted sidebar entry
+ h l                  previous / next  (single view)
+ o                    cycle which file of the stack is shown
 
  a                    actions menu
  w                    flush pending sidecars
@@ -824,13 +1065,27 @@ pub fn run(root: PathBuf) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Graphics protocol detection queries the terminal, so it has to happen
+    // after raw mode is on.
+    app.enable_images();
+
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|f| app.draw(f))?;
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
-                    app.on_key(key)?;
+
+            // Poll rather than block: thumbnails finish on a worker thread and
+            // the frame they belong to has to be redrawn when they land.
+            if event::poll(Duration::from_millis(120))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == event::KeyEventKind::Press {
+                        app.on_key(key)?;
+                    }
                 }
+            }
+            // Drain whatever the generator finished; each one is a reason to
+            // repaint, and draining keeps the channel from growing.
+            if let Some(cache) = app.cache.as_ref() {
+                while cache.done.try_recv().is_ok() {}
             }
             if app.quit {
                 break;
@@ -1041,7 +1296,7 @@ mod tests {
             app.sidebar_items
         );
 
-        press_code(&mut app, KeyCode::Tab); // focus sidebar
+        press_code(&mut app, KeyCode::BackTab); // focus sidebar
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.query, "date=2026-08-09");
         assert_eq!(app.total, 3);
@@ -1110,13 +1365,16 @@ mod tests {
     fn overlays_render_without_overflowing_the_frame() {
         let (_d, mut app) = app();
         app.show_help = true;
-        let screen = render(&mut app, 120, 30);
+        let screen = render(&mut app, 120, 40);
         assert!(screen.contains("keys"), "help overlay missing");
-        assert!(screen.contains("undo last edit"));
+        assert!(
+            screen.contains("undo last edit"),
+            "the key list is taller than its overlay and got truncated:\n{screen}"
+        );
 
         app.show_help = false;
         app.show_actions = true;
-        assert!(render(&mut app, 120, 30).contains("actions"));
+        assert!(render(&mut app, 120, 40).contains("actions"));
     }
 
     /// A narrow terminal must not panic on layout arithmetic.
@@ -1140,6 +1398,86 @@ mod tests {
         let screen = render(&mut app, 120, 24);
         assert!(screen.contains("query"), "prompt missing:\n{screen}");
         assert!(screen.contains("rating>=4"), "buffer missing:\n{screen}");
+    }
+
+    /// The three views must all render. Without a terminal there is no
+    /// graphics protocol, so images fall back to placeholders -- which is
+    /// exactly the path a non-kitty terminal takes, and worth covering.
+    #[test]
+    fn every_view_renders_without_a_graphics_protocol() {
+        let (_d, mut app) = app();
+        press(&mut app, '3');
+
+        for expected in [View::Grid, View::Single, View::List] {
+            press_code(&mut app, KeyCode::Tab);
+            assert_eq!(app.view, expected);
+            let screen = render(&mut app, 120, 30);
+            assert!(!screen.trim().is_empty(), "{expected:?} drew nothing");
+        }
+    }
+
+    #[test]
+    fn tab_cycles_views_and_shift_tab_focuses_the_sidebar() {
+        let (_d, mut app) = app();
+        assert_eq!(app.view, View::List);
+        press_code(&mut app, KeyCode::Tab);
+        assert_eq!(app.view, View::Grid);
+        press_code(&mut app, KeyCode::Tab);
+        assert_eq!(app.view, View::Single);
+        press_code(&mut app, KeyCode::Tab);
+        assert_eq!(app.view, View::List);
+
+        assert!(!app.sidebar_focus);
+        press_code(&mut app, KeyCode::BackTab);
+        assert!(app.sidebar_focus);
+    }
+
+    /// The culling loop: h/l walk the result set in single view, and each move
+    /// resets which member is displayed.
+    #[test]
+    fn single_view_walks_the_result_set() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Tab);
+        press_code(&mut app, KeyCode::Tab); // single
+        assert_eq!(app.cursor, 0);
+
+        press(&mut app, 'l');
+        assert_eq!(app.cursor, 1);
+        press(&mut app, 'l');
+        assert_eq!(app.cursor, 2);
+        press(&mut app, 'l');
+        assert_eq!(app.cursor, 2, "walked past the end");
+
+        press(&mut app, 'h');
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn o_cycles_through_the_members_of_a_stack() {
+        let (_d, mut app) = app();
+        // fixture stacks hold a NEF and a JPG
+        assert_eq!(app.current_members().len(), 2);
+        assert_eq!(app.member, 0);
+        press(&mut app, 'o');
+        assert_eq!(app.member, 1);
+        press(&mut app, 'o');
+        assert_eq!(app.member, 0, "member index did not wrap");
+    }
+
+    /// Rating must work identically in every view -- that is the whole point
+    /// of the single view existing.
+    #[test]
+    fn rating_works_in_grid_and_single_view() {
+        let (dir, mut app) = app();
+        press_code(&mut app, KeyCode::Tab); // grid
+        press(&mut app, '2');
+        assert_eq!(app.rows[0].rating, Some(2));
+
+        press_code(&mut app, KeyCode::Tab); // single
+        press(&mut app, 'l');
+        press(&mut app, '5');
+        assert_eq!(app.rows[1].rating, Some(5));
+        assert!(dir.path().join("2026/08/09/750_0002.xmp").exists());
     }
 
     #[test]

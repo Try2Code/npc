@@ -10,7 +10,6 @@
 use crate::db::Catalog;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]

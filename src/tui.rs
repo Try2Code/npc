@@ -347,6 +347,30 @@ impl App {
         }
     }
 
+    /// What is under the cursor, as a path relative to the library root plus
+    /// the actual filename. In grid view the tile shows only stars and marks,
+    /// so this is the only place the identity of a shot appears.
+    fn current_label(&self) -> Option<String> {
+        let row = self.rows.get(self.cursor)?;
+        let members = self.current_members();
+        let filename = members
+            .get(self.member.min(members.len().saturating_sub(1)))
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| row.base.clone());
+
+        let dir = std::path::Path::new(&row.dir)
+            .strip_prefix(&self.root)
+            .unwrap_or_else(|_| std::path::Path::new(&row.dir))
+            .to_string_lossy()
+            .to_string();
+
+        Some(if dir.is_empty() {
+            filename
+        } else {
+            format!("{dir}/{filename}")
+        })
+    }
+
     /// Files of the stack under the cursor, for the single view's `o` cycling.
     fn current_members(&self) -> Vec<(String, String)> {
         let Some(row) = self.rows.get(self.cursor) else {
@@ -770,19 +794,49 @@ impl App {
             View::Single => self.draw_single(f, cols[1]),
         }
 
-        // status / input
+        // Bottom area is two rows: what is selected, then what just happened.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(outer[1]);
+
+        let position = if self.rows.is_empty() {
+            String::new()
+        } else {
+            format!(" {}/{} ", self.cursor + 1, self.rows.len())
+        };
+        let identity = Line::from(vec![
+            Span::styled(
+                if self.query.is_empty() {
+                    "  all  ".to_string()
+                } else {
+                    format!("  {}  ", self.query)
+                },
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
+            Span::styled(position, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                self.current_label().unwrap_or_default(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                self.rows
+                    .get(self.cursor)
+                    .filter(|r| !r.tags.is_empty())
+                    .map(|r| format!("   [{}]", r.tags))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Blue),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(identity), rows[0]);
+
         let bottom = match self.input {
-            Input::None => Line::from(vec![
-                Span::styled(
-                    if self.query.is_empty() {
-                        "  all  ".to_string()
-                    } else {
-                        format!("  {}  ", self.query)
-                    },
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
-                Span::raw(format!(" {}", self.status)),
-            ]),
+            Input::None => Line::from(vec![Span::styled(
+                format!("  {}", self.status),
+                Style::default().fg(Color::DarkGray),
+            )]),
             _ => {
                 let prompt = match self.input {
                     Input::Query => "query",
@@ -800,7 +854,7 @@ impl App {
                 ])
             }
         };
-        f.render_widget(Paragraph::new(bottom), outer[1]);
+        f.render_widget(Paragraph::new(bottom), rows[1]);
 
         if self.show_help {
             self.overlay(f, " keys ", HELP);
@@ -1508,6 +1562,57 @@ mod tests {
         press(&mut app, '5');
         assert_eq!(app.rows[1].rating, Some(5));
         assert!(dir.path().join("2026/08/09/750_0002.xmp").exists());
+    }
+
+    /// The grid tile shows only stars, so the status area is the only place
+    /// the identity of a shot appears. It must be there in every view.
+    #[test]
+    fn the_status_area_names_the_selected_file() {
+        let (_d, mut app) = app();
+        for view in [View::List, View::Grid, View::Single] {
+            while app.view != view {
+                press_code(&mut app, KeyCode::Tab);
+            }
+            let screen = render(&mut app, 120, 30);
+            assert!(
+                screen.contains("750_0001"),
+                "{view:?} view does not name the selection:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_label_follows_the_cursor_and_the_member() {
+        let (_d, mut app) = app();
+        assert!(app.current_label().unwrap().contains("750_0001"));
+        press(&mut app, 'j');
+        assert!(app.current_label().unwrap().contains("750_0002"));
+
+        // `o` cycles members, and the label must name the actual file.
+        let first = app.current_label().unwrap();
+        press(&mut app, 'o');
+        let second = app.current_label().unwrap();
+        assert_ne!(first, second, "the label ignored the member cycle");
+        assert!(first.ends_with(".NEF") || first.ends_with(".JPG"));
+    }
+
+    /// The path is shown relative to the library root, not absolutely -- an
+    /// absolute path would push the filename off the end of the line.
+    #[test]
+    fn the_label_is_relative_to_the_library_root() {
+        let (dir, app) = app();
+        let label = app.current_label().unwrap();
+        assert!(!label.contains(dir.path().to_str().unwrap()));
+        assert!(label.starts_with("2026/08/09/"), "got {label}");
+    }
+
+    #[test]
+    fn tags_appear_next_to_the_filename() {
+        let (_d, mut app) = app();
+        press(&mut app, 't');
+        type_str(&mut app, "beach");
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("[beach]"), "tags missing:\n{screen}");
     }
 
     #[test]

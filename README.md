@@ -150,24 +150,47 @@ Token counts are not included: the tooling does not expose them to the agent,
 and inventing them would defeat the purpose of the exercise. The API and wall
 figures came from the human's side of the session.
 
-**What the human contributed beyond requirements.** Worth recording precisely,
-since it is the honest measure of where the boundary sat:
+**What the human contributed beyond requirements.** Recorded precisely,
+because it is the honest measure of where the boundary sat. Almost all of it
+came from running the program rather than reading it.
 
-- thumbnails being unusably small — reported twice, before the real cause was
-  found
-- the single view being too slow, *and* the fix: use a smaller embedded
-  preview. That suggestion was correct and made it 6x faster
+*Interaction design — essentially all of it:*
+
+- thumbnails unusably small, reported twice before the real cause was found
+- the filename missing from the status line in grid view
+- getting from single view back to grid in one key (became the enter/esc
+  zoom pair)
+- shift-tab for cycling views backward
+- page-up / page-down for screen-wise scrolling
+- showing date, shutter, aperture, ISO and exposure compensation — including
+  the `S` `A` `I` `EV` labels
+- where that panel goes: beside a portrait frame, below a landscape one
+- 4x the thumbnail pixels with higher JPEG compression
+- pointing out the screen could be measured rather than guessed at, which is
+  where the 1280 px grid and 1620 px view sizes came from
+
+*Diagnosis and correctness:*
+
+- the single view being too slow, **and the fix**: use a smaller embedded
+  preview. Correct, and 6x faster
+- a closed whitelist of file types, and dropping `.pp3` tracking entirely
 - an inconsistency between three different names for the same program
 - a hardcoded path that made the binary useless on any other machine
+- making the catalog location configurable
 - **asking for a test coverage workflow**, which then exposed an import-safety
-  suite that had been written into the plan and never implemented
-- unplugging the drive, which revealed that the entire offline mode — a
-  headline feature, written hours earlier — had never worked once
+  suite written into the plan and never implemented
+- unplugging the drive, which revealed the entire offline mode — a headline
+  feature, written hours earlier — had never worked once
 
 The last two are the sharpest. No test written by the agent would have found
 the offline bug, because the agent never pulled the cable. And the coverage
 gap was the agent failing to do what its own plan said, found only because
 someone asked for the instrument that measures it.
+
+The pattern is consistent: the agent was reliable at building what was
+specified and at verifying it against the specification. It was weak at
+noticing that the specification was not what a person actually wanted, and
+blind to anything requiring the program to be *used*.
 
 **What the agent found on its own.** Ground truth that contradicted its own
 plan: 1790 stacks rather than the 1722 asserted, computed in shell before

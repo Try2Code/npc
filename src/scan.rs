@@ -22,6 +22,7 @@ pub struct ScanStats {
     pub orphans: usize,
     pub vanished: usize,
     pub sidecars_read: usize,
+    pub events: usize,
     pub errors: Vec<String>,
 }
 
@@ -308,6 +309,8 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         }
     }
 
+    stats.events = derive_events(cat)?;
+
     Ok(stats)
 }
 
@@ -364,4 +367,53 @@ mod tests {
         assert!(json.contains(r"back\\slash"));
         assert!(json.contains(r"new\nline"));
     }
+}
+
+/// Group stacks into events: one per day of shooting.
+///
+/// The day comes from capture time, never from the file's mtime or its
+/// directory. That is what makes a JPG exported from a NEF months later land
+/// in the same event as the RAW it came from -- every sane converter copies
+/// DateTimeOriginal across, so the derived file dates itself to the shoot
+/// rather than to the export.
+///
+/// User-given names survive: events are keyed on the day, so re-deriving finds
+/// the same row and leaves `name` alone.
+pub fn derive_events(cat: &mut Catalog) -> Result<usize> {
+    let tx = cat.conn.transaction()?;
+
+    // A day, as the same as-if-UTC convention capture times are stored in.
+    tx.execute(
+        "INSERT OR IGNORE INTO event (start_time, end_time, auto)
+         SELECT DISTINCT
+             CAST(strftime('%s', date(f.capture_time, 'unixepoch')) AS INTEGER),
+             CAST(strftime('%s', date(f.capture_time, 'unixepoch')) AS INTEGER) + 86399,
+             1
+         FROM file f
+         WHERE f.capture_time IS NOT NULL",
+        [],
+    )?;
+
+    tx.execute(
+        "UPDATE stack SET event_id = (
+             SELECT e.id FROM event e
+             WHERE e.start_time = CAST(strftime('%s', date(
+                 (SELECT MIN(f.capture_time) FROM file f
+                   WHERE f.stack_id = stack.id AND f.capture_time IS NOT NULL),
+                 'unixepoch')) AS INTEGER))",
+        [],
+    )?;
+
+    // An event nothing points at is a leftover from deleted shots. Named ones
+    // are kept: the user said something about that day and may restore it.
+    tx.execute(
+        "DELETE FROM event
+         WHERE name IS NULL
+           AND id NOT IN (SELECT event_id FROM stack WHERE event_id IS NOT NULL)",
+        [],
+    )?;
+
+    let n: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
+    tx.commit()?;
+    Ok(n as usize)
 }

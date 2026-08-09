@@ -271,19 +271,20 @@ impl App {
             // Stacks with no capture time get an explicit bucket rather than
             // vanishing from this pane -- undated shots are exactly the ones
             // you need to find in order to fix them.
+            // Events are days of shooting. A named one shows its name, so the
+            // pane reads as a list of shoots rather than a list of dates.
             Sidebar::Dates => self
                 .cat
                 .conn
                 .prepare(
                     "SELECT COALESCE(
-                              strftime('%Y-%m-%d',
-                                (SELECT MIN(f.capture_time) FROM file f
-                                  WHERE f.stack_id = s.id AND f.capture_time IS NOT NULL),
-                                'unixepoch'),
+                              NULLIF(e.name, ''),
+                              date(e.start_time, 'unixepoch'),
                               'undated') AS d,
-                            COUNT(*) AS n
-                     FROM stack s
-                     GROUP BY d ORDER BY (d = 'undated'), d DESC",
+                            COUNT(s.id) AS n
+                     FROM stack s LEFT JOIN event e ON e.id = s.event_id
+                     GROUP BY COALESCE(e.id, -1)
+                     ORDER BY (e.start_time IS NULL), e.start_time DESC",
                 )?
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
                 .filter_map(Result::ok)
@@ -699,7 +700,7 @@ impl App {
                 if let Some((name, _)) = self.sidebar_items.get(self.sidebar_cursor) {
                     self.query = match self.sidebar {
                         Sidebar::Tags => format!("tag:\"{name}\""),
-                        Sidebar::Dates => format!("date={name}"),
+                        Sidebar::Dates => format!("event=\"{name}\""),
                     };
                     self.offset = 0;
                     self.cursor = 0;
@@ -1518,6 +1519,9 @@ mod tests {
         cat.conn
             .execute("UPDATE file SET capture_time = 1786233666", [])
             .unwrap();
+        // Events derive from capture time, which the fixture stamps after the
+        // scan, so they have to be recomputed here.
+        crate::scan::derive_events(&mut cat).unwrap();
         let app = App::with_catalog(cat, dir.path().to_path_buf()).unwrap();
         (dir, app)
     }
@@ -1684,18 +1688,18 @@ mod tests {
         assert_eq!(app.sidebar, Sidebar::Dates);
         assert!(
             app.sidebar_items.iter().any(|(d, _)| d == "2026-08-09"),
-            "dates sidebar is empty: {:?}",
+            "events sidebar should list the shooting day: {:?}",
             app.sidebar_items
         );
 
         press_code(&mut app, KeyCode::Left); // focus sidebar
         press_code(&mut app, KeyCode::Enter);
-        assert_eq!(app.query, "date=2026-08-09");
+        assert_eq!(app.query, "event=\"2026-08-09\"");
         assert_eq!(app.total, 3);
     }
 
     /// Undated stacks must remain reachable rather than silently missing from
-    /// the dates pane.
+    /// the events pane.
     #[test]
     fn undated_stacks_get_their_own_bucket() {
         let (_d, mut app) = app();
@@ -1703,6 +1707,7 @@ mod tests {
             .conn
             .execute("UPDATE file SET capture_time = NULL", [])
             .unwrap();
+        crate::scan::derive_events(&mut app.cat).unwrap();
         press(&mut app, 's');
         assert!(
             app.sidebar_items.iter().any(|(d, n)| d == "undated" && *n == 3),
@@ -2063,7 +2068,7 @@ mod tests {
         press_code(&mut app, KeyCode::Left); // focus sidebar
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::List, "zoom stole the sidebar's Enter");
-        assert!(app.query.starts_with("date="), "query: {}", app.query);
+        assert!(app.query.starts_with("event="), "query: {}", app.query);
     }
 
     /// Protected roots must gate actions too. The guard stops this program

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS volume (
@@ -19,10 +19,12 @@ CREATE TABLE IF NOT EXISTS volume (
     last_seen INTEGER
 );
 
+-- One event per day of shooting, derived from capture times. `name` is the
+-- user's and survives re-derivation; everything else is regenerated.
 CREATE TABLE IF NOT EXISTS event (
     id         INTEGER PRIMARY KEY,
     name       TEXT,
-    start_time INTEGER,
+    start_time INTEGER NOT NULL UNIQUE,
     end_time   INTEGER,
     auto       INTEGER NOT NULL DEFAULT 1
 );
@@ -286,6 +288,23 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
     if from < 3 {
         conn.execute("DELETE FROM file WHERE role = 'profile'", [])?;
         conn.execute("DELETE FROM orphan WHERE kind = 'profile'", [])?;
+    }
+
+    // v3 -> v4: events gain a unique day key. The table was never populated,
+    // so there is nothing to preserve -- but a UNIQUE column cannot be added
+    // by ALTER, so it is rebuilt.
+    if from < 4 {
+        conn.execute("DROP TABLE IF EXISTS event", [])?;
+        conn.execute_batch(
+            "CREATE TABLE event (
+                 id         INTEGER PRIMARY KEY,
+                 name       TEXT,
+                 start_time INTEGER NOT NULL UNIQUE,
+                 end_time   INTEGER,
+                 auto       INTEGER NOT NULL DEFAULT 1
+             );",
+        )?;
+        conn.execute("UPDATE stack SET event_id = NULL", [])?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

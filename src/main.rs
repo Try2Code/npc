@@ -131,6 +131,15 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List shooting days, and give them names.
+    Events {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Name an event: `photo events --name 3 "Ostsee"`. Names survive
+        /// rescanning; pass an empty string to clear one.
+        #[arg(long, num_args = 2, value_names = ["ID", "NAME"])]
+        name: Option<Vec<String>>,
+    },
     /// Report shots that appear more than once.
     Dupes {
         #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
@@ -566,6 +575,55 @@ fn main() -> Result<()> {
                 }
                 let (s, _) = scan::scan_root(&library, false)?;
                 println!("catalog now holds {} stacks", s.stacks);
+            }
+        }
+
+        Cmd::Events { root, name } => {
+            let cat = open_for(&root)?;
+
+            if let Some(args) = name {
+                let id: i64 = args[0].parse().context("event id must be a number")?;
+                let label = args[1].trim();
+                let value = (!label.is_empty()).then_some(label);
+                let n = cat.conn.execute(
+                    "UPDATE event SET name = ?2, auto = 0 WHERE id = ?1",
+                    rusqlite::params![id, value],
+                )?;
+                anyhow::ensure!(n == 1, "no event with id {id}");
+                println!(
+                    "event {id} {}",
+                    match value {
+                        Some(v) => format!("named `{v}`"),
+                        None => "name cleared".into(),
+                    }
+                );
+                return Ok(());
+            }
+
+            let mut stmt = cat.conn.prepare(
+                "SELECT e.id, date(e.start_time,'unixepoch'), COALESCE(e.name,''),
+                        COUNT(s.id)
+                 FROM event e LEFT JOIN stack s ON s.event_id = e.id
+                 GROUP BY e.id ORDER BY e.start_time DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut any = false;
+            for row in rows {
+                let (id, day, name, n) = row?;
+                println!("{id:>4}  {day}  {n:>6} stacks   {name}");
+                any = true;
+            }
+            if !any {
+                println!("no events yet; run `photo scan` first");
+            } else {
+                println!("\nname one with: photo events --name <id> \"<name>\"");
             }
         }
 

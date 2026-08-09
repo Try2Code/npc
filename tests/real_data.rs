@@ -286,6 +286,68 @@ fn fingerprint_tree(root: &Path) -> std::collections::BTreeMap<String, (u64, i64
         .collect()
 }
 
+/// Events are days of shooting, derived from capture time rather than from
+/// the directory layout. This library's folders run 08/01..08/09 but only
+/// seven of those days actually have frames, which is the distinction.
+#[test]
+fn events_are_one_per_day_of_shooting() {
+    require_library!();
+    let cat = scanned().unwrap();
+
+    let days: Vec<(String, i64)> = cat
+        .conn
+        .prepare(
+            "SELECT date(e.start_time,'unixepoch'), COUNT(s.id)
+             FROM event e LEFT JOIN stack s ON s.event_id = e.id
+             GROUP BY e.id ORDER BY e.start_time",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(days.len(), 7, "expected seven shooting days, got {days:?}");
+    assert_eq!(
+        days.iter().map(|(_, n)| n).sum::<i64>(),
+        EXPECTED_STACKS,
+        "every stack must belong to exactly one event"
+    );
+
+    let unassigned: i64 = cat
+        .conn
+        .query_row("SELECT COUNT(*) FROM stack WHERE event_id IS NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unassigned, 0);
+}
+
+/// A JPG exported from a NEF carries the RAW's capture time, so it lands in
+/// the shoot rather than on the day it was exported. That is the whole reason
+/// events key on capture time and not on mtime.
+#[test]
+fn a_derived_jpg_joins_the_event_of_its_raw() {
+    require_library!();
+    let cat = scanned().unwrap();
+
+    let mismatched: i64 = cat
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT s.id FROM stack s
+               JOIN file f ON f.stack_id = s.id
+               WHERE f.capture_time IS NOT NULL
+               GROUP BY s.id
+               HAVING COUNT(DISTINCT date(f.capture_time,'unixepoch')) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} stacks have members dated to different days"
+    );
+}
+
 #[test]
 fn role_helpers_agree_with_the_library_layout() {
     require_library!();

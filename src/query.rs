@@ -103,6 +103,7 @@ KEYS
   rating       rating>=4   rating=0   rating!=5
   year         year=2026   year=2024..2026
   date         date=2026-08-09        date=2026-08-01..2026-08-09
+  event        event~Ostsee           event=2026-08-09
   camera       camera~D750            camera=\"NIKON D750\"
   lens         lens~80-200
   serial       serial=6094708
@@ -414,6 +415,26 @@ impl Parser {
                 Ok(self.capture_between(lo, hi))
             }
 
+            // Match an event by name, or by its day when the value looks like
+            // a date -- both are how a shoot gets referred to.
+            "event" => {
+                if op == Op::Like {
+                    let p = self.bind(Value::Text(format!("%{value}%")));
+                    Ok(format!(
+                        "EXISTS (SELECT 1 FROM event e WHERE e.id = s.event_id
+                                 AND COALESCE(e.name,'') LIKE {p})"
+                    ))
+                } else {
+                    let name = self.bind(Value::Text(value.to_string()));
+                    let day = self.bind(Value::Text(value.to_string()));
+                    Ok(format!(
+                        "EXISTS (SELECT 1 FROM event e WHERE e.id = s.event_id
+                                 AND (COALESCE(e.name,'') = {name}
+                                      OR date(e.start_time,'unixepoch') = {day}))"
+                    ))
+                }
+            }
+
             "camera" | "lens" | "serial" => Ok(self.file_text(key, op, value)),
             "ext" => Ok(self.file_text("ext", op, value)),
             "role" => Ok(self.file_text("role", op, value)),
@@ -452,7 +473,7 @@ impl Parser {
 
             other => Err(anyhow!(
                 "unknown key `{other}`. Known: tag rating year date camera lens serial \
-                 ext role iso shutter width height path name title description"
+                 event ext role iso shutter width height path name title description"
             )),
         }
     }
@@ -694,6 +715,7 @@ mod tests {
             ("rating", "rating>=4"),
             ("year", "year=2026"),
             ("date", "date=2026-08-09"),
+            ("event", "event~Ostsee"),
             ("camera", "camera~D750"),
             ("lens", "lens~80-200"),
             ("serial", "serial=6094708"),

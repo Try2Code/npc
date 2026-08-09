@@ -90,6 +90,11 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// The browser.
+    Tui {
+        #[arg(default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+    },
     /// Write every pending edit out to its sidecar.
     Sync {
         #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
@@ -628,6 +633,8 @@ fn main() -> Result<()> {
                 eprintln!("error: {e}");
             }
         }
+
+        Cmd::Tui { root } => npc::tui::run(root)?,
 
         Cmd::Status { root } => {
             let v = vol::identify(&root)?;

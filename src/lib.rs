@@ -5,6 +5,7 @@
 //! and the SQLite catalog is a rebuildable cache that can be thrown away
 //! without losing anything.
 
+pub mod action;
 pub mod config;
 pub mod db;
 pub mod dupes;
@@ -15,4 +16,5 @@ pub mod query;
 pub mod scan;
 pub mod stack;
 pub mod trash;
+pub mod tui;
 pub mod vol;

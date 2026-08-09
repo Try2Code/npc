@@ -1,6 +1,6 @@
 //! The catalog: a rebuildable cache, never the only copy of anything.
 //!
-//! Everything here can be regenerated from the drive with `photo scan --full`.
+//! Everything here can be regenerated from the drive with `npc scan --full`.
 //! That is the whole stability argument: losing this file costs time, not work.
 //! Tags, ratings and titles live in sidecars; this is an index over them.
 
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS trashed (
 );
 
 -- Orphans: a profile or sidecar whose image members are all gone. Recorded
--- rather than ignored so `photo doctor` can report them.
+-- rather than ignored so `npc doctor` can report them.
 CREATE TABLE IF NOT EXISTS orphan (
     path   TEXT PRIMARY KEY,
     kind   TEXT NOT NULL,
@@ -333,7 +333,7 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
         );
     }
 
-    // v1 -> v2: exposure compensation. Backfilled by `photo scan --full`;
+    // v1 -> v2: exposure compensation. Backfilled by `npc scan --full`;
     // until then the column is simply NULL and the UI shows nothing.
     if from < 2 {
         let has_column: bool = conn

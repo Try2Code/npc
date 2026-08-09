@@ -4,7 +4,7 @@ use npc::{db::Catalog, meta, scan, vol};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "photo", about = "Terminal photo catalog", version)]
+#[command(name = "npc", about = "Terminal photo catalog", version)]
 struct Cli {
     /// Fail any mutating operation at dispatch. Defaults on until the write
     /// path is verified end to end; see PLAN.md.
@@ -35,7 +35,7 @@ enum Cmd {
     Volume { path: PathBuf },
     /// Catalog summary.
     Status { root: PathBuf },
-    /// Select stacks with the query language. See `photo find --help-syntax`.
+    /// Select stacks with the query language. See `npc find --help-syntax`.
     Find {
         /// e.g. "beach and rating>=4", "year=2026 camera~D750 -private"
         #[arg(default_value = "")]
@@ -95,7 +95,7 @@ enum Cmd {
     },
     /// Run a configured action on the stacks a query selects.
     Exec {
-        /// Action name or key, as listed by `photo exec --list`
+        /// Action name or key, as listed by `npc exec --list`
         #[arg(default_value = "")]
         action: String,
         #[arg(short = 'q', long)]
@@ -132,7 +132,7 @@ enum Cmd {
         prune: bool,
     },
     /// Report what this terminal can actually do. Run it inside the terminal
-    /// you use for `photo tui`.
+    /// you use for `npc tui`.
     Term,
     /// Write resized copies into a directory outside the library.
     Export {
@@ -195,7 +195,7 @@ enum Cmd {
     Events {
         #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
         root: PathBuf,
-        /// Name an event: `photo events --name 3 "Ostsee"`. Names survive
+        /// Name an event: `npc events --name 3 "Ostsee"`. Names survive
         /// rescanning; pass an empty string to clear one.
         #[arg(long, num_args = 2, value_names = ["ID", "NAME"])]
         name: Option<Vec<String>>,
@@ -647,7 +647,7 @@ fn main() -> Result<()> {
             let chosen = actions
                 .iter()
                 .find(|a| a.name.eq_ignore_ascii_case(&action) || a.key == action)
-                .ok_or_else(|| anyhow::anyhow!("no action `{action}`; try `photo exec --list`"))?;
+                .ok_or_else(|| anyhow::anyhow!("no action `{action}`; try `npc exec --list`"))?;
 
             let config = npc::config::Config::load()?;
             let cat = open_for(&root)?;
@@ -813,9 +813,9 @@ fn main() -> Result<()> {
                 any = true;
             }
             if !any {
-                println!("no events yet; run `photo scan` first");
+                println!("no events yet; run `npc scan` first");
             } else {
-                println!("\nname one with: photo events --name <id> \"<name>\"");
+                println!("\nname one with: npc events --name <id> \"<name>\"");
             }
         }
 
@@ -901,7 +901,7 @@ fn main() -> Result<()> {
                 stats.files,
                 target.root.display()
             );
-            println!("restore with `photo untrash <base>`; nothing was deleted");
+            println!("restore with `npc untrash <base>`; nothing was deleted");
             for e in &stats.errors {
                 eprintln!("error: {e}");
             }

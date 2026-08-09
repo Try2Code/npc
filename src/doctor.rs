@@ -147,7 +147,7 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
             .with(changed)
             .fix(
                 "Something other than this tool wrote to them -- an editor or a \
-              viewer embedding a rating. Run `photo scan --full` to re-read \
+              viewer embedding a rating. Run `npc scan --full` to re-read \
               them, or investigate first if that is unexpected.",
             ),
     )
@@ -216,7 +216,7 @@ fn check_pending(cat: &Catalog) -> Result<Finding> {
     }
     Ok(
         Finding::warn(format!("{n} edit(s) not yet written to disk")).fix(
-            "Run `photo sync` with the drive attached. Until then they exist \
+            "Run `npc sync` with the drive attached. Until then they exist \
               only in the catalog, which is the one place this design does not \
               want anything to exist only.",
         ),
@@ -253,7 +253,7 @@ fn check_duplicates(cat: &Catalog) -> Result<Finding> {
     Ok(
         Finding::note(format!("{} duplicate group(s)", groups.len()))
             .with(detail)
-            .fix("See `photo dupes` for the full list."),
+            .fix("See `npc dupes` for the full list."),
     )
 }
 
@@ -287,7 +287,7 @@ fn check_cache(root: &Path) -> Result<Finding> {
 
     if !dir.exists() {
         return Ok(Finding::note("no thumbnail cache yet")
-            .fix("Built on demand, or all at once with `photo thumbs`."));
+            .fix("Built on demand, or all at once with `npc thumbs`."));
     }
     let (mut files, mut bytes) = (0u64, 0u64);
     for e in walkdir::WalkDir::new(&dir)
@@ -303,7 +303,7 @@ fn check_cache(root: &Path) -> Result<Finding> {
         "thumbnail cache: {files} files, {:.0} MB",
         bytes as f64 / 1e6
     ))
-    .fix("`photo thumbs --prune` removes entries nothing asks for any more."))
+    .fix("`npc thumbs --prune` removes entries nothing asks for any more."))
 }
 
 fn check_protection(root: &Path, config: &Config) -> Finding {

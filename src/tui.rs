@@ -327,7 +327,7 @@ impl App {
                 match p.protocol_type() {
                     ratatui_image::picker::ProtocolType::Halfblocks => format!(
                         "no graphics protocol - falling back to halfblocks ({cw}x{ch}px cells). \
-                         Photos will not be identifiable. Run `photo term` to diagnose."
+                         Photos will not be identifiable. Run `npc term` to diagnose."
                     ),
                     other => format!("{other:?} graphics, {cw}x{ch}px cells. ? for help."),
                 }
@@ -1453,7 +1453,7 @@ const HELP: &str = "\
  v                    range: press once to start, again to close
  esc                  clear selection (outside single view)
 
- /                    query  (same syntax as `photo find`)
+ /                    query  (same syntax as `npc find`)
  t  T                 add / remove tags (comma separated)
  i                    set title
  1-5                  rate    0  clear rating

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
 
 [[bin]]
-name = "photo"
+name = "npc"
 path = "src/main.rs"
 
 [dependencies]

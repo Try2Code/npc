@@ -210,7 +210,7 @@ impl Cache {
         None
     }
 
-    /// Generate synchronously. Used by `photo thumbs` for bulk pre-warming.
+    /// Generate synchronously. Used by `npc thumbs` for bulk pre-warming.
     pub fn make_now(&self, src: &Source, size: Size) -> Result<PathBuf> {
         let out = self.path_for(src, size);
         if out.exists() {

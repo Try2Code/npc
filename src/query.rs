@@ -1,6 +1,6 @@
 //! The query language, compiled to SQL.
 //!
-//! One parser backs `photo find`, the bulk subcommands and the TUI's `/`, so
+//! One parser backs `npc find`, the bulk subcommands and the TUI's `/`, so
 //! the syntax is learned once. Barewords are tag names and adjacency implies
 //! AND, which makes the common case short:
 //!
@@ -78,7 +78,7 @@ impl Compiled {
     }
 }
 
-/// The reference, printed by `photo find --help-syntax`. Kept here beside the
+/// The reference, printed by `npc find --help-syntax`. Kept here beside the
 /// parser so the two cannot drift: every key listed below is one the parser
 /// actually accepts.
 pub const SYNTAX: &str = "\
@@ -133,12 +133,12 @@ OPERATORS
 
 EXAMPLES
 
-  photo find 'rating>=4'
-  photo find 'beach rating>=4 -private'
-  photo find 'year=2026 camera~D750 untagged'
-  photo find 'date=2026-08-01..2026-08-09 iso>1600'
-  photo find 'flagged and not rejected'
-  photo find 'rating=5 or flagged' --files --print0 | xargs -0 ls -l
+  npc find 'rating>=4'
+  npc find 'beach rating>=4 -private'
+  npc find 'year=2026 camera~D750 untagged'
+  npc find 'date=2026-08-01..2026-08-09 iso>1600'
+  npc find 'flagged and not rejected'
+  npc find 'rating=5 or flagged' --files --print0 | xargs -0 ls -l
 
   Values are always bound as parameters, so a tag containing quotes or
   semicolons is data, never syntax.
@@ -771,7 +771,7 @@ mod tests {
         // ..and the worked examples must all compile.
         for line in SYNTAX.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("photo find '") {
+            if let Some(rest) = line.strip_prefix("npc find '") {
                 let q = &rest[..rest.find('\'').expect("unterminated example")];
                 compile(q).unwrap_or_else(|e| panic!("example `{q}` does not parse: {e}"));
             }

@@ -73,9 +73,9 @@ impl Config {
         if let Some(dir) = &self.catalog_dir {
             return expand_home(dir);
         }
-        directories::ProjectDirs::from("", "", "photo-catalog")
+        directories::ProjectDirs::from("", "", "npc")
             .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".photo-catalog"))
+            .unwrap_or_else(|| PathBuf::from(".npc"))
     }
 
     /// Where thumbnails are kept, under the same directory when one is
@@ -85,9 +85,9 @@ impl Config {
         if let Some(dir) = &self.catalog_dir {
             return expand_home(dir).join("thumbnails");
         }
-        directories::ProjectDirs::from("", "", "photo-catalog")
+        directories::ProjectDirs::from("", "", "npc")
             .map(|d| d.cache_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".photo-cache"))
+            .unwrap_or_else(|| PathBuf::from(".npc-cache"))
     }
 }
 
@@ -104,9 +104,9 @@ fn expand_home(path: &Path) -> PathBuf {
 
 impl Config {
     pub fn path() -> PathBuf {
-        directories::ProjectDirs::from("", "", "photo-catalog")
+        directories::ProjectDirs::from("", "", "npc")
             .map(|d| d.config_dir().join("config.toml"))
-            .unwrap_or_else(|| PathBuf::from("photo-catalog.toml"))
+            .unwrap_or_else(|| PathBuf::from("npc.toml"))
     }
 
     pub fn load() -> Result<Self> {
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn catalog_dir_defaults_to_xdg_and_is_overridable() {
         let default = Config::default();
-        assert!(default.catalog_store().ends_with("photo-catalog"));
+        assert!(default.catalog_store().ends_with("npc"));
 
         let moved = Config {
             catalog_dir: Some(PathBuf::from("/data/photo-catalogs")),

@@ -55,7 +55,7 @@ than trusted:
 
 Two consequences worth stating up front rather than discovering later:
 
-**Rotation is sidecar-only, so plain viewers won't honour it.** `photo rotate` writes
+**Rotation is sidecar-only, so plain viewers won't honour it.** `npc rotate` writes
 `Xmp.tiff.Orientation` to the sidecar. This tool honours it, and so do Lightroom, Bridge, and
 digiKam. But `eog` or `feh` opening the JPG directly read EXIF, ignore sidecars, and will show
 it unrotated.
@@ -73,8 +73,8 @@ Until M6 the invariant is absolute, which is the point of deferring: every safet
 M5 is written against "nothing ever opens an original for writing", so the exception arrives
 as a separately-tested carve-out rather than a hole present from the start.
 
-**`photo trash` is the one command that touches originals** — it *moves* them to `.trash/`.
-No bytes change, it's reversible via `photo restore`, it never runs automatically, and
+**`npc trash` is the one command that touches originals** — it *moves* them to `.trash/`.
+No bytes change, it's reversible via `npc restore`, it never runs automatically, and
 `--read-only` blocks it. Flagged here because it's the single exception to "this tool only
 ever reads your photos", even though it isn't an exception to "never changes them".
 
@@ -96,7 +96,7 @@ root, leaving system cargo alone. System cargo 1.75 is from Dec 2023, old enough
 pinning several crates, and the nightly-only tools (Miri, `cargo-fuzz`) are unavailable
 without it.
 
-Thumbnails need `photo tui` to be running *inside* kitty; `ratatui-image` detects the protocol
+Thumbnails need `npc tui` to be running *inside* kitty; `ratatui-image` detects the protocol
 by querying the terminal at startup rather than trusting `$TERM`, and falls back cleanly if
 you launch it somewhere else.
 
@@ -128,7 +128,7 @@ caveat below.
 
 | Shotwell feature | Here |
 |---|---|
-| Import from card into dated folders | **Yes** — `photo import`, copy-only, hash-verified |
+| Import from card into dated folders | **Yes** — `npc import`, copy-only, hash-verified |
 | Duplicate detection on import | **Yes** — capture time + serial + shutter count, hash fallback |
 | Thumbnail grid browsing | **Yes** — from embedded RAW previews |
 | Event / date navigation | **Yes** — year/month/day tree plus gap-derived events |
@@ -158,7 +158,7 @@ its library database, so a corrupt DB loses real work. This design inverts that,
 the stability story follows from it:
 
 - **The catalog is disposable.** Tags, ratings, titles, flags all live in sidecars on the
-  drive. Total catalog loss costs `photo scan --full` and some waiting — nothing else.
+  drive. Total catalog loss costs `npc scan --full` and some waiting — nothing else.
 - **Originals are never written** — see the invariant above.
 - **Every write is atomic** — temp file plus `rename()` within the same directory, so an
   interrupted write cannot truncate a sidecar.
@@ -171,7 +171,7 @@ the stability story follows from it:
 - **Panic policy.** No `unwrap()` on anything file-derived; `catch_unwind` around the TUI so a
   panic restores the terminal and prints the error rather than leaving a wrecked tty. Exiv2
   exceptions arrive as `Result` via `cxx`, so a corrupt file is a skipped row, never an abort.
-- **Migrations copy the DB first**; `photo doctor` is the consistency checker.
+- **Migrations copy the DB first**; `npc doctor` is the consistency checker.
 - Fuzz targets on the query parser and the sidecar reader — the two places untrusted input
   meets parsing logic.
 
@@ -218,7 +218,6 @@ member carries a `role`:
 | `750_6926.NEF` | `raw` | the original |
 | `750_6926.JPG` | `oocjpg` | out-of-camera JPG, what you cull on |
 | `750_6926_NEF_embedded.jpg` | `derived` | an already-extracted preview |
-| `750_6926.NEF.pp3` | `profile` | a RawTherapee processing profile |
 
 Two rules fall out of this, both of which matter more than they look:
 
@@ -234,8 +233,9 @@ while the stored name stays literal.
 
 Roles also make the action placeholders resolve correctly: `{raw}` is the NEF, `{jpg}` is the
 out-of-camera JPG — never the extracted preview, which you'd never want opened in RawTherapee.
-And `profile` members ride along with their stack through trash and restore, so a `.pp3` never
-gets orphaned from the RAW it describes.
+RawTherapee `.pp3` profiles are not catalogued at all, but they still ride
+along with their stack through trash and restore -- a profile left pointing at
+an image that has moved is litter.
 
 ## Layout
 
@@ -344,7 +344,7 @@ until measured, not designed for speculatively.
 ## Import
 
 ```
-photo import /media/card              copy into <library>/YYYY/MM/DD/ by EXIF capture date
+npc import /media/card              copy into <library>/YYYY/MM/DD/ by EXIF capture date
   --in-place PATH                     register where files already are, no copy
   --dry-run                           show the plan
 ```
@@ -356,7 +356,7 @@ there is no `--move`, by choice. A name collision against a genuinely different 
 
 **Dedupe** matches on capture time + camera serial + shutter count, exact for Nikon bodies via
 Exiv2's maker-note support. Files that collide on `(capture_time, size)` but lack serial data
-fall back to a blake3 content hash. `photo dupes` reports groups across the library; resolving
+fall back to a blake3 content hash. `npc dupes` reports groups across the library; resolving
 them is left to trash and the action system rather than an automatic rule.
 
 ## Metadata via Exiv2
@@ -398,7 +398,7 @@ than the 1.75 MB full-resolution one.
 
 The cache lives on the **laptop** deliberately: nothing is ever written beside your photos for
 display purposes, and with offline queries it means browsing and tagging visually with the SSD
-unplugged. Generation is lazy (visible page plus prefetch window), with `photo thumbs` to
+unplugged. Generation is lazy (visible page plus prefetch window), with `npc thumbs` to
 pre-warm after an import.
 
 **Rendering** via `ratatui-image`. Targeting the **kitty graphics protocol** as the primary
@@ -462,7 +462,7 @@ than from you. `shell = true` exists as an explicit opt-in and is documented as 
 
 Note the boundary: RawTherapee and darktable are non-destructive editors and write their own
 sidecars, so the invariant survives the handoff. GIMP is not — if you open a JPG in GIMP and
-save, that's your edit, outside this tool's control. `photo doctor` reports when a file's
+save, that's your edit, outside this tool's control. `npc doctor` reports when a file's
 mtime changed underneath the catalog, so at least it won't be silent.
 
 Modes: `detach` (GUI launches, TUI stays live), `wait` (leave the alternate screen, restore
@@ -474,7 +474,7 @@ the terminal, run in foreground, resume cleanly), `term` (output into an overlay
 ## Export
 
 ```
-photo export --size 2048 --quality 88 -o ~/web -- 'beach rating>=4'
+npc export --size 2048 --quality 88 -o ~/web -- 'beach rating>=4'
   --strip          drop metadata
   --keep-structure mirror YYYY/MM/DD under the target
 ```
@@ -494,10 +494,10 @@ profiles are already sitting next to those files. The subcommand says exactly th
 ## Trash
 
 ```
-photo trash -- 'rejected'      move stacks to <library>/.trash/, path preserved
+npc trash -- 'rejected'      move stacks to <library>/.trash/, path preserved
 photo restore PATH             put one back
-photo trash --list             what's in there
-photo trash --empty            the only real delete; counts and confirms
+npc trash --list             what's in there
+npc trash --empty            the only real delete; counts and confirms
 ```
 
 A rename within one filesystem: atomic, instant, reversible. Every member moves together —
@@ -519,40 +519,40 @@ event~"Ostsee" title~sunset
 ```
 
 Keys: `tag: rating year date event camera lens iso ext path title description
-untagged flagged rejected edited offline`, where `edited` means the stack has a RawTherapee
-`.pp3` profile. Operators `= != > >= < <= ~` and `..` ranges. Each tag
+untagged flagged rejected offline`. Operators `= != > >= < <= ~` and `..` ranges. Each tag
 term becomes an `EXISTS` against `stack_tag`, served directly by the reverse index. Values are
 always bound as parameters, never interpolated.
 
-One parser backs `photo find`, `photo exec`, every bulk subcommand, and the TUI's `/`.
+One parser backs `npc find`, `npc exec`, every bulk subcommand, and the TUI's `/`.
 
 ## Commands
 
 ```
-photo import PATH        ingest from a card; --in-place, --dry-run
-photo scan [ROOT]        incremental; --full to reparse
-photo find QUERY         --print0, --files|--stacks, --format, --limit
-photo tags               names with counts; --tree for hierarchies
-photo tag add|rm NAMES -- (QUERY | paths)
-photo rate N             -- (QUERY | paths)
-photo flag|reject        -- (QUERY | paths)
-photo set title|description VALUE -- (QUERY | paths)
-photo rotate cw|ccw|180  -- (QUERY | paths)      sidecar only
-photo events             list; --name ID NAME to name one
-photo dupes              duplicate groups
-photo export ...         resized copies into a directory outside the library
-photo trash ...          trash / restore / list / empty
-photo thumbs [-- QUERY]  pre-warm the cache
-photo exec ACTION -- QUERY
-photo sync               flush queued sidecar writes
-photo doctor             drift, orphan sidecars, pending writes, broken actions, cache size,
+npc import PATH        ingest from a card; --in-place, --dry-run
+npc scan [ROOT]        incremental; --full to reparse
+npc find QUERY         --print0, --files|--stacks, --format, --limit
+npc tags               names with counts; --tree for hierarchies
+npc tag add|rm NAMES -- (QUERY | paths)
+npc rate N             -- (QUERY | paths)
+npc mark flag|reject|clear -- (QUERY | paths)
+npc set title|description VALUE -- (QUERY | paths)
+npc rotate cw|ccw|180  -- (QUERY | paths)      sidecar only
+npc events             list; --name ID NAME to name one
+npc dupes              duplicate groups
+npc export ...         resized copies into a directory outside the library
+npc trash ...          trash / restore / list / empty
+npc thumbs [-- QUERY]  pre-warm the cache
+npc exec ACTION -- QUERY
+npc sync               flush queued sidecar writes
+npc completion SHELL   shell completion script
+npc doctor             drift, orphan sidecars, pending writes, broken actions, cache size,
                          and any original whose mtime changed behind our back
-photo tui                the browser
+npc tui                the browser
 
 --read-only              global; fails any mutating operation at dispatch
 ```
 
-`photo find --print0 | xargs -0` stays the escape hatch into your existing workflow.
+`npc find --print0 | xargs -0` stays the escape hatch into your existing workflow.
 
 ## Offline behaviour
 
@@ -591,8 +591,9 @@ Four things this changes in the plan, all folded in above:
 1. **Derived-file folding is mandatory, not a nicety.** 1182 `_NEF_embedded.jpg` files would
    otherwise become 1182 phantom stacks — a bug that would have looked like "the catalog is
    double-counting everything" and been annoying to diagnose after the fact.
-2. **`.pp3` files mean RawTherapee is already in the workflow**, so profiles ride with their
-   stack through trash/restore and `edited` becomes a query key.
+2. **`.pp3` files mean RawTherapee is already in the workflow.** They ride with
+   their stack through trash/restore but are otherwise ignored -- see the
+   note at the end of this document.
 3. **`.JPG` and `.jpg` carry different meanings here**, so extension matching classifies
    case-insensitively while preserving the literal name.
 4. **Thumbnails get cheaper** — where an `_NEF_embedded.jpg` exists, no Exiv2 call is needed.
@@ -634,7 +635,7 @@ the suite passes here.
    mtime-identical before and after. Plus a source-level check that `writeMetadata()` appears
    only in `write_sidecar` and `stamp_export`.
 2. **The preservation test** — a sidecar carrying foreign darktable properties must keep every
-   one of them byte-identical after `photo tag add` rewrites `dc:subject`.
+   one of them byte-identical after `npc tag add` rewrites `dc:subject`.
 3. **Argv injection** — a stack named `DSC 01'23"; rm -rf x.NEF` must reach the child as one
    intact argv element, asserted against a recording stub for every placeholder.
 4. **Import safety** — the source directory is byte-identical after import (mtimes included);
@@ -722,6 +723,23 @@ Practical shape: one CI job per target producing a static binary, plus a
 smoke-test job that runs the invariant and preservation suites against the
 artifact itself. That is also the point at which the "no CI" decision above
 should be revisited -- releases are the use case that justifies it, not tests.
+
+## What changed during the build
+
+The plan was mostly right. Four things were not, and are recorded here rather
+than quietly corrected above:
+
+- **Stack count.** The plan asserted 1722; ground truth is 1790, because 68
+  JPGs have no NEF. Computed in shell before writing the code.
+- **Thumbnail sources.** The plan called the `_NEF_embedded.jpg` files a
+  shortcut. They are the *full-resolution* preview tier, so using them cost
+  4.7x. Letting Exiv2 pick a tier from the RAW is the cheap path.
+- **`.pp3` tracking and the `edited` key.** Both removed. Profiles are
+  RawTherapee's business; the tool now uses a closed whitelist of `.nef`,
+  `.jpg`/`.jpeg` and `.xmp`.
+- **The offline path.** Written in M2, described here, and broken from the
+  first line until the drive was physically unplugged in M6. Resolving a
+  volume canonicalises the path, which cannot work when the path is gone.
 
 ## Milestones (continued)
 

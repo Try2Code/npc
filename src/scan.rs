@@ -21,6 +21,7 @@ pub struct ScanStats {
     pub stacks: usize,
     pub orphans: usize,
     pub vanished: usize,
+    pub sidecars_read: usize,
     pub errors: Vec<String>,
 }
 
@@ -163,6 +164,10 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
     }
 
     // --- write ---------------------------------------------------------------
+    // (stack_id, sidecar path, its mtime) -- ingested after the transaction, so
+    // tags made in darktable or digiKam are picked up on the next scan.
+    let mut sidecars_found: Vec<(i64, String, i64)> = Vec::new();
+
     let tx = cat.conn.transaction()?;
     {
         let mut ins_stack = tx.prepare(
@@ -197,7 +202,17 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         for ((dir, base), members) in &stacks {
             let sid: i64 = ins_stack.query_row(rusqlite::params![dir, base], |r| r.get(0))?;
 
+            // A sidecar is metadata about the stack, not a member of it. Record
+            // it for ingestion below; never let it become a `file` row, or it
+            // would be counted as a photograph.
+            if let Some(sc) = members.iter().find(|m| m.role == Role::Sidecar) {
+                sidecars_found.push((sid, format!("{dir}/{}", sc.name), sc.mtime_ns));
+            }
+
             for m in members {
+                if m.role == Role::Sidecar {
+                    continue;
+                }
                 let path = format!("{dir}/{}", m.name);
                 let fm = parsed.get(&path);
                 ins_file.execute(rusqlite::params![
@@ -256,6 +271,41 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
     }
 
     tx.commit()?;
+
+    // --- ingest sidecars ------------------------------------------------------
+    // Only when the sidecar's own mtime moved, so a rescan of an untouched
+    // library re-reads nothing. A dirty stack is skipped: our unflushed edit is
+    // newer than whatever is on disk and must not be clobbered by it.
+    for (sid, path, mtime) in sidecars_found {
+        let (known_mtime, dirty): (Option<i64>, i64) = cat
+            .conn
+            .query_row(
+                "SELECT sidecar_mtime, dirty FROM stack WHERE id = ?1",
+                [sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((None, 0));
+
+        if dirty == 1 {
+            continue;
+        }
+        if !full && known_mtime == Some(mtime) {
+            continue;
+        }
+
+        match crate::edit::ingest_sidecar(cat, sid, Path::new(&path)) {
+            Ok(true) => {
+                cat.conn.execute(
+                    "UPDATE stack SET sidecar_mtime = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, mtime],
+                )?;
+                stats.sidecars_read += 1;
+            }
+            Ok(false) => {}
+            Err(e) => stats.errors.push(format!("{path}: {e}")),
+        }
+    }
+
     Ok(stats)
 }
 

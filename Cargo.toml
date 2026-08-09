@@ -17,6 +17,8 @@ walkdir = "2"
 rayon = "1"
 directories = "5"
 rustix = { version = "0.38", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [build-dependencies]
 cxx-build = "1.0"

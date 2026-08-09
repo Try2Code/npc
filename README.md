@@ -26,7 +26,7 @@ comes first.
   - [What failed](#what-failed)
   - [Where the human time went](#where-the-human-time-went)
   - [The honest summary](#the-honest-summary)
-- [Why the next photo catalogue](#why-the-next-photo-catalogue)
+- [Why the next photo catalog](#why-the-next-photo-catalog)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Commands](#commands)
@@ -163,7 +163,7 @@ The mitigations that worked were structural, not attentional:
 
 That last one found more than every test in this repository combined.
 
-## Why the next photo catalogue
+## Why the next photo catalog
 
 Shotwell's core, in a terminal, fast enough for a large library and stable
 enough to trust with originals. Full-resolution thumbnails come out of the

@@ -279,7 +279,7 @@ pub fn hash_file(path: &Path) -> Result<blake3::Hash> {
     Ok(hasher.finalize())
 }
 
-/// `(serial, shutter_count) -> "dir/base"` for everything already catalogued.
+/// `(serial, shutter_count) -> "dir/base"` for everything already cataloged.
 /// Exact for Nikon bodies, which is what makes import dedupe reliable rather
 /// than heuristic.
 fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), String>> {

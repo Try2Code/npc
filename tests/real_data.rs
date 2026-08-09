@@ -18,7 +18,7 @@ const LIBRARY: &str = "/home/ram/src/tasks/test-data";
 //   1722 distinct .NEF basenames
 //   +  68 .JPG with no matching .NEF
 //   = 1790 stacks
-// RawTherapee .pp3 profiles are not catalogued at all, so the three leftover
+// RawTherapee .pp3 profiles are not cataloged at all, so the three leftover
 // ones whose images no longer exist are simply invisible rather than orphans.
 const EXPECTED_STACKS: i64 = 1790;
 const EXPECTED_ORPHANS: i64 = 0;
@@ -102,7 +102,7 @@ fn stray_profiles_are_invisible_rather_than_orphans() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(profiles, 0, "a .pp3 was catalogued");
+    assert_eq!(profiles, 0, "a .pp3 was cataloged");
 }
 
 /// A directory whose composition is known exactly: 71 shots, each with a RAW,
@@ -142,7 +142,7 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         "{odd} stacks in 08/09 lack the expected image members"
     );
 
-    // Exactly the three image roles. Profiles are no longer catalogued, so
+    // Exactly the three image roles. Profiles are no longer cataloged, so
     // opening a shot in RawTherapee can no longer change this.
     let roles: Vec<String> = cat
         .conn

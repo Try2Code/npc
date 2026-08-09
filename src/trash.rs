@@ -7,7 +7,7 @@
 //! unlinked until `empty`, which counts and confirms first.
 //!
 //! Every member moves together: RAW, JPG, extracted preview and sidecar, plus
-//! any RawTherapee `.pp3` sitting beside them. Profiles are not catalogued,
+//! any RawTherapee `.pp3` sitting beside them. Profiles are not cataloged,
 //! but a profile separated from the RAW it describes is useless litter.
 
 use crate::config::Config;
@@ -50,7 +50,7 @@ fn members_on_disk(cat: &Catalog, stack_id: i64) -> Result<(PathBuf, String, Vec
         names.push(sidecar);
     }
 
-    // RawTherapee profiles are not catalogued -- they are none of this tool's
+    // RawTherapee profiles are not cataloged -- they are none of this tool's
     // business -- but leaving one behind pointing at an image that has moved is
     // litter. Matched exactly as `<member>.pp3` rather than by prefix, because
     // `750_6926` is a prefix of `750_6926_1` and prefix matching would drag a

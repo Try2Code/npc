@@ -1523,7 +1523,7 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 }
 
 /// Run the browser. The terminal is restored even on panic: leaving a user in
-/// a wrecked tty because of a bug in a photo cataloguer is not acceptable.
+/// a wrecked tty because of a bug in a photo cataloger is not acceptable.
 pub fn run(root: PathBuf) -> Result<()> {
     let mut app = App::new(root)?;
 

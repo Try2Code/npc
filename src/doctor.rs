@@ -94,7 +94,7 @@ pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> 
     ])
 }
 
-/// A file whose size or mtime no longer matches what was catalogued has been
+/// A file whose size or mtime no longer matches what was cataloged has been
 /// written by something else. That is not necessarily wrong -- RawTherapee and
 /// image viewers do it -- but it is always worth knowing, because this tool's
 /// whole premise is that originals do not change.
@@ -131,7 +131,7 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
 
     if changed.is_empty() {
         return Ok(Finding::fine(format!(
-            "originals unchanged since catalogued{}",
+            "originals unchanged since cataloged{}",
             if gone > 0 {
                 format!(" ({gone} not readable)")
             } else {
@@ -143,7 +143,7 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
     let n = changed.len();
     changed.truncate(10);
     Ok(
-        Finding::warn(format!("{n} original(s) modified since catalogued"))
+        Finding::warn(format!("{n} original(s) modified since cataloged"))
             .with(changed)
             .fix(
                 "Something other than this tool wrote to them -- an editor or a \
@@ -373,7 +373,7 @@ mod tests {
         std::fs::write(&raw, b"rewritten by something else entirely").unwrap();
 
         let findings = run(&cat, dir.path(), &Config::default()).unwrap();
-        let f = find(&findings, "modified since catalogued");
+        let f = find(&findings, "modified since cataloged");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.detail[0].contains("750_0001.NEF"));
     }

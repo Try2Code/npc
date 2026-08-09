@@ -21,7 +21,7 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct DupeGroup {
     pub reason: String,
-    /// `dir/name` for each file in the group, oldest catalogued first.
+    /// `dir/name` for each file in the group, oldest cataloged first.
     pub paths: Vec<String>,
 }
 

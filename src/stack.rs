@@ -47,7 +47,7 @@ impl Role {
 pub const DERIVED_SUFFIXES: &[&str] = &["_NEF_embedded"];
 
 /// The whitelist. Anything not named here is ignored outright -- not
-/// catalogued, not counted, not shown.
+/// cataloged, not counted, not shown.
 ///
 /// `.pp3` is deliberately absent: those are RawTherapee's processing profiles
 /// and none of this tool's business. They still travel with their stack when
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn only_whitelisted_extensions_are_seen() {
         for name in ["a.NEF", "a.JPG", "a.jpg", "a.jpeg", "a.xmp"] {
-            assert!(classify(name).is_some(), "{name} should be catalogued");
+            assert!(classify(name).is_some(), "{name} should be cataloged");
         }
         for name in [
             "a.pp3",

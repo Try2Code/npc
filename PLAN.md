@@ -233,7 +233,7 @@ while the stored name stays literal.
 
 Roles also make the action placeholders resolve correctly: `{raw}` is the NEF, `{jpg}` is the
 out-of-camera JPG — never the extracted preview, which you'd never want opened in RawTherapee.
-RawTherapee `.pp3` profiles are not catalogued at all, but they still ride
+RawTherapee `.pp3` profiles are not cataloged at all, but they still ride
 along with their stack through trash and restore -- a profile left pointing at
 an image that has moved is litter.
 

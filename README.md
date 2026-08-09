@@ -123,17 +123,23 @@ running it, and saying when it was wrong.
 
 | | |
 |---|---|
-| Wall clock | ~7 h, one sitting |
+| Wall clock | **7 h 50 m**, one sitting |
+| API time | **2 h 10 m** — 28% of wall clock |
 | Commits | 28 |
 | Rust | ~10,800 lines incl. tests |
 | C++ | 447 lines (the Exiv2 shim) |
 | Tests | 177, 84% region / 86% line coverage |
 | Docs | ~1,000 lines (PLAN.md, CLAUDE.md, README.md) |
 
-Token and API-time figures are not included because the tooling does not
-expose them to the agent that did the work; quoting them would be invention.
-Wall clock is measured from commit timestamps and covers design, coding,
-testing and debugging together, on a 41 GB / 4,188-file library.
+The gap between the two numbers is the interesting part. Under a third of the
+elapsed time was the model thinking; the rest was compiling, running 177 tests
+against a 41 GB library, scanning 4,188 files repeatedly, hashing 41 GB to
+prove nothing had changed — and the human looking at the result and saying
+what was wrong.
+
+Token counts are not included: the tooling does not expose them to the agent,
+and inventing them would defeat the purpose of the exercise. The API and wall
+figures came from the human's side of the session.
 
 **What the human caught that the machine did not.** Worth recording, since it
 is the honest measure of where the boundary sat:

@@ -1,0 +1,310 @@
+//! The catalog: a rebuildable cache, never the only copy of anything.
+//!
+//! Everything here can be regenerated from the drive with `photo scan --full`.
+//! That is the whole stability argument: losing this file costs time, not work.
+//! Tags, ratings and titles live in sidecars; this is an index over them.
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension};
+use std::path::{Path, PathBuf};
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS volume (
+    id        INTEGER PRIMARY KEY,
+    vol_uuid  TEXT NOT NULL UNIQUE,
+    label     TEXT,
+    last_root TEXT,
+    last_seen INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS event (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT,
+    start_time INTEGER,
+    end_time   INTEGER,
+    auto       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS stack (
+    id            INTEGER PRIMARY KEY,
+    dir           TEXT NOT NULL,
+    base          TEXT NOT NULL,
+    event_id      INTEGER REFERENCES event(id),
+    sidecar_mtime INTEGER,
+    rating        INTEGER,
+    flag          INTEGER NOT NULL DEFAULT 0,
+    reject        INTEGER NOT NULL DEFAULT 0,
+    title         TEXT,
+    description   TEXT,
+    orientation   INTEGER,
+    dirty         INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(dir, base)
+);
+
+CREATE TABLE IF NOT EXISTS file (
+    id               INTEGER PRIMARY KEY,
+    stack_id         INTEGER NOT NULL REFERENCES stack(id) ON DELETE CASCADE,
+    name             TEXT NOT NULL,
+    ext              TEXT,
+    role             TEXT NOT NULL,
+    size             INTEGER,
+    mtime_ns         INTEGER,
+    capture_time     INTEGER,
+    camera           TEXT,
+    lens             TEXT,
+    iso              INTEGER,
+    fnumber          REAL,
+    exposure         REAL,
+    focal            REAL,
+    width            INTEGER,
+    height           INTEGER,
+    exif_orientation INTEGER,
+    serial           TEXT,
+    shutter_count    INTEGER,
+    content_hash     TEXT,
+    present          INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(stack_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS tag (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+
+CREATE TABLE IF NOT EXISTS stack_tag (
+    stack_id INTEGER NOT NULL REFERENCES stack(id) ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES tag(id)   ON DELETE CASCADE,
+    PRIMARY KEY (stack_id, tag_id)
+);
+
+CREATE TABLE IF NOT EXISTS pending (
+    stack_id  INTEGER PRIMARY KEY REFERENCES stack(id) ON DELETE CASCADE,
+    queued_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS trashed (
+    stack_id   INTEGER PRIMARY KEY REFERENCES stack(id) ON DELETE CASCADE,
+    orig_dir   TEXT,
+    trashed_at INTEGER
+);
+
+-- Orphans: a profile or sidecar whose image members are all gone. Recorded
+-- rather than ignored so `photo doctor` can report them.
+CREATE TABLE IF NOT EXISTS orphan (
+    path   TEXT PRIMARY KEY,
+    kind   TEXT NOT NULL,
+    seen_at INTEGER
+);
+
+-- The index that makes select-by-tag instant: given a tag, find its stacks.
+CREATE INDEX IF NOT EXISTS stack_tag_rev ON stack_tag(tag_id, stack_id);
+CREATE INDEX IF NOT EXISTS file_capture  ON file(capture_time);
+CREATE INDEX IF NOT EXISTS file_dedupe   ON file(serial, shutter_count);
+CREATE INDEX IF NOT EXISTS file_stack    ON file(stack_id);
+CREATE INDEX IF NOT EXISTS stack_dir     ON stack(dir);
+"#;
+
+pub struct Catalog {
+    pub conn: Connection,
+    pub path: PathBuf,
+}
+
+impl Catalog {
+    /// Open (or create) the catalog for a volume. Kept on the laptop and keyed
+    /// by volume UUID, so the library stays queryable with the drive unplugged.
+    pub fn open_for_volume(vol_uuid: &str) -> Result<Self> {
+        let dir = directories::ProjectDirs::from("", "", "photo-catalog")
+            .map(|d| d.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".photo-catalog"));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating catalog directory {}", dir.display()))?;
+        Self::open_at(dir.join(format!("{vol_uuid}.sqlite")))
+    }
+
+    pub fn open_at(path: PathBuf) -> Result<Self> {
+        let conn = Connection::open(&path)
+            .with_context(|| format!("opening catalog {}", path.display()))?;
+
+        // WAL plus NORMAL: a crash can lose the last transaction, never the
+        // database. Since the catalog is rebuildable that trade is free.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        conn.execute_batch(SCHEMA)?;
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if version == 0 {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version != SCHEMA_VERSION {
+            anyhow::bail!(
+                "catalog {} is schema version {version}, this build expects {SCHEMA_VERSION}",
+                path.display()
+            );
+        }
+
+        Ok(Self { conn, path })
+    }
+
+    /// In-memory catalog, for tests.
+    pub fn open_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.execute_batch(SCHEMA)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+        })
+    }
+
+    pub fn register_volume(&self, uuid: &str, label: Option<&str>, root: &Path) -> Result<i64> {
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO volume (vol_uuid, label, last_root, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(vol_uuid) DO UPDATE SET
+                 label = excluded.label,
+                 last_root = excluded.last_root,
+                 last_seen = excluded.last_seen",
+            rusqlite::params![uuid, label, root.to_string_lossy(), now],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM volume WHERE vol_uuid = ?1",
+            [uuid],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn stack_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM stack", [], |r| r.get(0))?)
+    }
+
+    pub fn file_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM file WHERE present = 1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn orphan_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM orphan", [], |r| r.get(0))?)
+    }
+
+    /// Existing `(size, mtime_ns)` for every known file, keyed by full path.
+    /// Loaded in one query so the scan can reject unchanged files without
+    /// opening them -- the single thing that keeps a rescan fast.
+    pub fn fingerprints(&self) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.dir || '/' || f.name, f.size, f.mtime_ns
+             FROM file f JOIN stack s ON s.id = f.stack_id",
+        )?;
+        let mut map = std::collections::HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (p, s, m) = row?;
+            map.insert(p, (s, m));
+        }
+        Ok(map)
+    }
+
+    pub fn stack_id(&self, dir: &str, base: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1 AND base = ?2",
+                rusqlite::params![dir, base],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_applies_and_is_idempotent() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn.execute_batch(SCHEMA).unwrap(); // re-applying must not fail
+        assert_eq!(cat.stack_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn deleting_a_stack_takes_its_files_and_tags_with_it() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute("INSERT INTO stack (dir, base) VALUES ('/d', 'b')", [])
+            .unwrap();
+        let sid = cat.conn.last_insert_rowid();
+        cat.conn
+            .execute(
+                "INSERT INTO file (stack_id, name, role) VALUES (?1, 'b.NEF', 'raw')",
+                [sid],
+            )
+            .unwrap();
+        cat.conn
+            .execute("INSERT INTO tag (name) VALUES ('beach')", [])
+            .unwrap();
+        let tid = cat.conn.last_insert_rowid();
+        cat.conn
+            .execute(
+                "INSERT INTO stack_tag (stack_id, tag_id) VALUES (?1, ?2)",
+                [sid, tid],
+            )
+            .unwrap();
+
+        cat.conn
+            .execute("DELETE FROM stack WHERE id = ?1", [sid])
+            .unwrap();
+
+        assert_eq!(cat.file_count().unwrap(), 0);
+        let links: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM stack_tag", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0);
+        // The tag itself survives; it may be used elsewhere.
+        let tags: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM tag", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 1);
+    }
+
+    #[test]
+    fn tag_names_are_case_insensitive_for_uniqueness() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute("INSERT INTO tag (name) VALUES ('Beach')", [])
+            .unwrap();
+        let dup = cat
+            .conn
+            .execute("INSERT INTO tag (name) VALUES ('beach')", []);
+        assert!(dup.is_err(), "tag uniqueness must ignore case");
+    }
+}

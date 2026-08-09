@@ -78,6 +78,72 @@ impl Compiled {
     }
 }
 
+/// The reference, printed by `photo find --help-syntax`. Kept here beside the
+/// parser so the two cannot drift: every key listed below is one the parser
+/// actually accepts.
+pub const SYNTAX: &str = "\
+QUERY SYNTAX
+
+  Barewords are tag names, and adjacency means AND:
+
+    beach                       tagged `beach`
+    beach anna                  both tags
+    beach and anna              the same thing, written out
+    beach or anna               either
+    beach and (anna or ben)     grouping
+    not private                 negation
+    -private                    the same, shorthand
+    \"family trip\"               quote anything containing spaces
+
+  Tags are hierarchical, so a parent selects everything beneath it:
+  `beach` also matches `beach/sunset`.
+
+KEYS
+
+  rating       rating>=4   rating=0   rating!=5
+  year         year=2026   year=2024..2026
+  date         date=2026-08-09        date=2026-08-01..2026-08-09
+  camera       camera~D750            camera=\"NIKON D750\"
+  lens         lens~80-200
+  serial       serial=6094708
+  iso          iso>1600    iso<=400
+  shutter      shutter>50000          (shutter actuation count)
+  width height width>=6000
+  ext          ext=NEF     ext=jpg    (case-insensitive)
+  role         role=raw    role=oocjpg  role=derived  role=profile
+  path         path~08/09             (substring of dir/base)
+  name         name~750_69
+  title        title~sunset
+  description  description~\"low tide\"
+  tag          tag:beach              (explicit form of a bareword)
+
+FLAGS  (no value)
+
+  tagged  untagged      has any tag / none
+  rated   unrated       has a star rating / none
+  flagged rejected      the pick and reject marks
+  edited                has a RawTherapee .pp3 profile
+  offline               no member currently present on disk
+
+OPERATORS
+
+  =  !=  >  >=  <  <=      comparison
+  ~                        substring match
+  ..                       inclusive range, for year and date
+
+EXAMPLES
+
+  photo find 'rating>=4'
+  photo find 'beach rating>=4 -private'
+  photo find 'year=2026 camera~D750 untagged'
+  photo find 'date=2026-08-01..2026-08-09 iso>1600'
+  photo find 'flagged and not rejected'
+  photo find 'edited or rating=5' --files --print0 | xargs -0 ls -l
+
+  Values are always bound as parameters, so a tag containing quotes or
+  semicolons is data, never syntax.
+";
+
 // --- tokenising ----------------------------------------------------------
 
 fn tokenize(input: &str) -> Result<Vec<Tok>> {
@@ -621,6 +687,61 @@ mod tests {
         );
         assert!(c.where_sql.contains("?1"));
         assert_eq!(c.params[0], Value::Text(hostile.to_string()));
+    }
+
+    /// Documentation drift is what produced `--help-syntax` being advertised
+    /// before it existed. Every key and flag the reference lists must actually
+    /// parse, and every key the parser knows must be documented -- both
+    /// directions, so neither side can quietly get ahead of the other.
+    #[test]
+    fn the_syntax_reference_matches_what_the_parser_accepts() {
+        const KEYS: &[(&str, &str)] = &[
+            ("rating", "rating>=4"),
+            ("year", "year=2026"),
+            ("date", "date=2026-08-09"),
+            ("camera", "camera~D750"),
+            ("lens", "lens~80-200"),
+            ("serial", "serial=6094708"),
+            ("iso", "iso>1600"),
+            ("shutter", "shutter>50000"),
+            ("width", "width>=6000"),
+            ("height", "height>=4000"),
+            ("ext", "ext=NEF"),
+            ("role", "role=raw"),
+            ("path", "path~08/09"),
+            ("name", "name~750"),
+            ("title", "title~sunset"),
+            ("description", "description~tide"),
+            ("tag", "tag:beach"),
+        ];
+        const FLAGS: &[&str] = &[
+            "tagged", "untagged", "rated", "unrated", "flagged", "rejected", "edited", "offline",
+        ];
+
+        for (key, example) in KEYS {
+            compile(example)
+                .unwrap_or_else(|e| panic!("documented key `{key}` does not parse: {e}"));
+            assert!(
+                SYNTAX.contains(key),
+                "`{key}` is accepted but missing from the reference"
+            );
+        }
+        for flag in FLAGS {
+            compile(flag).unwrap_or_else(|e| panic!("documented flag `{flag}` does not parse: {e}"));
+            assert!(
+                SYNTAX.contains(flag),
+                "`{flag}` is accepted but missing from the reference"
+            );
+        }
+
+        // ..and the worked examples must all compile.
+        for line in SYNTAX.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("photo find '") {
+                let q = &rest[..rest.find('\'').expect("unterminated example")];
+                compile(q).unwrap_or_else(|e| panic!("example `{q}` does not parse: {e}"));
+            }
+        }
     }
 
     #[test]

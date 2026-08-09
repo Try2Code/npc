@@ -54,6 +54,9 @@ enum Cmd {
         /// Print the compiled SQL instead of running it
         #[arg(long)]
         explain: bool,
+        /// Print the query language reference and exit
+        #[arg(long)]
+        help_syntax: bool,
     },
     /// List tags with counts.
     Tags {
@@ -348,7 +351,12 @@ fn main() -> Result<()> {
             print0,
             limit,
             explain,
+            help_syntax,
         } => {
+            if help_syntax {
+                println!("{}", npc::query::SYNTAX);
+                return Ok(());
+            }
             let compiled = npc::query::compile(&query)?;
             let stmt = compiled.select_stacks(limit);
 

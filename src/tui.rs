@@ -126,7 +126,11 @@ impl App {
     pub fn with_catalog(cat: Catalog, root: PathBuf) -> Result<Self> {
         let mut app = Self {
             cat,
-            config: Config::load()?,
+            config: {
+                let c = Config::load()?;
+                thumbs::configure(&c.thumbs);
+                c
+            },
             actions: action::load(),
             root,
             query: String::new(),
@@ -1521,6 +1525,7 @@ mod tests {
         let (dir, mut app) = app();
         app.config = Config {
             protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
         };
         press(&mut app, '5');
         assert!(app.status.contains("refused"), "status: {}", app.status);

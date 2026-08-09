@@ -97,9 +97,12 @@ enum Cmd {
         /// Restrict to the stacks a query selects
         #[arg(short = 'q', long)]
         query: Option<String>,
-        /// `grid` (384px) or `view` (1600px)
+        /// `grid` or `view`; sizes come from config.toml
         #[arg(long, default_value = "grid")]
         size: String,
+        /// Delete cache entries nothing would ask for any more
+        #[arg(long)]
+        prune: bool,
     },
     /// Report what this terminal can actually do. Run it inside the terminal
     /// you use for `photo tui`.
@@ -258,6 +261,12 @@ fn stars(rating: Option<i64>) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Thumbnail sizes come from config; the cache key includes them, so
+    // changing them invalidates exactly the affected entries.
+    if let Ok(cfg) = npc::config::Config::load() {
+        npc::thumbs::configure(&cfg.thumbs);
+    }
 
     match cli.cmd {
         Cmd::Probe { path, preview } => {
@@ -648,7 +657,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Thumbs { root, query, size } => {
+        Cmd::Thumbs { root, query, size, prune } => {
             let size = match size.as_str() {
                 "grid" => npc::thumbs::Size::Grid,
                 "view" => npc::thumbs::Size::View,
@@ -666,6 +675,12 @@ fn main() -> Result<()> {
             let ids: Vec<i64> = prepared
                 .query_map(params.as_slice(), |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
+
+            if prune {
+                let (n, bytes) = cache.prune(&cat, &ids)?;
+                println!("pruned {n} stale entr(ies), {:.0} MB", bytes as f64 / 1e6);
+                return Ok(());
+            }
 
             let started = std::time::Instant::now();
             let (made, skipped, failed) = npc::thumbs::prewarm(&cat, &cache, &ids, size);

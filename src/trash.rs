@@ -350,6 +350,7 @@ mod tests {
         let (dir, mut cat, sid) = library();
         let config = Config {
             protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
         };
         assert!(trash(&mut cat, dir.path(), &[sid], &config).is_err());
         assert!(

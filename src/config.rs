@@ -10,12 +10,49 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Thumbnail sizing. Exposed in config because the right values depend on
+/// screen and font size, which the program cannot see and the user can.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Thumbs {
+    /// Long edge, in pixels, for grid tiles.
+    pub grid_px: u32,
+    /// Long edge for the single-image view.
+    pub view_px: u32,
+    /// JPEG quality, 1-100. Lower trades file size for detail; at these
+    /// resolutions ~80 keeps the cache small without visible artefacts.
+    pub quality: u8,
+}
+
+impl Default for Thumbs {
+    fn default() -> Self {
+        // Sized from a 3440x1440 display, which is what this is used on.
+        //
+        //   grid : 3440 / 5 tiles across = 688 px, and 1147 px if narrowed to
+        //          3 across with `-`. 1280 covers the widest tile without
+        //          upscaling.
+        //   view : a 3:2 frame in a 3440x1400 window is height-limited, so the
+        //          long edge needed is 1400 * 1.5 = 2100 px. 2560 leaves room
+        //          for wider crops without paying for a 3200 px cache.
+        //
+        // Both are overridable in config.toml; the cache key includes the pixel
+        // size, so changing them regenerates exactly what is affected.
+        Self {
+            grid_px: 1280,
+            view_px: 2560,
+            quality: 80,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Absolute paths. Any mutating operation whose target resolves inside one
     /// of these is refused at dispatch, before a file is opened.
     #[serde(default)]
     pub protected_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub thumbs: Thumbs,
 }
 
 impl Config {
@@ -87,6 +124,7 @@ mod tests {
     fn cfg(roots: &[&str]) -> Config {
         Config {
             protected_roots: roots.iter().map(PathBuf::from).collect(),
+            ..Default::default()
         }
     }
 

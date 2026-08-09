@@ -32,13 +32,32 @@ pub enum Size {
     View,
 }
 
+/// Runtime sizing, set once from config at startup. Kept as statics rather
+/// than threaded through every call site because it is read-only after start
+/// and every consumer wants the same answer.
+static GRID_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1280);
+static VIEW_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3200);
+static QUALITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(78);
+
+/// Apply configured thumbnail sizes. Because the cache key includes the pixel
+/// size, changing these invalidates the affected thumbnails automatically.
+pub fn configure(cfg: &crate::config::Thumbs) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GRID_PX.store(cfg.grid_px.clamp(64, 8192), Relaxed);
+    VIEW_PX.store(cfg.view_px.clamp(64, 12288), Relaxed);
+    QUALITY.store(cfg.quality.clamp(1, 100), Relaxed);
+}
+
+pub fn quality() -> u8 {
+    QUALITY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Size {
     pub fn px(self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
         match self {
-            // Sized for a 5-across grid in a maximised window; larger tiles
-            // would otherwise be upscaled from too little data.
-            Size::Grid => 640,
-            Size::View => 1600,
+            Size::Grid => GRID_PX.load(Relaxed),
+            Size::View => VIEW_PX.load(Relaxed),
         }
     }
     fn tag(self) -> &'static str {
@@ -203,6 +222,46 @@ impl Cache {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    /// Delete cache entries that no current stack would ask for.
+    ///
+    /// Changing a thumbnail size leaves the previous generation orphaned --
+    /// correct, since the key includes the size, but it accumulates. After
+    /// two size changes this cache held three generations and 320 MB where
+    /// 107 MB was live.
+    pub fn prune(&self, cat: &Catalog, stack_ids: &[i64]) -> Result<(usize, u64)> {
+        let mut keep = std::collections::HashSet::new();
+        for &id in stack_ids {
+            if let Ok(Some(src)) = best_source(cat, id) {
+                keep.insert(self.path_for(&src, Size::Grid));
+                keep.insert(self.path_for(&src, Size::View));
+            }
+        }
+
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+        for entry in walkdir::WalkDir::new(&self.dir)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+                continue;
+            }
+            if keep.contains(&path) {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+                bytes += size;
+            }
+        }
+        Ok((removed, bytes))
+    }
 }
 
 /// Read pixels, downscale, apply orientation, write JPEG.
@@ -242,9 +301,20 @@ fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
     // Temp + rename, so a killed process cannot leave a truncated JPEG that
     // would then be served from cache forever.
     let part = out.with_extension("part");
-    img.to_rgb8()
-        .save_with_format(&part, image::ImageFormat::Jpeg)
-        .with_context(|| format!("writing {}", part.display()))?;
+    {
+        // Explicit quality: the default encoder setting is not tunable, and at
+        // 4x the pixel count the compression setting is what keeps the cache
+        // from ballooning.
+        let file = std::fs::File::create(&part)
+            .with_context(|| format!("creating {}", part.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality());
+        let rgb = img.to_rgb8();
+        encoder
+            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .with_context(|| format!("encoding {}", part.display()))?;
+    }
     std::fs::rename(&part, out)?;
     Ok(())
 }
@@ -466,6 +536,46 @@ mod tests {
     /// Regression: the RAW must win. The _NEF_embedded.jpg beside it is the
     /// full-resolution tier, not a thumbnail, and decoding it is ~50x the work
     /// of letting Exiv2 pick the 640x424 preview.
+    /// Pruning must delete previous generations and keep the live ones. It is
+    /// the only thing here that removes files, so it gets a test that proves
+    /// it does not remove the wrong ones.
+    #[test]
+    fn prune_removes_stale_generations_but_keeps_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute("INSERT INTO stack (dir, base) VALUES (?1, 'shot')",
+                     [dir.path().to_str().unwrap()])
+            .unwrap();
+        let sid = cat.conn.last_insert_rowid();
+        std::fs::write(dir.path().join("shot.JPG"), jpeg(64, 48)).unwrap();
+        cat.conn
+            .execute(
+                "INSERT INTO file (stack_id, name, role, mtime_ns, exif_orientation, present)
+                 VALUES (?1, 'shot.JPG', 'oocjpg', 7, 1, 1)",
+                [sid],
+            )
+            .unwrap();
+
+        let cache = Cache::new("prune-test").unwrap();
+        let src = best_source(&cat, sid).unwrap().unwrap();
+        let live = cache.path_for(&src, Size::Grid);
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, b"current").unwrap();
+
+        // A previous generation: same stack, different key.
+        let stale = cache.dir().join("ab/deadbeefdeadbeef-g.jpg");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"old generation").unwrap();
+
+        let (removed, _) = cache.prune(&cat, &[sid]).unwrap();
+        assert_eq!(removed, 1);
+        assert!(live.exists(), "pruning deleted the live thumbnail");
+        assert!(!stale.exists(), "pruning kept a stale thumbnail");
+
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
     #[test]
     fn best_source_prefers_the_raw_so_exiv2_can_pick_a_small_tier() {
         let cat = Catalog::open_memory().unwrap();

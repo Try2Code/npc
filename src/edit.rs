@@ -465,6 +465,7 @@ mod tests {
 
         let config = Config {
             protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
         };
 
         let err = apply(
@@ -509,6 +510,7 @@ mod tests {
 
         let config = Config {
             protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
         };
         let stats = flush(&mut cat, &config).unwrap();
 

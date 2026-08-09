@@ -14,6 +14,26 @@ npc find 'beach rating>=4'     # select
 npc tui                        # browse
 ```
 
+## Contents
+
+- [Why](#why)
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [The query language](#the-query-language)
+- [The browser](#the-browser)
+- [What it will not do](#what-it-will-not-do)
+- [Offline](#offline)
+- [How this was built](#how-this-was-built)
+  - [The structural fact](#the-structural-fact)
+  - [What actually worked](#what-actually-worked)
+  - [What failed](#what-failed)
+  - [Where the human time went](#where-the-human-time-went)
+  - [The honest summary](#the-honest-summary)
+- [Coverage](#coverage)
+- [Portability](#portability)
+- [Development](#development)
+
 ## Why
 
 Shotwell's core, in a terminal, fast enough for a large library and stable

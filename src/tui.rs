@@ -110,6 +110,10 @@ pub struct App {
     picker: Option<Picker>,
     /// Which member of the stack the single view is showing.
     member: usize,
+    /// Cache paths drawn in the current frame. Anything not in here is
+    /// released after the frame, so the terminal only ever holds images that
+    /// are actually on screen.
+    frame_used: HashSet<PathBuf>,
     /// Tiles across in grid view. Adjustable live, because the right value
     /// depends on font size and window, which only the user can see.
     grid_cols: u16,
@@ -156,6 +160,7 @@ impl App {
             images: HashMap::new(),
             picker: None,
             member: 0,
+            frame_used: HashSet::new(),
             grid_cols: 5,
         };
         app.reload()?;
@@ -330,10 +335,6 @@ impl App {
             return false;
         };
         let protocol = picker.new_resize_protocol(img);
-        // Bounded: a long scroll must not grow this without limit.
-        if self.images.len() > 120 {
-            self.images.clear();
-        }
         self.images.insert(path.clone(), protocol);
         true
     }
@@ -696,6 +697,14 @@ impl App {
                     self.status = format!("filter: {}", self.query);
                 }
             }
+            // Force a re-upload of the current image. Also a diagnostic: if a
+            // frame renders black and this fixes it, the pixels were fine and
+            // the terminal lost the placement.
+            KeyCode::Char('r') => {
+                let dropped = self.images.len();
+                self.images.clear();
+                self.status = format!("re-sent {dropped} image(s) to the terminal");
+            }
             KeyCode::Char('u') => self.undo()?,
             KeyCode::Char('w') => {
                 let stats = edit::flush(&mut self.cat, &self.config)?;
@@ -804,6 +813,7 @@ impl App {
     // --- drawing ---------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
+        self.frame_used.clear();
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -923,6 +933,15 @@ impl App {
             }
         };
         f.render_widget(Paragraph::new(bottom), rows[1]);
+
+        // Release every image not drawn this frame. Dropping a protocol tells
+        // the terminal to forget that image, so the graphics store holds only
+        // what is on screen. Previously this kept up to 120 uploaded images
+        // and then dropped all of them at once, which is a good way to make a
+        // terminal lose track of placements.
+        let used = std::mem::take(&mut self.frame_used);
+        self.images.retain(|k, _| used.contains(k));
+        self.frame_used = used;
 
         if self.show_help {
             self.overlay(f, " keys ", HELP);
@@ -1058,6 +1077,7 @@ impl App {
 
             match self.image_for(idx, ThumbSize::Grid) {
                 Some(path) if self.ensure_decoded(&path) => {
+                    self.frame_used.insert(path.clone());
                     if let Some(p) = self.images.get_mut(&path) {
                         f.render_stateful_widget(StatefulImage::default(), picture, p);
                     }
@@ -1123,6 +1143,7 @@ impl App {
 
         match self.image_for(self.cursor, ThumbSize::View) {
             Some(path) if self.ensure_decoded(&path) => {
+                self.frame_used.insert(path.clone());
                 if let Some(p) = self.images.get_mut(&path) {
                     f.render_stateful_widget(StatefulImage::default(), picture, p);
                 }
@@ -1327,6 +1348,7 @@ const HELP: &str = "\
  - +                  fewer / more tiles across (grid view)
 
  a                    actions menu
+ r                    re-send images to the terminal (if one renders blank)
  w                    flush pending sidecars
  u                    undo last edit
  q                    quit

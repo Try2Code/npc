@@ -692,6 +692,39 @@ tests stay local. Worth doing when a second machine or person is involved, not b
 | **M5** | Thumbnails — `extract_preview`, cache, grid and single view. The culling loop. |
 | **M6** | `rotate`, `export`, `events --name`, `doctor`, undo, tag hierarchies, shell completion, fuzz targets. |
 
+## Later: pre-compiled releases
+
+Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`aarch64-apple-darwin`.
+
+This partly reverses an early decision, deliberately. Portability was dropped
+during development because it bought nothing and cost a static-link fight;
+shipping binaries reintroduces exactly that requirement. Worth naming so the
+work is not underestimated:
+
+- **Exiv2 is the whole difficulty.** The Rust half cross-compiles trivially;
+  the C++ shim needs a libexiv2 (plus expat and zlib) built for each target.
+  Linking against a system libexiv2 is fine for a machine you control and
+  useless for a release artifact.
+- **Static linking comes back.** Each target wants exiv2 built from source with
+  `EXIV2_ENABLE_XMP=ON`, `BUILD_SHARED_LIBS=OFF`, and BMFF/curl/NLS off, then
+  linked in. That is a per-target build step, not a cargo flag.
+- **darwin-aarch64 cannot be cross-compiled from Linux** in any way worth
+  maintaining. It needs a macOS runner. Linux aarch64 can be done with a
+  sysroot or a QEMU container, but a native arm runner is less painful.
+- **The XMP toolkit must be verified per artifact.** A build that silently
+  loses XMP support would pass every test that does not touch sidecars, and
+  then destroy metadata in the field. `have_xmptoolkit` should be asserted at
+  build time for each target, and the preservation test run against each
+  produced binary rather than only against the development build.
+
+Practical shape: one CI job per target producing a static binary, plus a
+smoke-test job that runs the invariant and preservation suites against the
+artifact itself. That is also the point at which the "no CI" decision above
+should be revisited -- releases are the use case that justifies it, not tests.
+
+## Milestones (continued)
+
 M1 deliberately builds the safety machinery before the features, so that every later milestone
 is developed under a harness that makes violating the invariant a test failure rather than a
 discovery. It also front-loads the two risks specific to this stack: proving the FFI boundary

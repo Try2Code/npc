@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS volume (
@@ -276,6 +276,16 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
         if !has_column {
             conn.execute("ALTER TABLE file ADD COLUMN exposure_bias REAL", [])?;
         }
+    }
+
+    // v2 -> v3: RawTherapee profiles are no longer a concept. Existing
+    // catalogs carry rows for them, marked absent by the first scan after the
+    // change. They are harmless -- nothing counts an absent row -- but they
+    // describe something the model no longer has, and `doctor` would later
+    // have to explain them.
+    if from < 3 {
+        conn.execute("DELETE FROM file WHERE role = 'profile'", [])?;
+        conn.execute("DELETE FROM orphan WHERE kind = 'profile'", [])?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

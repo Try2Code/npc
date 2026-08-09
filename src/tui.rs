@@ -110,6 +110,10 @@ pub struct App {
     picker: Option<Picker>,
     /// Which member of the stack the single view is showing.
     member: usize,
+    /// How many rows a screen holds in the current view. Only the draw pass
+    /// knows this -- it depends on the window and, in the grid, on the tile
+    /// size -- so it is recorded there and used by the paging keys.
+    page_size: usize,
     /// Cache paths drawn in the current frame. Anything not in here is
     /// released after the frame, so the terminal only ever holds images that
     /// are actually on screen.
@@ -161,6 +165,7 @@ impl App {
             picker: None,
             member: 0,
             frame_used: HashSet::new(),
+            page_size: 20,
             grid_cols: 5,
         };
         app.reload()?;
@@ -544,14 +549,19 @@ impl App {
 
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+            KeyCode::PageDown => self.move_cursor(self.page_size as isize),
+            KeyCode::PageUp => self.move_cursor(-(self.page_size as isize)),
+            // Half a screen, the vi convention.
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_cursor(20)
+                self.move_cursor((self.page_size / 2).max(1) as isize)
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_cursor(-20)
+                self.move_cursor(-((self.page_size / 2).max(1) as isize))
             }
-            KeyCode::Char('g') => self.cursor = 0,
-            KeyCode::Char('G') => self.cursor = self.rows.len().saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => {
+                self.cursor = self.rows.len().saturating_sub(1)
+            }
 
             KeyCode::Char(' ') => {
                 if let Some(r) = self.rows.get(self.cursor) {
@@ -1033,6 +1043,8 @@ impl App {
             .collect();
         let mut state = ListState::default();
         state.select(Some(self.cursor));
+        // Two rows of border.
+        self.page_size = area.height.saturating_sub(2).max(1) as usize;
         let block = self.frame_block(self.heading());
         f.render_stateful_widget(
             List::new(rows)
@@ -1060,6 +1072,7 @@ impl App {
         let th = (tw / 2).max(3) + 1;
         let rows_fit = (inner.height / th).max(1);
         let per_page = (cols * rows_fit) as usize;
+        self.page_size = per_page;
 
         // Keep the cursor on screen by scrolling in whole rows.
         let cursor_row = self.cursor / cols as usize;
@@ -1139,6 +1152,10 @@ impl App {
             }
             None => " nothing to show ".to_string(),
         };
+
+        // Paging through one image at a time is what h/l are for; a page here
+        // means a stride worth using.
+        self.page_size = 10;
 
         let block = self.frame_block(title);
         let inner = block.inner(area);
@@ -1351,7 +1368,9 @@ fn format_datetime(unix: i64) -> String {
 const HELP: &str = "\
  j k  up  down        move
  g G                  first / last
- ctrl-d ctrl-u        page
+ page-up page-down    one screen
+ ctrl-u ctrl-d        half a screen
+ home end             first / last
  space                select / deselect
  v                    range: press once to start, again to close
  esc                  clear selection (outside single view)
@@ -2073,6 +2092,40 @@ mod tests {
             "an action was launched against a protected root: {}",
             app.status
         );
+    }
+
+    /// Paging must move by whatever a screen actually holds, which only the
+    /// draw pass knows -- a fixed stride would page past content in a tall
+    /// window and stall in a short one.
+    #[test]
+    fn page_keys_move_by_a_real_screen() {
+        let (_d, mut app) = app();
+        // A 10-row frame leaves 8 usable rows once borders are drawn.
+        let _ = render(&mut app, 100, 12);
+        assert_eq!(app.page_size, 8, "page size not taken from the drawn area");
+
+        // With only 3 stacks, a page lands on the last one rather than past it.
+        press_code(&mut app, KeyCode::PageDown);
+        assert_eq!(app.cursor, 2);
+        press_code(&mut app, KeyCode::PageUp);
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::End);
+        assert_eq!(app.cursor, 2);
+        press_code(&mut app, KeyCode::Home);
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn the_grid_pages_by_tiles_on_screen() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Tab); // grid
+        let _ = render(&mut app, 120, 30);
+        assert!(app.page_size >= 1, "grid page size was never set");
     }
 
     #[test]

@@ -18,9 +18,10 @@ const LIBRARY: &str = "/home/ram/src/tasks/test-data";
 //   1722 distinct .NEF basenames
 //   +  68 .JPG with no matching .NEF
 //   = 1790 stacks
-// and 3 leftover RawTherapee profiles whose images no longer exist.
+// RawTherapee .pp3 profiles are not catalogued at all, so the three leftover
+// ones whose images no longer exist are simply invisible rather than orphans.
 const EXPECTED_STACKS: i64 = 1790;
-const EXPECTED_ORPHANS: i64 = 3;
+const EXPECTED_ORPHANS: i64 = 0;
 // Image members only. Deliberately *not* total files: .pp3 profiles and .xmp
 // sidecars accumulate as the library is used -- RawTherapee writes a profile
 // whenever a shot is opened -- and a test that breaks because the tool was
@@ -84,27 +85,20 @@ fn stack_count_matches_ground_truth() {
     }
 }
 
-/// Leftover profiles whose image is gone must not conjure a stack out of
-/// nothing -- they are orphans for `doctor` to report.
+/// With profiles out of the picture there is nothing left to orphan here: the
+/// three stray .pp3 files are ignored rather than reported. The orphan table
+/// still exists for a sidecar whose images have all gone.
 #[test]
-fn orphan_profiles_do_not_create_stacks() {
+fn stray_profiles_are_invisible_rather_than_orphans() {
     require_library!();
     let cat = scanned().unwrap();
-
     assert_eq!(cat.orphan_count().unwrap(), EXPECTED_ORPHANS);
 
-    let kinds: Vec<String> = cat
+    let profiles: i64 = cat
         .conn
-        .prepare("SELECT kind FROM orphan")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(
-        kinds.iter().all(|k| k == "profile"),
-        "expected only orphan profiles, got {kinds:?}"
-    );
+        .query_row("SELECT COUNT(*) FROM file WHERE role = 'profile'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(profiles, 0, "a .pp3 was catalogued");
 }
 
 /// A directory whose composition is known exactly: 71 shots, each with a RAW,
@@ -141,8 +135,8 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         .unwrap();
     assert_eq!(odd, 0, "{odd} stacks in 08/09 lack the expected image members");
 
-    // All three image roles are represented. `profile` may or may not appear
-    // depending on what has been opened in RawTherapee since.
+    // Exactly the three image roles. Profiles are no longer catalogued, so
+    // opening a shot in RawTherapee can no longer change this.
     let roles: Vec<String> = cat
         .conn
         .prepare(
@@ -154,12 +148,11 @@ fn a_known_directory_resolves_to_three_member_stacks() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    for expected in ["raw", "oocjpg", "derived"] {
-        assert!(
-            roles.iter().any(|r| r == expected),
-            "role `{expected}` missing from 08/09: {roles:?}"
-        );
-    }
+    assert_eq!(
+        roles,
+        vec!["derived", "oocjpg", "raw"],
+        "with profiles ignored, only the three image roles remain"
+    );
 }
 
 /// EXIF came off real files, not fixtures: the D750 body and its maker-note
@@ -233,9 +226,10 @@ fn every_real_filename_classifies_as_expected() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        match classify(&name) {
-            Some(c) => *counts.entry(c.role.as_str()).or_insert(0usize) += 1,
-            None => panic!("unclassified file in the library: {name}"),
+        // The whitelist is closed now, so `None` is the expected answer for
+        // anything that is not a photograph or our own sidecar.
+        if let Some(c) = classify(&name) {
+            *counts.entry(c.role.as_str()).or_insert(0usize) += 1;
         }
     }
 
@@ -296,5 +290,5 @@ fn fingerprint_tree(root: &Path) -> std::collections::BTreeMap<String, (u64, i64
 fn role_helpers_agree_with_the_library_layout() {
     require_library!();
     assert!(Role::Raw.is_image());
-    assert!(!Role::Profile.is_image());
+    assert!(!Role::Sidecar.is_image());
 }

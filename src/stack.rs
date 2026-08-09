@@ -21,16 +21,13 @@ pub enum Role {
     OocJpg,
     /// An already-extracted preview: `750_6926_NEF_embedded.jpg`
     Derived,
-    /// A RawTherapee processing profile: `750_6926.NEF.pp3`
-    Profile,
     /// Our metadata: `750_6926.xmp`
     Sidecar,
 }
 
 impl Role {
-    /// Profiles and sidecars describe a shot but are not the shot. A stack
-    /// exists only if it has at least one image member -- otherwise a leftover
-    /// `.pp3` whose image was deleted would conjure a stack out of nothing.
+    /// A sidecar describes a shot but is not the shot. A stack exists only if
+    /// it has at least one image member, so a stray `.xmp` cannot conjure one.
     pub fn is_image(self) -> bool {
         matches!(self, Role::Raw | Role::OocJpg | Role::Derived)
     }
@@ -40,7 +37,6 @@ impl Role {
             Role::Raw => "raw",
             Role::OocJpg => "oocjpg",
             Role::Derived => "derived",
-            Role::Profile => "profile",
             Role::Sidecar => "sidecar",
         }
     }
@@ -50,8 +46,16 @@ impl Role {
 /// position only, applied after the extension is removed.
 pub const DERIVED_SUFFIXES: &[&str] = &["_NEF_embedded"];
 
+/// The whitelist. Anything not named here is ignored outright -- not
+/// catalogued, not counted, not shown.
+///
+/// `.pp3` is deliberately absent: those are RawTherapee's processing profiles
+/// and none of this tool's business. They still travel with their stack when
+/// it is trashed, because leaving a profile behind pointing at a moved image
+/// is litter, but nothing else here knows they exist.
 const RAW_EXTS: &[&str] = &["nef"];
 const JPG_EXTS: &[&str] = &["jpg", "jpeg"];
+const SIDECAR_EXTS: &[&str] = &["xmp"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classified {
@@ -68,26 +72,11 @@ pub struct Classified {
 pub fn classify(filename: &str) -> Option<Classified> {
     let lower = filename.to_ascii_lowercase();
 
-    // Profiles carry the full image name: `750_6926.NEF.pp3`, and for a JPG
-    // profile `750_5770_modified.JPG.pp3`. Strip `.pp3`, then strip whatever
-    // image extension is underneath.
-    if let Some(stem) = lower.strip_suffix(".pp3") {
-        let literal = &filename[..stem.len()];
-        let base = match literal.rfind('.') {
-            Some(i) => &literal[..i],
-            None => literal,
-        };
-        return Some(Classified {
-            base: strip_derived(base).to_string(),
-            role: Role::Profile,
-        });
-    }
-
     let dot = lower.rfind('.')?;
     let ext = &lower[dot + 1..];
     let stem = &filename[..dot];
 
-    if ext == "xmp" {
+    if SIDECAR_EXTS.contains(&ext) {
         return Some(Classified {
             base: stem.to_string(),
             role: Role::Sidecar,
@@ -148,7 +137,6 @@ mod tests {
             c("750_6926_NEF_embedded.jpg"),
             ("750_6926".into(), Role::Derived)
         );
-        assert_eq!(c("750_6926.NEF.pp3"), ("750_6926".into(), Role::Profile));
         assert_eq!(c("750_6926.xmp"), ("750_6926".into(), Role::Sidecar));
     }
 
@@ -166,21 +154,35 @@ mod tests {
     #[test]
     fn only_configured_suffixes_strip() {
         assert_eq!(c("750_5744_1.NEF"), ("750_5744_1".into(), Role::Raw));
-        assert_eq!(c("750_5744_1.NEF.pp3"), ("750_5744_1".into(), Role::Profile));
         assert_eq!(c("750_6262_modified.JPG"), ("750_6262_modified".into(), Role::OocJpg));
     }
 
-    /// A profile for a JPG rather than a RAW, which this library contains.
+    /// RawTherapee profiles are not ours. Ignoring them outright is simpler
+    /// than modelling them, and it removes the only file type this tool
+    /// tracked without ever doing anything useful with.
     #[test]
-    fn handles_jpg_profiles() {
-        assert_eq!(
-            c("750_5770_modified.JPG.pp3"),
-            ("750_5770_modified".into(), Role::Profile)
-        );
-        assert_eq!(
-            c("750_6108_NEF_embedded_modified.jpg.pp3"),
-            ("750_6108_NEF_embedded_modified".into(), Role::Profile)
-        );
+    fn processing_profiles_are_ignored_entirely() {
+        for name in [
+            "750_6926.NEF.pp3",
+            "750_5770_modified.JPG.pp3",
+            "750_6108_NEF_embedded_modified.jpg.pp3",
+        ] {
+            assert!(classify(name).is_none(), "{name} should be ignored");
+        }
+    }
+
+    /// The whitelist is closed: anything not named in it is invisible.
+    #[test]
+    fn only_whitelisted_extensions_are_seen() {
+        for name in ["a.NEF", "a.JPG", "a.jpg", "a.jpeg", "a.xmp"] {
+            assert!(classify(name).is_some(), "{name} should be catalogued");
+        }
+        for name in [
+            "a.pp3", "a.CR2", "a.ARW", "a.dng", "a.tif", "a.png", "a.mov",
+            "a.txt", "a.xml", "a.json", "Thumbs.db",
+        ] {
+            assert!(classify(name).is_none(), "{name} should be ignored");
+        }
     }
 
     #[test]
@@ -203,7 +205,6 @@ mod tests {
         assert!(Role::Raw.is_image());
         assert!(Role::OocJpg.is_image());
         assert!(Role::Derived.is_image());
-        assert!(!Role::Profile.is_image());
         assert!(!Role::Sidecar.is_image());
     }
 }

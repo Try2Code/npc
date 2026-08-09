@@ -122,7 +122,6 @@ FLAGS  (no value)
   tagged  untagged      has any tag / none
   rated   unrated       has a star rating / none
   flagged rejected      the pick and reject marks
-  edited                has a RawTherapee .pp3 profile
   offline               no member currently present on disk
 
 OPERATORS
@@ -138,7 +137,7 @@ EXAMPLES
   photo find 'year=2026 camera~D750 untagged'
   photo find 'date=2026-08-01..2026-08-09 iso>1600'
   photo find 'flagged and not rejected'
-  photo find 'edited or rating=5' --files --print0 | xargs -0 ls -l
+  photo find 'rating=5 or flagged' --files --print0 | xargs -0 ls -l
 
   Values are always bound as parameters, so a tag containing quotes or
   semicolons is data, never syntax.
@@ -368,10 +367,6 @@ impl Parser {
             "rejected" => "s.reject = 1".into(),
             "rated" => "s.rating IS NOT NULL AND s.rating > 0".into(),
             "unrated" => "(s.rating IS NULL OR s.rating = 0)".into(),
-            "edited" => {
-                "EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.role = 'profile')"
-                    .into()
-            }
             "offline" => "NOT EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.present = 1)".into(),
             _ => self.tag_match(w),
         })
@@ -585,7 +580,7 @@ mod tests {
 
     #[test]
     fn flags_compile_without_parameters() {
-        for flag in ["untagged", "tagged", "flagged", "rejected", "rated", "unrated", "edited"] {
+        for flag in ["untagged", "tagged", "flagged", "rejected", "rated", "unrated"] {
             assert!(params(flag).is_empty(), "{flag} should bind nothing");
             assert!(!sql(flag).is_empty());
         }
@@ -715,7 +710,7 @@ mod tests {
             ("tag", "tag:beach"),
         ];
         const FLAGS: &[&str] = &[
-            "tagged", "untagged", "rated", "unrated", "flagged", "rejected", "edited", "offline",
+            "tagged", "untagged", "rated", "unrated", "flagged", "rejected", "offline",
         ];
 
         for (key, example) in KEYS {
@@ -762,7 +757,6 @@ mod tests {
             "iso>1600",
             "ext=NEF",
             "untagged",
-            "edited",
             "flagged and not rejected",
             "path~08/09",
             "title~sunset",

@@ -6,9 +6,9 @@
 //! filesystem, which is atomic and instant and cannot half-happen. Nothing is
 //! unlinked until `empty`, which counts and confirms first.
 //!
-//! Every member moves together: RAW, JPG, extracted preview, RawTherapee
-//! profile and sidecar. A `.pp3` separated from the RAW it describes is
-//! useless, and a sidecar left behind would re-appear as an orphan.
+//! Every member moves together: RAW, JPG, extracted preview and sidecar, plus
+//! any RawTherapee `.pp3` sitting beside them. Profiles are not catalogued,
+//! but a profile separated from the RAW it describes is useless litter.
 
 use crate::config::Config;
 use crate::db::{now_secs, Catalog};
@@ -48,6 +48,18 @@ fn members_on_disk(cat: &Catalog, stack_id: i64) -> Result<(PathBuf, String, Vec
     let sidecar = format!("{base}.xmp");
     if dir.join(&sidecar).exists() {
         names.push(sidecar);
+    }
+
+    // RawTherapee profiles are not catalogued -- they are none of this tool's
+    // business -- but leaving one behind pointing at an image that has moved is
+    // litter. Matched exactly as `<member>.pp3` rather than by prefix, because
+    // `750_6926` is a prefix of `750_6926_1` and prefix matching would drag a
+    // different shot's files into the trash.
+    for name in names.clone() {
+        let profile = format!("{name}.pp3");
+        if dir.join(&profile).exists() {
+            names.push(profile);
+        }
     }
 
     let paths = names.into_iter().map(|n| dir.join(n)).collect();

@@ -517,7 +517,7 @@ fn main() -> Result<()> {
             // first run, and must not fail on volume resolution.
             std::fs::create_dir_all(&library)
                 .with_context(|| format!("creating library {}", library.display()))?;
-            let mut cat = open_for(&library)?;
+            let cat = open_for(&library)?;
 
             let plans = npc::import::plan(&cat, &source, &library)?;
             let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();

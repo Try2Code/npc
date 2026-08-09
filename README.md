@@ -124,6 +124,7 @@ running it, and saying when it was wrong.
 | | |
 |---|---|
 | Wall clock | **7 h 50 m**, one sitting |
+| — of which planning | **~1 h 15 m** before the first line of code |
 | API time | **2 h 10 m** — 28% of wall clock |
 | Commits | 28 |
 | Rust | ~10,800 lines incl. tests |
@@ -131,11 +132,19 @@ running it, and saying when it was wrong.
 | Tests | 177, 84% region / 86% line coverage |
 | Docs | ~1,000 lines (PLAN.md, CLAUDE.md, README.md) |
 
-The gap between the two numbers is the interesting part. Under a third of the
-elapsed time was the model thinking; the rest was compiling, running 177 tests
-against a 41 GB library, scanning 4,188 files repeatedly, hashing 41 GB to
-prove nothing had changed — and the human looking at the result and saying
-what was wrong.
+The first ~1 h 15 m was planning, before any code existed: requirements,
+four rounds of questions, and the design going Go → Rust → C++ → Rust-with-a-
+C++-shim as the constraints came out. Two decisions taken there — that
+originals are never opened for writing, and that the catalog is a disposable
+cache — shaped every file afterwards and were never revisited. Two others were
+wrong and had to be measured out later, which is why `PLAN.md` carries a
+section recording where it was mistaken.
+
+The gap between the two duration numbers is the other interesting part. Under
+a third of the elapsed time was the model thinking; the rest was compiling,
+running 177 tests against a 41 GB library, scanning 4,188 files repeatedly,
+hashing 41 GB to prove nothing had changed — and the human looking at the
+result and saying what was wrong.
 
 Token counts are not included: the tooling does not expose them to the agent,
 and inventing them would defeat the purpose of the exercise. The API and wall

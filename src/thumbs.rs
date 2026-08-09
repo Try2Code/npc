@@ -146,9 +146,10 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(vol_uuid: &str) -> Result<Self> {
-        let dir = directories::ProjectDirs::from("", "", "photo-catalog")
-            .map(|d| d.cache_dir().join(vol_uuid))
-            .unwrap_or_else(|| PathBuf::from(".photo-cache").join(vol_uuid));
+        let dir = crate::config::Config::load()
+            .unwrap_or_default()
+            .cache_store()
+            .join(vol_uuid);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating thumbnail cache {}", dir.display()))?;
 

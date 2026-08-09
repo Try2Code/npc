@@ -300,8 +300,32 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
 }
 
 fn open_for(root: &Path) -> Result<Catalog> {
-    let v = vol::identify(root)?;
-    Catalog::open_for(&v.uuid, root)
+    Ok(open_checked(root)?.0)
+}
+
+/// Open a catalog and say whether the library itself is reachable. Read-only
+/// commands work either way; anything that touches files must check.
+fn open_checked(root: &Path) -> Result<(Catalog, bool)> {
+    let (cat, online) = Catalog::open_for_root(root)?;
+    if !online {
+        eprintln!(
+            "OFFLINE  {} is not mounted -- answering from the catalog.",
+            root.display()
+        );
+    }
+    Ok((cat, online))
+}
+
+/// Refuse an operation that needs the actual files.
+fn require_online(root: &Path) -> Result<Catalog> {
+    let (cat, online) = open_checked(root)?;
+    anyhow::ensure!(
+        online,
+        "{} is not mounted, and this needs the files themselves. \
+         Reconnect the drive and try again.",
+        root.display()
+    );
+    Ok(cat)
 }
 
 /// Apply changes, then immediately flush. Edits are useless sitting in the
@@ -860,7 +884,7 @@ fn main() -> Result<()> {
 
         Cmd::Trash { target } => {
             let config = npc::config::Config::load()?;
-            let mut cat = open_for(&target.root)?;
+            let mut cat = require_online(&target.root)?;
             let ids = resolve(&cat, &target)?;
             if ids.is_empty() {
                 println!("nothing matched");
@@ -945,9 +969,19 @@ fn main() -> Result<()> {
                 "view" => npc::thumbs::Size::View,
                 other => anyhow::bail!("unknown size `{other}`; use grid or view"),
             };
-            let v = vol::identify(&root)?;
-            let cat = open_for(&root)?;
-            let cache = npc::thumbs::Cache::new(&v.uuid)?;
+            // Generating needs the originals; pruning does not.
+            let (cat, online) = open_checked(&root)?;
+            let uuid: String = cat
+                .conn
+                .query_row("SELECT vol_uuid FROM volume LIMIT 1", [], |r| r.get(0))
+                .unwrap_or_default();
+            anyhow::ensure!(
+                online || prune,
+                "{} is not mounted; thumbnails need the originals. \
+                 (`--prune` works offline.)",
+                root.display()
+            );
+            let cache = npc::thumbs::Cache::new(&uuid)?;
 
             let compiled = npc::query::compile(query.as_deref().unwrap_or(""))?;
             let stmt = compiled.select_stacks(None);
@@ -1086,7 +1120,7 @@ fn main() -> Result<()> {
             };
 
             let config = npc::config::Config::load()?;
-            let cat = open_for(&root)?;
+            let cat = require_online(&root)?;
             let target = Target {
                 query: query.clone(),
                 paths: Vec::new(),
@@ -1142,10 +1176,14 @@ fn main() -> Result<()> {
         Cmd::Tui { root } => npc::tui::run(root)?,
 
         Cmd::Status { root } => {
-            let v = vol::identify(&root)?;
-            let cat = open_for(&root)?;
+            let (cat, online) = open_checked(&root)?;
             println!("catalog {}", cat.path.display());
-            println!("  volume  {}", v.uuid);
+            let recorded: Option<String> = cat
+                .conn
+                .query_row("SELECT vol_uuid FROM volume LIMIT 1", [], |r| r.get(0))
+                .ok();
+            println!("  volume  {}", recorded.unwrap_or_else(|| "-".into()));
+            println!("  library {}", if online { "mounted" } else { "NOT MOUNTED" });
             println!("  stacks  {}", cat.stack_count()?);
             println!("  files   {}", cat.file_count()?);
             println!("  orphans {}", cat.orphan_count()?);

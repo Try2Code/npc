@@ -109,6 +109,7 @@ CREATE INDEX IF NOT EXISTS file_stack    ON file(stack_id);
 CREATE INDEX IF NOT EXISTS stack_dir     ON stack(dir);
 "#;
 
+#[derive(Debug)]
 pub struct Catalog {
     pub conn: Connection,
     pub path: PathBuf,
@@ -123,9 +124,7 @@ impl Catalog {
     /// Both components are known without the drive mounted, so offline queries
     /// still work.
     pub fn open_for(vol_uuid: &str, root: &Path) -> Result<Self> {
-        let dir = directories::ProjectDirs::from("", "", "photo-catalog")
-            .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".photo-catalog"));
+        let dir = Self::store();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating catalog directory {}", dir.display()))?;
 
@@ -144,6 +143,71 @@ impl Catalog {
             .collect();
 
         Self::open_at(dir.join(format!("{vol_uuid}-{label}-{short}.sqlite")))
+    }
+
+    /// The catalog directory, honouring `catalog_dir` in the config.
+    pub fn store() -> PathBuf {
+        crate::config::Config::load()
+            .unwrap_or_default()
+            .catalog_store()
+    }
+
+    /// Open the catalog for a library root, whether or not the drive is here.
+    ///
+    /// This is the whole point of keeping the catalog on the laptop, and it
+    /// did not work until now: resolving the volume canonicalises the path,
+    /// which fails the moment the drive is unplugged, so every command died
+    /// with "No such file or directory" while the catalog sat readable on
+    /// disk. When the root cannot be resolved, the catalog is found instead by
+    /// the `last_root` recorded in it at the last scan.
+    ///
+    /// Returns the catalog and whether the library is actually reachable.
+    pub fn open_for_root(root: &Path) -> Result<(Self, bool)> {
+        Self::open_for_root_in(&Self::store(), root)
+    }
+
+    /// The store directory is a parameter so this can be tested without
+    /// writing into the real one.
+    pub fn open_for_root_in(dir: &Path, root: &Path) -> Result<(Self, bool)> {
+        if let Ok(vol) = crate::vol::identify(root) {
+            return Ok((Self::open_for(&vol.uuid, root)?, true));
+        }
+
+        let wanted = root.to_string_lossy().to_string();
+        let mut candidates = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("sqlite") {
+                    continue;
+                }
+                let Ok(conn) = Connection::open(&path) else { continue };
+                let recorded: Option<String> = conn
+                    .query_row("SELECT last_root FROM volume LIMIT 1", [], |r| r.get(0))
+                    .ok();
+                if recorded.as_deref() == Some(wanted.as_str()) {
+                    candidates.push(path);
+                }
+            }
+        }
+
+        match candidates.len() {
+            1 => Ok((Self::open_at(candidates.remove(0))?, false)),
+            0 => anyhow::bail!(
+                "{} is not reachable and no catalog for it exists.\n\
+                 If the drive is unplugged, this library has never been scanned \
+                 while it was attached. Catalogs live in {}.",
+                root.display(),
+                dir.display()
+            ),
+            n => anyhow::bail!(
+                "{n} catalogs claim {} as their library. Refusing to guess; \
+                 remove the stale ones from {}.",
+                root.display(),
+                dir.display()
+            ),
+        }
     }
 
     pub fn open_at(path: PathBuf) -> Result<Self> {
@@ -369,6 +433,56 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tag", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tags, 1);
+    }
+
+    /// The offline path, which did not work at all until it was tested with
+    /// the drive actually unplugged: resolving a volume canonicalises the
+    /// path, so every command died with "No such file or directory" while the
+    /// catalog sat readable on disk. Found by pulling the cable, not by
+    /// reading the code.
+    #[test]
+    fn a_catalog_is_found_by_its_recorded_root_when_the_drive_is_gone() {
+        let store = tempfile::tempdir().unwrap();
+        let absent = Path::new("/media/nowhere/MyPics/2026/08");
+
+        // A catalog as a scan would have left it while the drive was attached.
+        let cat = Catalog::open_at(store.path().join("VOL1-08-abcdef12.sqlite")).unwrap();
+        cat.register_volume("VOL1", Some("MyPics"), absent).unwrap();
+        cat.conn
+            .execute("INSERT INTO stack (dir, base) VALUES ('/media/nowhere/MyPics/2026/08/09', 'x')", [])
+            .unwrap();
+        drop(cat);
+
+        let (found, online) = Catalog::open_for_root_in(store.path(), absent).unwrap();
+        assert!(!online, "an absent drive must not report as mounted");
+        assert_eq!(found.stack_count().unwrap(), 1, "the catalog was not found");
+    }
+
+    #[test]
+    fn an_unknown_root_says_so_rather_than_creating_an_empty_catalog() {
+        let store = tempfile::tempdir().unwrap();
+        let err = Catalog::open_for_root_in(store.path(), Path::new("/media/nowhere/never-scanned"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never been scanned"), "got: {err}");
+    }
+
+    /// Two catalogs claiming the same library is a state a person must resolve;
+    /// picking one silently would answer from an arbitrary half of the truth.
+    #[test]
+    fn ambiguous_catalogs_are_refused_rather_than_guessed() {
+        let store = tempfile::tempdir().unwrap();
+        let absent = Path::new("/media/nowhere/MyPics");
+
+        for name in ["A-x-1.sqlite", "B-x-2.sqlite"] {
+            let cat = Catalog::open_at(store.path().join(name)).unwrap();
+            cat.register_volume(name, None, absent).unwrap();
+        }
+
+        let err = Catalog::open_for_root_in(store.path(), absent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 catalogs"), "got: {err}");
     }
 
     #[test]

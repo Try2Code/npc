@@ -58,6 +58,48 @@ pub struct Config {
     pub protected_roots: Vec<PathBuf>,
     #[serde(default)]
     pub thumbs: Thumbs,
+    /// Where catalogs live. Defaults to the XDG data directory.
+    ///
+    /// Worth moving if the default lands somewhere you would rather it did
+    /// not -- a synced home directory, or a small root partition. A catalog is
+    /// rebuildable, so relocating it costs a rescan and nothing else.
+    #[serde(default)]
+    pub catalog_dir: Option<PathBuf>,
+}
+
+impl Config {
+    /// Where catalogs are kept, honouring `catalog_dir` if it is set.
+    pub fn catalog_store(&self) -> PathBuf {
+        if let Some(dir) = &self.catalog_dir {
+            return expand_home(dir);
+        }
+        directories::ProjectDirs::from("", "", "photo-catalog")
+            .map(|d| d.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".photo-catalog"))
+    }
+
+    /// Where thumbnails are kept, under the same directory when one is
+    /// configured -- keeping the two together is what people expect when they
+    /// move a catalog off the default path.
+    pub fn cache_store(&self) -> PathBuf {
+        if let Some(dir) = &self.catalog_dir {
+            return expand_home(dir).join("thumbnails");
+        }
+        directories::ProjectDirs::from("", "", "photo-catalog")
+            .map(|d| d.cache_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".photo-cache"))
+    }
+}
+
+/// `~` is what a person writes in a config file, and nothing expands it for us.
+fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 impl Config {
@@ -159,6 +201,55 @@ mod tests {
         assert!(c
             .ensure_mutable(Path::new("/media/ram/MyPicsBackup/x.xmp"))
             .is_ok());
+    }
+
+    #[test]
+    fn catalog_dir_defaults_to_xdg_and_is_overridable() {
+        let default = Config::default();
+        assert!(default.catalog_store().ends_with("photo-catalog"));
+
+        let moved = Config {
+            catalog_dir: Some(PathBuf::from("/data/photo-catalogs")),
+            ..Default::default()
+        };
+        assert_eq!(moved.catalog_store(), PathBuf::from("/data/photo-catalogs"));
+        // Thumbnails follow the catalog: keeping them apart when someone has
+        // deliberately relocated one is not what they meant.
+        assert_eq!(
+            moved.cache_store(),
+            PathBuf::from("/data/photo-catalogs/thumbnails")
+        );
+    }
+
+    /// `~` is what a person writes in a config file, and nothing expands it
+    /// for us -- a literal `~` directory would be created instead.
+    #[test]
+    fn a_tilde_in_the_catalog_path_is_expanded() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let c = Config {
+            catalog_dir: Some(PathBuf::from("~/photo-cat")),
+            ..Default::default()
+        };
+        assert_eq!(c.catalog_store(), PathBuf::from(home).join("photo-cat"));
+    }
+
+    #[test]
+    fn config_parses_the_documented_shape() {
+        let c: Config = toml::from_str(
+            r#"
+            protected_roots = ["/media/ram/MyPics"]
+            catalog_dir = "~/photo-catalogs"
+
+            [thumbs]
+            grid_px = 1280
+            view_px = 1620
+            quality = 80
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.protected_roots.len(), 1);
+        assert_eq!(c.thumbs.grid_px, 1280);
+        assert!(c.catalog_dir.is_some());
     }
 
     #[test]

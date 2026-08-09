@@ -280,9 +280,10 @@ fn check_cache(root: &Path) -> Result<Finding> {
     let Ok(vol) = crate::vol::identify(root) else {
         return Ok(Finding::note("cache not checked (volume unresolved)"));
     };
-    let dir = directories::ProjectDirs::from("", "", "photo-catalog")
-        .map(|d| d.cache_dir().join(&vol.uuid))
-        .unwrap_or_else(|| PathBuf::from(".photo-cache"));
+    let dir = crate::config::Config::load()
+        .unwrap_or_default()
+        .cache_store()
+        .join(&vol.uuid);
 
     if !dir.exists() {
         return Ok(Finding::note("no thumbnail cache yet")

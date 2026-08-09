@@ -118,6 +118,9 @@ pub struct App {
     /// released after the frame, so the terminal only ever holds images that
     /// are actually on screen.
     frame_used: HashSet<PathBuf>,
+    /// False when the library is not mounted. Browsing and tagging still work
+    /// -- edits queue -- but nothing that needs the files themselves does.
+    online: bool,
     /// Tiles across in grid view. Adjustable live, because the right value
     /// depends on font size and window, which only the user can see.
     grid_cols: u16,
@@ -125,9 +128,10 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
-        let v = crate::vol::identify(&root)?;
-        let cat = Catalog::open_for(&v.uuid, &root)?;
-        Self::with_catalog(cat, root)
+        let (cat, online) = Catalog::open_for_root(&root)?;
+        let mut app = Self::with_catalog(cat, root)?;
+        app.online = online;
+        Ok(app)
     }
 
     /// Split out so the interaction logic can be exercised without a terminal.
@@ -167,6 +171,7 @@ impl App {
             frame_used: HashSet::new(),
             page_size: 20,
             grid_cols: 5,
+            online: true,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -298,6 +303,20 @@ impl App {
     pub fn enable_images(&mut self) {
         if let Ok(v) = crate::vol::identify(&self.root) {
             self.cache = thumbs::Cache::new(&v.uuid).ok();
+        }
+        // Thumbnails come from the laptop cache, so they still render with the
+        // drive away; only generating new ones needs it.
+        if self.online {
+            if let Ok(v) = crate::vol::identify(&self.root) {
+                self.cache = thumbs::Cache::new(&v.uuid).ok();
+            }
+        } else {
+            let uuid: String = self
+                .cat
+                .conn
+                .query_row("SELECT vol_uuid FROM volume LIMIT 1", [], |r| r.get(0))
+                .unwrap_or_default();
+            self.cache = thumbs::Cache::new(&uuid).ok();
         }
         self.picker = Picker::from_query_stdio().ok();
         // Say plainly what was detected. A silent fallback to halfblocks looks
@@ -812,6 +831,13 @@ impl App {
             self.status = format!("no action bound to `{key}`");
             return Ok(());
         };
+        if !self.online {
+            self.status = format!(
+                "{} not launched: the library is not mounted",
+                a.name
+            );
+            return Ok(());
+        }
         let ids = self.targets();
 
         // A protected root protects against *this* program's writes. It says
@@ -920,7 +946,25 @@ impl App {
         } else {
             format!(" {}/{} ", self.cursor + 1, self.rows.len())
         };
+        let pending: i64 = self
+            .cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| r.get(0))
+            .unwrap_or(0);
+        let offline_badge = if self.online {
+            String::new()
+        } else {
+            format!(
+                "  OFFLINE{}  ",
+                if pending > 0 { format!(" - {pending} pending") } else { String::new() }
+            )
+        };
+
         let identity = Line::from(vec![
+            Span::styled(
+                offline_badge,
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
             Span::styled(
                 if self.query.is_empty() {
                     "  all  ".to_string()

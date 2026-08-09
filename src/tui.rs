@@ -371,6 +371,39 @@ impl App {
         })
     }
 
+    /// Shooting data for the file under the cursor.
+    fn current_exif(&self) -> Option<Exif> {
+        let row = self.rows.get(self.cursor)?;
+        self.cat
+            .conn
+            .query_row(
+                "SELECT capture_time, exposure, fnumber, iso, exposure_bias, focal,
+                        lens, camera, width, height,
+                        COALESCE(?2, exif_orientation, 1)
+                 FROM file
+                 WHERE stack_id = ?1 AND present = 1
+                 ORDER BY CASE role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END
+                 LIMIT 1",
+                rusqlite::params![row.id, None::<i64>],
+                |r| {
+                    Ok(Exif {
+                        captured: r.get(0)?,
+                        exposure: r.get(1)?,
+                        fnumber: r.get(2)?,
+                        iso: r.get(3)?,
+                        bias: r.get(4)?,
+                        focal: r.get(5)?,
+                        lens: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        camera: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                        width: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                        height: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        orientation: r.get::<_, Option<i64>>(10)?.unwrap_or(1) as u16,
+                    })
+                },
+            )
+            .ok()
+    }
+
     /// Files of the stack under the cursor, for the single view's `o` cycling.
     fn current_members(&self) -> Vec<(String, String)> {
         let Some(row) = self.rows.get(self.cursor) else {
@@ -800,6 +833,7 @@ impl App {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(outer[1]);
 
+        let exif = self.current_exif();
         let position = if self.rows.is_empty() {
             String::new()
         } else {
@@ -828,6 +862,12 @@ impl App {
                     .map(|r| format!("   [{}]", r.tags))
                     .unwrap_or_default(),
                 Style::default().fg(Color::Blue),
+            ),
+            Span::styled(
+                exif.as_ref()
+                    .map(|e| format!("   {}", e.line()))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Yellow),
             ),
         ]);
         f.render_widget(Paragraph::new(identity), rows[0]);
@@ -1031,18 +1071,106 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        // A portrait frame leaves width unused, a landscape frame leaves
+        // height. Put the shooting data wherever the picture is not.
+        let exif = self.current_exif();
+        let portrait = exif.as_ref().map(|e| e.is_portrait()).unwrap_or(false);
+        let (picture, panel) = if portrait && inner.width > 60 {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(20), Constraint::Length(34)])
+                .split(inner);
+            (cols[0], Some(cols[1]))
+        } else if !portrait && inner.height > 12 {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(4)])
+                .split(inner);
+            (rows[0], Some(rows[1]))
+        } else {
+            (inner, None)
+        };
+
         self.prefetch(ThumbSize::View, 2);
 
         match self.image_for(self.cursor, ThumbSize::View) {
             Some(path) if self.ensure_decoded(&path) => {
                 if let Some(p) = self.images.get_mut(&path) {
-                    f.render_stateful_widget(StatefulImage::default(), inner, p);
+                    f.render_stateful_widget(StatefulImage::default(), picture, p);
                 }
             }
             _ => f.render_widget(
                 Paragraph::new("rendering...").style(Style::default().fg(Color::DarkGray)),
-                inner,
+                picture,
             ),
+        }
+
+        if let (Some(area), Some(e)) = (panel, exif.as_ref()) {
+            let label = |k: &str, v: String| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<3}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(v, Style::default().fg(Color::Yellow)),
+                ])
+            };
+            let mut lines = Vec::new();
+            if portrait {
+                // Stacked: one field per line, room to spare.
+                if let Some(t) = e.captured {
+                    lines.push(label("", format_datetime(t)));
+                    lines.push(Line::from(""));
+                }
+                if let Some(x) = e.exposure.filter(|x| *x > 0.0) {
+                    lines.push(label("S", format_shutter(x)));
+                }
+                if let Some(x) = e.fnumber.filter(|x| *x > 0.0) {
+                    lines.push(label("A", format!("f/{x:.1}")));
+                }
+                if let Some(x) = e.iso.filter(|x| *x > 0) {
+                    lines.push(label("I", format!("{x}")));
+                }
+                if let Some(x) = e.bias {
+                    lines.push(label("EV", format_ev(x)));
+                }
+                if let Some(x) = e.focal.filter(|x| *x > 0.0) {
+                    lines.push(label("", format!("{x:.0}mm")));
+                }
+                lines.push(Line::from(""));
+                if !e.lens.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        e.lens.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                if !e.camera.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        e.camera.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            } else {
+                // One row across, under a landscape frame.
+                lines.push(Line::from(Span::styled(
+                    e.line(),
+                    Style::default().fg(Color::Yellow),
+                )));
+                let mut tail = String::new();
+                if !e.lens.is_empty() {
+                    tail.push_str(&e.lens);
+                }
+                if !e.camera.is_empty() {
+                    if !tail.is_empty() {
+                        tail.push_str("   ");
+                    }
+                    tail.push_str(&e.camera);
+                }
+                if !tail.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        tail,
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         }
     }
 
@@ -1061,6 +1189,89 @@ impl App {
             area,
         );
     }
+}
+
+/// Shooting data, as it is displayed rather than as it is stored.
+#[derive(Debug, Clone, Default)]
+struct Exif {
+    captured: Option<i64>,
+    exposure: Option<f64>,
+    fnumber: Option<f64>,
+    iso: Option<i64>,
+    bias: Option<f64>,
+    focal: Option<f64>,
+    lens: String,
+    camera: String,
+    width: i64,
+    height: i64,
+    orientation: u16,
+}
+
+impl Exif {
+    /// True when the frame is taller than it is wide *as displayed*, which is
+    /// what decides whether the info panel goes beside it or beneath it.
+    fn is_portrait(&self) -> bool {
+        let (w, h) = if matches!(self.orientation, 5..=8) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        h > w && w > 0
+    }
+
+    /// The exposure quintet, in the order a photographer reads it.
+    fn line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(t) = self.captured {
+            parts.push(format_datetime(t));
+        }
+        if let Some(e) = self.exposure.filter(|e| *e > 0.0) {
+            parts.push(format!("S {}", format_shutter(e)));
+        }
+        if let Some(f) = self.fnumber.filter(|f| *f > 0.0) {
+            parts.push(format!("A f/{f:.1}"));
+        }
+        if let Some(i) = self.iso.filter(|i| *i > 0) {
+            parts.push(format!("I {i}"));
+        }
+        if let Some(b) = self.bias {
+            parts.push(format!("EV {}", format_ev(b)));
+        }
+        if let Some(f) = self.focal.filter(|f| *f > 0.0) {
+            parts.push(format!("{f:.0}mm"));
+        }
+        parts.join("   ")
+    }
+}
+
+/// `1/400` below a second, `2.5\"` above it -- how a camera displays it.
+fn format_shutter(seconds: f64) -> String {
+    if seconds >= 1.0 {
+        format!("{seconds:.1}\"")
+    } else {
+        format!("1/{:.0}", (1.0 / seconds).round())
+    }
+}
+
+/// Signed, because the sign is the whole point of exposure compensation.
+fn format_ev(ev: f64) -> String {
+    if ev.abs() < 0.01 {
+        "0".to_string()
+    } else {
+        format!("{ev:+.1}")
+    }
+}
+
+fn format_datetime(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (y, m, d) = civil(days);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 const HELP: &str = "\
@@ -1613,6 +1824,96 @@ mod tests {
         type_str(&mut app, "beach");
         let screen = render(&mut app, 120, 30);
         assert!(screen.contains("[beach]"), "tags missing:\n{screen}");
+    }
+
+    #[test]
+    fn shutter_speeds_read_the_way_a_camera_shows_them() {
+        assert_eq!(format_shutter(1.0 / 400.0), "1/400");
+        assert_eq!(format_shutter(0.0025), "1/400");
+        assert_eq!(format_shutter(1.0 / 13.0), "1/13");
+        assert_eq!(format_shutter(1.0), "1.0\"");
+        assert_eq!(format_shutter(2.5), "2.5\"");
+    }
+
+    /// Exposure compensation is meaningless without its sign, and Nikon works
+    /// in thirds -- -2/3 EV arrives as -0.6666 and must read as the camera
+    /// displays it.
+    #[test]
+    fn exposure_compensation_keeps_its_sign() {
+        assert_eq!(format_ev(0.0), "0");
+        assert_eq!(format_ev(-0.666_666_7), "-0.7");
+        assert_eq!(format_ev(-0.333_333_3), "-0.3");
+        assert_eq!(format_ev(1.0), "+1.0");
+        assert_eq!(format_ev(-1.666_666_6), "-1.7");
+    }
+
+    #[test]
+    fn the_exposure_line_is_labelled() {
+        let e = Exif {
+            captured: Some(1_786_233_666),
+            exposure: Some(0.0025),
+            fnumber: Some(4.5),
+            iso: Some(2500),
+            bias: Some(-0.666_666_7),
+            focal: Some(200.0),
+            ..Default::default()
+        };
+        let line = e.line();
+        assert!(line.contains("S 1/400"), "{line}");
+        assert!(line.contains("A f/4.5"), "{line}");
+        assert!(line.contains("I 2500"), "{line}");
+        assert!(line.contains("EV -0.7"), "{line}");
+        assert!(line.contains("200mm"), "{line}");
+        assert!(line.contains("2026-08-09"), "{line}");
+    }
+
+    /// Missing fields are omitted rather than shown as zero. One file in the
+    /// library has no ISO recorded, and `I 0` would be a lie.
+    #[test]
+    fn missing_fields_are_omitted_not_zeroed() {
+        let e = Exif {
+            captured: Some(1_786_233_666),
+            iso: Some(0),
+            fnumber: Some(0.0),
+            exposure: None,
+            ..Default::default()
+        };
+        let line = e.line();
+        assert!(!line.contains("I 0"), "{line}");
+        assert!(!line.contains("f/0"), "{line}");
+        assert!(!line.contains("S "), "{line}");
+    }
+
+    /// The layout decision: orientation, not stored dimensions, decides
+    /// whether a frame displays portrait. A D750 writes 6016x4016 with
+    /// orientation 8 for a portrait shot.
+    #[test]
+    fn portrait_is_decided_after_rotation() {
+        let landscape = Exif { width: 6016, height: 4016, orientation: 1, ..Default::default() };
+        assert!(!landscape.is_portrait());
+
+        let rotated = Exif { width: 6016, height: 4016, orientation: 8, ..Default::default() };
+        assert!(rotated.is_portrait(), "orientation 8 must display as portrait");
+
+        let unknown = Exif::default();
+        assert!(!unknown.is_portrait(), "no dimensions must not claim portrait");
+    }
+
+    #[test]
+    fn the_status_area_shows_the_exposure_data() {
+        let (_d, mut app) = app();
+        app.cat
+            .conn
+            .execute(
+                "UPDATE file SET exposure = 0.0025, fnumber = 4.5, iso = 2500,
+                                 exposure_bias = -0.6666667, focal = 200.0",
+                [],
+            )
+            .unwrap();
+        let screen = render(&mut app, 160, 30);
+        for want in ["S 1/400", "A f/4.5", "I 2500", "EV -0.7"] {
+            assert!(screen.contains(want), "`{want}` missing:\n{screen}");
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS volume (
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS file (
     fnumber          REAL,
     exposure         REAL,
     focal            REAL,
+    exposure_bias    REAL,
     width            INTEGER,
     height           INTEGER,
     exif_orientation INTEGER,
@@ -158,14 +159,7 @@ impl Catalog {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
-        if version == 0 {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION {
-            anyhow::bail!(
-                "catalog {} is schema version {version}, this build expects {SCHEMA_VERSION}",
-                path.display()
-            );
-        }
+        migrate(&conn, version, &path)?;
 
         Ok(Self { conn, path })
     }
@@ -254,6 +248,38 @@ impl Catalog {
             )
             .optional()?)
     }
+}
+
+/// Bring an existing catalog up to date. The catalog is rebuildable, so a
+/// migration that cannot be applied is not a disaster -- but silently
+/// refusing to open would strand tags that only exist in sidecars until the
+/// user works out they need a rescan, so migrate in place where possible.
+fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
+    if from == 0 || from == SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        return Ok(());
+    }
+    if from > SCHEMA_VERSION {
+        anyhow::bail!(
+            "catalog {} was written by a newer build (schema {from}, this build expects \
+             {SCHEMA_VERSION}). Delete it to rebuild, or use the newer binary.",
+            path.display()
+        );
+    }
+
+    // v1 -> v2: exposure compensation. Backfilled by `photo scan --full`;
+    // until then the column is simply NULL and the UI shows nothing.
+    if from < 2 {
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('file') WHERE name = 'exposure_bias'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute("ALTER TABLE file ADD COLUMN exposure_bias REAL", [])?;
+        }
+    }
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
 }
 
 pub fn now_secs() -> i64 {

@@ -199,6 +199,20 @@ FileMeta read_meta(rust::Str path_) {
     m.exposure = f64_of(d, "Exif.Photo.ExposureTime");
     m.focal = f64_of(d, "Exif.Photo.FocalLength");
 
+    // Exposure compensation is a signed rational, and 0 EV is both the most
+    // common real value and what a missing tag would look like -- so the
+    // presence flag is not redundant.
+    if (auto *v = find(d, "Exif.Photo.ExposureBiasValue")) {
+        try {
+            m.exposure_bias = v->toFloat();
+            m.has_bias = true;
+        } catch (...) {
+            m.has_bias = false;
+        }
+    } else {
+        m.has_bias = false;
+    }
+
     uint32_t o = u32_of(d, "Exif.Image.Orientation");
     m.orientation = static_cast<uint16_t>(o == 0 ? 1 : o);
 

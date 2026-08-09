@@ -179,8 +179,8 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
             "INSERT INTO file (stack_id, name, ext, role, size, mtime_ns,
                                capture_time, camera, lens, iso, fnumber, exposure,
                                focal, width, height, exif_orientation, serial,
-                               shutter_count, present)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,1)
+                               shutter_count, exposure_bias, present)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,1)
              ON CONFLICT(stack_id, name) DO UPDATE SET
                  ext=excluded.ext, role=excluded.role, size=excluded.size,
                  mtime_ns=excluded.mtime_ns,
@@ -196,6 +196,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                  exif_orientation=COALESCE(NULLIF(excluded.exif_orientation,0), file.exif_orientation),
                  serial=COALESCE(NULLIF(excluded.serial,''), file.serial),
                  shutter_count=COALESCE(NULLIF(excluded.shutter_count,0), file.shutter_count),
+                 exposure_bias=COALESCE(excluded.exposure_bias, file.exposure_bias),
                  present=1",
         )?;
 
@@ -234,6 +235,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                     fm.map(|f| f.orientation).unwrap_or(0),
                     fm.map(|f| f.serial.as_str()).unwrap_or(""),
                     fm.map(|f| f.shutter_count).unwrap_or(0),
+                    fm.and_then(|f| f.has_bias.then_some(f.exposure_bias)),
                 ])?;
             }
         }

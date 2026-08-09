@@ -28,6 +28,10 @@ pub mod ffi {
         pub fnumber: f64,
         pub exposure: f64,
         pub focal: f64,
+        /// Exposure compensation in EV. Zero is a real value, so `has_bias`
+        /// distinguishes "shot at 0 EV" from "camera recorded nothing".
+        pub exposure_bias: f64,
+        pub has_bias: bool,
         pub width: u32,
         pub height: u32,
         pub orientation: u16, // as the camera wrote it; never overwritten

@@ -101,9 +101,7 @@ fn on_path(program: &str) -> bool {
         return std::path::Path::new(program).exists();
     }
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join(program).is_file())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
         .unwrap_or(false)
 }
 
@@ -119,18 +117,23 @@ pub struct Selection {
     pub query: String,
 }
 
-pub fn gather(cat: &Catalog, stack_ids: &[i64], current: Option<i64>, query: &str) -> Result<Selection> {
+pub fn gather(
+    cat: &Catalog,
+    stack_ids: &[i64],
+    current: Option<i64>,
+    query: &str,
+) -> Result<Selection> {
     let mut sel = Selection {
         query: query.to_string(),
         ..Default::default()
     };
 
     for &sid in stack_ids {
-        let (dir,): (String,) = cat.conn.query_row(
-            "SELECT dir FROM stack WHERE id = ?1",
-            [sid],
-            |r| Ok((r.get(0)?,)),
-        )?;
+        let (dir,): (String,) =
+            cat.conn
+                .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| {
+                    Ok((r.get(0)?,))
+                })?;
         if !sel.dirs.contains(&dir) {
             sel.dirs.push(dir.clone());
         }
@@ -205,10 +208,7 @@ pub fn build_argv(action: &Action, sel: &Selection) -> Result<Vec<String>> {
     // would silently run the bare program -- e.g. opening RawTherapee with no
     // file. Better to say so.
     if argv.len() == 1 && action.cmd.len() > 1 {
-        bail!(
-            "action `{}` matched no files in the selection",
-            action.name
-        );
+        bail!("action `{}` matched no files in the selection", action.name);
     }
     Ok(argv)
 }
@@ -329,7 +329,10 @@ mod tests {
             &selection(&["/a/1.NEF", "/a/2.NEF", "/a/3.NEF"]),
         )
         .unwrap();
-        assert_eq!(argv, vec!["rawtherapee", "/a/1.NEF", "/a/2.NEF", "/a/3.NEF"]);
+        assert_eq!(
+            argv,
+            vec!["rawtherapee", "/a/1.NEF", "/a/2.NEF", "/a/3.NEF"]
+        );
     }
 
     #[test]
@@ -342,11 +345,23 @@ mod tests {
             dirs: vec!["/a".into()],
             query: "beach".into(),
         };
-        assert_eq!(build_argv(&action(&["x", "{raw}"]), &sel).unwrap()[1], "/a/1.NEF");
-        assert_eq!(build_argv(&action(&["x", "{jpg}"]), &sel).unwrap()[1], "/a/1.JPG");
+        assert_eq!(
+            build_argv(&action(&["x", "{raw}"]), &sel).unwrap()[1],
+            "/a/1.NEF"
+        );
+        assert_eq!(
+            build_argv(&action(&["x", "{jpg}"]), &sel).unwrap()[1],
+            "/a/1.JPG"
+        );
         assert_eq!(build_argv(&action(&["x", "{dir}"]), &sel).unwrap()[1], "/a");
-        assert_eq!(build_argv(&action(&["x", "{query}"]), &sel).unwrap()[1], "beach");
-        assert_eq!(build_argv(&action(&["x", "{files}"]), &sel).unwrap().len(), 3);
+        assert_eq!(
+            build_argv(&action(&["x", "{query}"]), &sel).unwrap()[1],
+            "beach"
+        );
+        assert_eq!(
+            build_argv(&action(&["x", "{files}"]), &sel).unwrap().len(),
+            3
+        );
     }
 
     /// Literal arguments pass through untouched, so flags still work.
@@ -360,7 +375,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(argv, vec!["convert", "-resize", "2048x", "/a/1.JPG", "out.jpg"]);
+        assert_eq!(
+            argv,
+            vec!["convert", "-resize", "2048x", "/a/1.JPG", "out.jpg"]
+        );
     }
 
     /// Silently opening an editor with no file is worse than an error.

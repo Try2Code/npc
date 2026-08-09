@@ -332,14 +332,19 @@ fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
         // Explicit quality: the default encoder setting is not tunable, and at
         // 4x the pixel count the compression setting is what keeps the cache
         // from ballooning.
-        let file = std::fs::File::create(&part)
-            .with_context(|| format!("creating {}", part.display()))?;
+        let file =
+            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
         let mut writer = std::io::BufWriter::new(file);
         let mut encoder =
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality());
         let rgb = img.to_rgb8();
         encoder
-            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
             .with_context(|| format!("encoding {}", part.display()))?;
     }
     std::fs::rename(&part, out)?;
@@ -396,9 +401,9 @@ pub fn prewarm(
         })
         .collect();
 
-    counts.into_iter().fold((0, 0, 0), |a, b| {
-        (a.0 + b.0, a.1 + b.1, a.2 + b.2)
-    })
+    counts
+        .into_iter()
+        .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 }
 
 #[cfg(test)]
@@ -613,8 +618,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES (?1, 'shot')",
-                     [dir.path().to_str().unwrap()])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES (?1, 'shot')",
+                [dir.path().to_str().unwrap()],
+            )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
         std::fs::write(dir.path().join("shot.JPG"), jpeg(64, 48)).unwrap();
@@ -649,7 +656,10 @@ mod tests {
     fn best_source_prefers_the_raw_so_exiv2_can_pick_a_small_tier() {
         let cat = Catalog::open_memory().unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES ('/d', '750_0001')", [])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES ('/d', '750_0001')",
+                [],
+            )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
         for (name, role) in [
@@ -672,7 +682,10 @@ mod tests {
             "picked {} -- the full-res derived file is not a cheap source",
             src.path.display()
         );
-        assert!(src.embedded, "the RAW path must go through Exiv2 tier selection");
+        assert!(
+            src.embedded,
+            "the RAW path must go through Exiv2 tier selection"
+        );
         assert_eq!(src.orientation, 8);
     }
 
@@ -680,7 +693,10 @@ mod tests {
     fn best_source_uses_a_jpeg_when_there_is_no_raw() {
         let cat = Catalog::open_memory().unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES ('/d', '750_0002')", [])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES ('/d', '750_0002')",
+                [],
+            )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
         cat.conn

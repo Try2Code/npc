@@ -2,3 +2,6 @@
 # Hash baselines of the user's photo library: regenerable, and a file listing
 # of personal photographs has no business in a repo that might one day be pushed.
 /.tripwire
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

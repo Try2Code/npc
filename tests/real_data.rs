@@ -96,7 +96,11 @@ fn stray_profiles_are_invisible_rather_than_orphans() {
 
     let profiles: i64 = cat
         .conn
-        .query_row("SELECT COUNT(*) FROM file WHERE role = 'profile'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM file WHERE role = 'profile'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(profiles, 0, "a .pp3 was catalogued");
 }
@@ -133,7 +137,10 @@ fn a_known_directory_resolves_to_three_member_stacks() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(odd, 0, "{odd} stacks in 08/09 lack the expected image members");
+    assert_eq!(
+        odd, 0,
+        "{odd} stacks in 08/09 lack the expected image members"
+    );
 
     // Exactly the three image roles. Profiles are no longer catalogued, so
     // opening a shot in RawTherapee can no longer change this.
@@ -190,9 +197,11 @@ fn real_exif_lands_in_the_catalog() {
 
     let lenses: i64 = cat
         .conn
-        .query_row("SELECT COUNT(DISTINCT lens) FROM file WHERE lens != ''", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(DISTINCT lens) FROM file WHERE lens != ''",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(lenses >= 1, "maker-note lens names did not survive");
 }
@@ -221,7 +230,10 @@ fn every_real_filename_classifies_as_expected() {
     let root = require_library!();
     let mut counts = std::collections::BTreeMap::new();
 
-    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -234,8 +246,14 @@ fn every_real_filename_classifies_as_expected() {
     }
 
     assert_eq!(counts.get("raw").copied().unwrap_or(0) as i64, EXPECTED_RAW);
-    assert_eq!(counts.get("oocjpg").copied().unwrap_or(0) as i64, EXPECTED_OOCJPG);
-    assert_eq!(counts.get("derived").copied().unwrap_or(0) as i64, EXPECTED_DERIVED);
+    assert_eq!(
+        counts.get("oocjpg").copied().unwrap_or(0) as i64,
+        EXPECTED_OOCJPG
+    );
+    assert_eq!(
+        counts.get("derived").copied().unwrap_or(0) as i64,
+        EXPECTED_DERIVED
+    );
     // Profiles and sidecars are not asserted: RawTherapee adds a .pp3 whenever
     // a shot is opened, and this tool adds .xmp whenever anything is tagged.
     // Both are correct behaviour and neither must break the suite.
@@ -316,7 +334,11 @@ fn events_are_one_per_day_of_shooting() {
 
     let unassigned: i64 = cat
         .conn
-        .query_row("SELECT COUNT(*) FROM stack WHERE event_id IS NULL", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM stack WHERE event_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(unassigned, 0);
 }

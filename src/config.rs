@@ -136,7 +136,9 @@ mod tests {
     #[test]
     fn allows_paths_outside_every_protected_root() {
         let c = cfg(&["/media/ram/MyPics"]);
-        assert!(c.ensure_mutable(Path::new("/home/ram/src/tasks/test-data/a.xmp")).is_ok());
+        assert!(c
+            .ensure_mutable(Path::new("/home/ram/src/tasks/test-data/a.xmp"))
+            .is_ok());
         assert!(c.ensure_mutable(Path::new("/tmp/scratch/b.xmp")).is_ok());
     }
 
@@ -154,7 +156,9 @@ mod tests {
     #[test]
     fn does_not_confuse_a_sibling_with_a_prefix_name() {
         let c = cfg(&["/media/ram/MyPics"]);
-        assert!(c.ensure_mutable(Path::new("/media/ram/MyPicsBackup/x.xmp")).is_ok());
+        assert!(c
+            .ensure_mutable(Path::new("/media/ram/MyPicsBackup/x.xmp"))
+            .is_ok());
     }
 
     #[test]

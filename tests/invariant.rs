@@ -156,7 +156,10 @@ fn writemetadata_appears_only_inside_the_guarded_writers() {
     let mut offenders = Vec::new();
     let mut total = 0usize;
 
-    for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }

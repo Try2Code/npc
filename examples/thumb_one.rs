@@ -1,7 +1,9 @@
 //! Generate one thumbnail and print where it landed, so a suspect image can
 //! be inspected directly. Debugging aid, not part of the CLI.
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).expect("usage: thumb_one <image> [grid|view]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: thumb_one <image> [grid|view]");
     let size = match std::env::args().nth(2).as_deref() {
         Some("view") => npc::thumbs::Size::View,
         _ => npc::thumbs::Size::Grid,

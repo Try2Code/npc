@@ -189,11 +189,11 @@ impl Catalog {
                  last_seen = excluded.last_seen",
             rusqlite::params![uuid, label, root.to_string_lossy(), now],
         )?;
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM volume WHERE vol_uuid = ?1",
-            [uuid],
-            |r| r.get(0),
-        )?;
+        let id: i64 =
+            self.conn
+                .query_row("SELECT id FROM volume WHERE vol_uuid = ?1", [uuid], |r| {
+                    r.get(0)
+                })?;
         Ok(id)
     }
 
@@ -204,11 +204,11 @@ impl Catalog {
     }
 
     pub fn file_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM file WHERE present = 1",
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM file WHERE present = 1", [], |r| {
+                r.get(0)
+            })?)
     }
 
     pub fn orphan_count(&self) -> Result<i64> {

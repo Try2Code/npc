@@ -47,13 +47,28 @@ pub struct Finding {
 
 impl Finding {
     fn fine(title: impl Into<String>) -> Self {
-        Self { severity: Severity::Fine, title: title.into(), detail: vec![], remedy: None }
+        Self {
+            severity: Severity::Fine,
+            title: title.into(),
+            detail: vec![],
+            remedy: None,
+        }
     }
     fn note(title: impl Into<String>) -> Self {
-        Self { severity: Severity::Note, title: title.into(), detail: vec![], remedy: None }
+        Self {
+            severity: Severity::Note,
+            title: title.into(),
+            detail: vec![],
+            remedy: None,
+        }
     }
     fn warn(title: impl Into<String>) -> Self {
-        Self { severity: Severity::Warn, title: title.into(), detail: vec![], remedy: None }
+        Self {
+            severity: Severity::Warn,
+            title: title.into(),
+            detail: vec![],
+            remedy: None,
+        }
     }
     fn with(mut self, lines: Vec<String>) -> Self {
         self.detail = lines;
@@ -92,7 +107,11 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
          WHERE f.present = 1",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })?;
 
     let mut changed = Vec::new();
@@ -103,11 +122,7 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
             Ok(md) => {
                 let now_mtime = md.mtime() * 1_000_000_000 + md.mtime_nsec();
                 if md.size() as i64 != size || now_mtime != mtime {
-                    changed.push(format!(
-                        "{path}  ({} -> {} bytes)",
-                        size,
-                        md.size()
-                    ));
+                    changed.push(format!("{path}  ({} -> {} bytes)", size, md.size()));
                 }
             }
             Err(_) => gone += 1,
@@ -117,25 +132,33 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
     if changed.is_empty() {
         return Ok(Finding::fine(format!(
             "originals unchanged since catalogued{}",
-            if gone > 0 { format!(" ({gone} not readable)") } else { String::new() }
+            if gone > 0 {
+                format!(" ({gone} not readable)")
+            } else {
+                String::new()
+            }
         )));
     }
 
     let n = changed.len();
     changed.truncate(10);
-    Ok(Finding::warn(format!("{n} original(s) modified since catalogued"))
-        .with(changed)
-        .fix("Something other than this tool wrote to them -- an editor or a \
+    Ok(
+        Finding::warn(format!("{n} original(s) modified since catalogued"))
+            .with(changed)
+            .fix(
+                "Something other than this tool wrote to them -- an editor or a \
               viewer embedding a rating. Run `photo scan --full` to re-read \
-              them, or investigate first if that is unexpected."))
+              them, or investigate first if that is unexpected.",
+            ),
+    )
 }
 
 fn check_missing(cat: &Catalog) -> Result<Finding> {
-    let n: i64 = cat.conn.query_row(
-        "SELECT COUNT(*) FROM file WHERE present = 0",
-        [],
-        |r| r.get(0),
-    )?;
+    let n: i64 = cat
+        .conn
+        .query_row("SELECT COUNT(*) FROM file WHERE present = 0", [], |r| {
+            r.get(0)
+        })?;
     if n == 0 {
         return Ok(Finding::fine("no files missing"));
     }
@@ -148,15 +171,21 @@ fn check_missing(cat: &Catalog) -> Result<Finding> {
         .query_map([], |r| r.get::<_, String>(0))?
         .filter_map(std::result::Result::ok)
         .collect();
-    Ok(Finding::note(format!("{n} file(s) recorded but not on disk"))
-        .with(sample)
-        .fix("Kept deliberately: an unplugged drive or a renamed folder must \
+    Ok(
+        Finding::note(format!("{n} file(s) recorded but not on disk"))
+            .with(sample)
+            .fix(
+                "Kept deliberately: an unplugged drive or a renamed folder must \
               not destroy tag history. They disappear from queries but their \
-              tags survive."))
+              tags survive.",
+            ),
+    )
 }
 
 fn check_orphan_sidecars(cat: &Catalog) -> Result<Finding> {
-    let n: i64 = cat.conn.query_row("SELECT COUNT(*) FROM orphan", [], |r| r.get(0))?;
+    let n: i64 = cat
+        .conn
+        .query_row("SELECT COUNT(*) FROM orphan", [], |r| r.get(0))?;
     if n == 0 {
         return Ok(Finding::fine("no orphan sidecars"));
     }
@@ -166,36 +195,49 @@ fn check_orphan_sidecars(cat: &Catalog) -> Result<Finding> {
         .query_map([], |r| r.get::<_, String>(0))?
         .filter_map(std::result::Result::ok)
         .collect();
-    Ok(Finding::warn(format!("{n} sidecar(s) with no image beside them"))
-        .with(sample)
-        .fix("The images they describe are gone. Safe to delete, but check \
-              first -- a sidecar is the only place tags live."))
+    Ok(
+        Finding::warn(format!("{n} sidecar(s) with no image beside them"))
+            .with(sample)
+            .fix(
+                "The images they describe are gone. Safe to delete, but check \
+              first -- a sidecar is the only place tags live.",
+            ),
+    )
 }
 
 fn check_pending(cat: &Catalog) -> Result<Finding> {
     let n: i64 = cat
         .conn
-        .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| r.get(0))?;
+        .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| {
+            r.get(0)
+        })?;
     if n == 0 {
         return Ok(Finding::fine("no unwritten edits"));
     }
-    Ok(Finding::warn(format!("{n} edit(s) not yet written to disk"))
-        .fix("Run `photo sync` with the drive attached. Until then they exist \
+    Ok(
+        Finding::warn(format!("{n} edit(s) not yet written to disk")).fix(
+            "Run `photo sync` with the drive attached. Until then they exist \
               only in the catalog, which is the one place this design does not \
-              want anything to exist only."))
+              want anything to exist only.",
+        ),
+    )
 }
 
 fn check_undated(cat: &Catalog) -> Result<Finding> {
-    let n: i64 = cat
-        .conn
-        .query_row("SELECT COUNT(*) FROM stack WHERE event_id IS NULL", [], |r| r.get(0))?;
+    let n: i64 = cat.conn.query_row(
+        "SELECT COUNT(*) FROM stack WHERE event_id IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
     if n == 0 {
         return Ok(Finding::fine("every stack belongs to an event"));
     }
-    Ok(Finding::note(format!("{n} stack(s) have no capture date")).fix(
-        "They are grouped under `undated`. Usually files whose EXIF was \
+    Ok(
+        Finding::note(format!("{n} stack(s) have no capture date")).fix(
+            "They are grouped under `undated`. Usually files whose EXIF was \
          stripped by an earlier edit.",
-    ))
+        ),
+    )
 }
 
 fn check_duplicates(cat: &Catalog) -> Result<Finding> {
@@ -208,9 +250,11 @@ fn check_duplicates(cat: &Catalog) -> Result<Finding> {
         .take(5)
         .map(|g| format!("{} ({} copies)", g.paths[0], g.paths.len()))
         .collect();
-    Ok(Finding::note(format!("{} duplicate group(s)", groups.len()))
-        .with(detail)
-        .fix("See `photo dupes` for the full list."))
+    Ok(
+        Finding::note(format!("{} duplicate group(s)", groups.len()))
+            .with(detail)
+            .fix("See `photo dupes` for the full list."),
+    )
 }
 
 fn check_actions() -> Finding {
@@ -245,7 +289,10 @@ fn check_cache(root: &Path) -> Result<Finding> {
             .fix("Built on demand, or all at once with `photo thumbs`."));
     }
     let (mut files, mut bytes) = (0u64, 0u64);
-    for e in walkdir::WalkDir::new(&dir).into_iter().filter_map(std::result::Result::ok) {
+    for e in walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         if e.file_type().is_file() {
             files += 1;
             bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -308,7 +355,10 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.severity != Severity::Warn),
             "clean library produced warnings: {:#?}",
-            findings.iter().filter(|f| f.severity == Severity::Warn).collect::<Vec<_>>()
+            findings
+                .iter()
+                .filter(|f| f.severity == Severity::Warn)
+                .collect::<Vec<_>>()
         );
     }
 

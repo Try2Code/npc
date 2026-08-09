@@ -85,6 +85,30 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Rotate. Writes orientation to the sidecar; no pixels are touched and
+    /// the original is not opened for writing.
+    Rotate {
+        /// `cw`, `ccw`, `180`, or `none` to clear
+        direction: String,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Run a configured action on the stacks a query selects.
+    Exec {
+        /// Action name or key, as listed by `photo exec --list`
+        #[arg(default_value = "")]
+        action: String,
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Show the available actions and exit
+        #[arg(long)]
+        list: bool,
+        /// Print the command instead of running it
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set a title or description.
     Set {
         /// `title` or `description`
@@ -140,6 +164,11 @@ enum Cmd {
         /// List the presets defined in config.toml and exit
         #[arg(long)]
         list_presets: bool,
+    },
+    /// Emit a shell completion script.
+    Completion {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
     },
     /// The browser.
     Tui {
@@ -377,7 +406,10 @@ fn main() -> Result<()> {
             println!("  unchanged   {}", stats.unchanged);
             println!("  orphans     {}", stats.orphans);
             if stats.vanished > 0 {
-                println!("  vanished    {} (marked absent, tags kept)", stats.vanished);
+                println!(
+                    "  vanished    {} (marked absent, tags kept)",
+                    stats.vanished
+                );
             }
             if !stats.errors.is_empty() {
                 println!("  errors      {}", stats.errors.len());
@@ -389,7 +421,10 @@ fn main() -> Result<()> {
                 }
             }
             let rate = stats.files_seen as f64 / elapsed.as_secs_f64().max(1e-9);
-            println!("  took        {:.2}s  ({rate:.0} files/s)", elapsed.as_secs_f64());
+            println!(
+                "  took        {:.2}s  ({rate:.0} files/s)",
+                elapsed.as_secs_f64()
+            );
         }
 
         Cmd::Find {
@@ -539,6 +574,100 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unknown field `{other}`; use title or description"),
             };
             edit_and_flush(&target, vec![change], &format!("set {field} on"))?;
+        }
+
+        Cmd::Rotate { direction, target } => {
+            // EXIF orientation values, as a quarter-turn each way. Composing
+            // with whatever is already set would need the current value per
+            // stack; setting absolutely is predictable and matches how every
+            // viewer treats the tag.
+            let value: u16 = match direction.as_str() {
+                "cw" | "right" => 6, // rotate 90 CW
+                "ccw" | "left" => 8, // rotate 270 CW
+                "180" | "flip" => 3,
+                "none" | "clear" | "0" => 1,
+                other => anyhow::bail!("unknown direction `{other}`; use cw, ccw, 180 or none"),
+            };
+            edit_and_flush(
+                &target,
+                vec![npc::edit::Change::SetOrientation(value)],
+                &format!("rotated {direction}"),
+            )?;
+            println!(
+                "  note      orientation is written to the sidecar only, so \n\
+                 \x20           viewers that ignore sidecars will still show the \n\
+                 \x20           original framing. See PLAN.md."
+            );
+        }
+
+        Cmd::Exec {
+            action,
+            query,
+            root,
+            list,
+            dry_run,
+        } => {
+            let actions = npc::action::load();
+            if list || action.is_empty() {
+                if actions.is_empty() {
+                    println!("no actions available (none of the configured programs are on PATH)");
+                } else {
+                    println!("{:<4} {:<14} {}", "key", "name", "command");
+                    for a in &actions {
+                        println!("{:<4} {:<14} {}", a.key, a.name, a.cmd.join(" "));
+                    }
+                }
+                return Ok(());
+            }
+
+            let chosen = actions
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&action) || a.key == action)
+                .ok_or_else(|| anyhow::anyhow!("no action `{action}`; try `photo exec --list`"))?;
+
+            let config = npc::config::Config::load()?;
+            let cat = open_for(&root)?;
+            let target = Target {
+                query: query.clone(),
+                paths: Vec::new(),
+                root: root.clone(),
+                dry_run,
+            };
+            let ids = resolve(&cat, &target)?;
+            if ids.is_empty() {
+                println!("nothing matched");
+                return Ok(());
+            }
+
+            // Same rule as the TUI: an external editor cannot be prevented
+            // from writing, so a protected root must not be handed to one.
+            for &sid in &ids {
+                let dir: String =
+                    cat.conn
+                        .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))?;
+                config.ensure_mutable(Path::new(&dir)).with_context(|| {
+                    "refusing to launch an external program against a protected root"
+                })?;
+            }
+
+            let sel =
+                npc::action::gather(&cat, &ids, ids.first().copied(), &query.unwrap_or_default())?;
+            let argv = npc::action::build_argv(chosen, &sel)?;
+
+            if dry_run {
+                println!("would run:");
+                for a in &argv {
+                    println!("  {a}");
+                }
+                return Ok(());
+            }
+            let outcome = npc::action::run(chosen, &sel)?;
+            println!("{}", outcome.description);
+            if let Some(text) = outcome.output {
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+            }
         }
 
         Cmd::Sync { root } => {
@@ -788,10 +917,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if !yes {
-                println!(
-                    "{} stack(s) would be permanently deleted:",
-                    entries.len()
-                );
+                println!("{} stack(s) would be permanently deleted:", entries.len());
                 for e in entries.iter().take(10) {
                     println!("    {}", e.base);
                 }
@@ -808,7 +934,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Thumbs { root, query, size, prune } => {
+        Cmd::Thumbs {
+            root,
+            query,
+            size,
+            prune,
+        } => {
             let size = match size.as_str() {
                 "grid" => npc::thumbs::Size::Grid,
                 "view" => npc::thumbs::Size::View,
@@ -821,8 +952,11 @@ fn main() -> Result<()> {
             let compiled = npc::query::compile(query.as_deref().unwrap_or(""))?;
             let stmt = compiled.select_stacks(None);
             let mut prepared = cat.conn.prepare(&stmt)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                compiled.params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = compiled
+                .params
+                .iter()
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
             let ids: Vec<i64> = prepared
                 .query_map(params.as_slice(), |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
@@ -845,15 +979,30 @@ fn main() -> Result<()> {
             }
             println!("  cache      {}", cache.dir().display());
             if made > 0 {
-                println!("  took       {secs:.1}s  ({:.0}/s)", made as f64 / secs.max(1e-9));
+                println!(
+                    "  took       {secs:.1}s  ({:.0}/s)",
+                    made as f64 / secs.max(1e-9)
+                );
             }
         }
 
         Cmd::Term => {
-            println!("TERM              {}", std::env::var("TERM").unwrap_or_default());
-            println!("TERM_PROGRAM      {}", std::env::var("TERM_PROGRAM").unwrap_or_default());
-            println!("KITTY_WINDOW_ID   {}", std::env::var("KITTY_WINDOW_ID").unwrap_or_default());
-            println!("WEZTERM_PANE      {}", std::env::var("WEZTERM_PANE").unwrap_or_default());
+            println!(
+                "TERM              {}",
+                std::env::var("TERM").unwrap_or_default()
+            );
+            println!(
+                "TERM_PROGRAM      {}",
+                std::env::var("TERM_PROGRAM").unwrap_or_default()
+            );
+            println!(
+                "KITTY_WINDOW_ID   {}",
+                std::env::var("KITTY_WINDOW_ID").unwrap_or_default()
+            );
+            println!(
+                "WEZTERM_PANE      {}",
+                std::env::var("WEZTERM_PANE").unwrap_or_default()
+            );
             println!();
 
             match ratatui_image::picker::Picker::from_query_stdio() {
@@ -862,12 +1011,17 @@ fn main() -> Result<()> {
                     println!("graphics protocol {:?}", picker.protocol_type());
                     println!("cell size         {cw}x{ch} px");
                     if let Ok((cols, rows)) = crossterm::terminal::size() {
-                        println!("terminal          {cols}x{rows} cells = {}x{} px",
-                                 cols as u32 * cw as u32, rows as u32 * ch as u32);
+                        println!(
+                            "terminal          {cols}x{rows} cells = {}x{} px",
+                            cols as u32 * cw as u32,
+                            rows as u32 * ch as u32
+                        );
                         println!();
-                        println!("a 5-across grid gives tiles of about {}x{} px",
-                                 (cols as u32 / 5) * cw as u32,
-                                 ((rows as u32).saturating_sub(3) / 3) * ch as u32);
+                        println!(
+                            "a 5-across grid gives tiles of about {}x{} px",
+                            (cols as u32 / 5) * cw as u32,
+                            ((rows as u32).saturating_sub(3) / 3) * ch as u32
+                        );
                     }
                     match picker.protocol_type() {
                         ratatui_image::picker::ProtocolType::Halfblocks => {
@@ -901,8 +1055,11 @@ fn main() -> Result<()> {
         } => {
             let available = npc::export::presets();
             if list_presets {
-                println!("built-in: {}px long edge, quality {}, from the largest",
-                         npc::export::DEFAULT_LONG_EDGE, npc::export::DEFAULT_QUALITY);
+                println!(
+                    "built-in: {}px long edge, quality {}, from the largest",
+                    npc::export::DEFAULT_LONG_EDGE,
+                    npc::export::DEFAULT_QUALITY
+                );
                 println!("          embedded preview (full sensor resolution on a D750)");
                 if available.is_empty() {
                     println!("\nno presets in {}", npc::config::Config::path().display());
@@ -920,14 +1077,11 @@ fn main() -> Result<()> {
             }
 
             let chosen = match &preset {
-                Some(want) => Some(
-                    available
-                        .iter()
-                        .find(|p| &p.name == want)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no export preset named `{want}`; try --list-presets"
-                        ))?,
-                ),
+                Some(want) => {
+                    Some(available.iter().find(|p| &p.name == want).ok_or_else(|| {
+                        anyhow::anyhow!("no export preset named `{want}`; try --list-presets")
+                    })?)
+                }
                 None => None,
             };
 
@@ -976,6 +1130,13 @@ fn main() -> Result<()> {
             if !dry_run && stats.written > 0 {
                 println!("  took      {secs:.1}s");
             }
+        }
+
+        Cmd::Completion { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
         Cmd::Tui { root } => npc::tui::run(root)?,

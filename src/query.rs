@@ -368,7 +368,9 @@ impl Parser {
             "rejected" => "s.reject = 1".into(),
             "rated" => "s.rating IS NOT NULL AND s.rating > 0".into(),
             "unrated" => "(s.rating IS NULL OR s.rating = 0)".into(),
-            "offline" => "NOT EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.present = 1)".into(),
+            "offline" => {
+                "NOT EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.present = 1)".into()
+            }
             _ => self.tag_match(w),
         })
     }
@@ -389,7 +391,9 @@ impl Parser {
             "tag" => Ok(self.tag_match(value)),
 
             "rating" => {
-                let n: i64 = value.parse().map_err(|_| anyhow!("rating must be a number, got `{value}`"))?;
+                let n: i64 = value
+                    .parse()
+                    .map_err(|_| anyhow!("rating must be a number, got `{value}`"))?;
                 let p = self.bind(Value::Integer(n));
                 Ok(format!("COALESCE(s.rating, 0) {} {p}", op.sql()))
             }
@@ -440,7 +444,11 @@ impl Parser {
             "role" => Ok(self.file_text("role", op, value)),
 
             "iso" | "shutter" | "width" | "height" => {
-                let column = if key == "shutter" { "shutter_count" } else { key };
+                let column = if key == "shutter" {
+                    "shutter_count"
+                } else {
+                    key
+                };
                 let n: i64 = value
                     .parse()
                     .map_err(|_| anyhow!("{key} must be a number, got `{value}`"))?;
@@ -524,7 +532,11 @@ fn day_bounds(s: &str) -> Result<(i64, i64)> {
     let end = match parts.len() {
         1 => days_from_civil(year + 1, 1, 1) * 86_400 - 1,
         2 => {
-            let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+            let (ny, nm) = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
             days_from_civil(ny, nm, 1) * 86_400 - 1
         }
         _ => start + 86_399,
@@ -533,7 +545,9 @@ fn day_bounds(s: &str) -> Result<(i64, i64)> {
 }
 
 /// Public wrapper so `import` can assert its inverse round-trips.
-pub fn days_from_civil_pub(y: i64, m: i64, d: i64) -> i64 { days_from_civil(y, m, d) }
+pub fn days_from_civil_pub(y: i64, m: i64, d: i64) -> i64 {
+    days_from_civil(y, m, d)
+}
 
 /// Howard Hinnant's civil-to-days algorithm; avoids a chrono dependency.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -601,7 +615,9 @@ mod tests {
 
     #[test]
     fn flags_compile_without_parameters() {
-        for flag in ["untagged", "tagged", "flagged", "rejected", "rated", "unrated"] {
+        for flag in [
+            "untagged", "tagged", "flagged", "rejected", "rated", "unrated",
+        ] {
             assert!(params(flag).is_empty(), "{flag} should bind nothing");
             assert!(!sql(flag).is_empty());
         }
@@ -744,7 +760,8 @@ mod tests {
             );
         }
         for flag in FLAGS {
-            compile(flag).unwrap_or_else(|e| panic!("documented flag `{flag}` does not parse: {e}"));
+            compile(flag)
+                .unwrap_or_else(|e| panic!("documented flag `{flag}` does not parse: {e}"));
             assert!(
                 SYNTAX.contains(flag),
                 "`{flag}` is accepted but missing from the reference"

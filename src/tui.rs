@@ -179,10 +179,7 @@ impl App {
         let compiled = query::compile(&self.query)?;
 
         self.total = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM stack s WHERE {}",
-                compiled.where_sql
-            );
+            let sql = format!("SELECT COUNT(*) FROM stack s WHERE {}", compiled.where_sql);
             let params: Vec<&dyn rusqlite::ToSql> = compiled
                 .params
                 .iter()
@@ -439,7 +436,11 @@ impl App {
         if !self.selected.is_empty() {
             return self.selected.iter().copied().collect();
         }
-        self.rows.get(self.cursor).map(|r| r.id).into_iter().collect()
+        self.rows
+            .get(self.cursor)
+            .map(|r| r.id)
+            .into_iter()
+            .collect()
     }
 
     fn snapshot(&self, ids: &[i64]) -> Result<Vec<(i64, Vec<String>, Option<i64>, bool, bool)>> {
@@ -560,9 +561,7 @@ impl App {
                 self.move_cursor(-((self.page_size / 2).max(1) as isize))
             }
             KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                self.cursor = self.rows.len().saturating_sub(1)
-            }
+            KeyCode::Char('G') | KeyCode::End => self.cursor = self.rows.len().saturating_sub(1),
 
             KeyCode::Char(' ') => {
                 if let Some(r) = self.rows.get(self.cursor) {
@@ -572,25 +571,23 @@ impl App {
                     self.move_cursor(1);
                 }
             }
-            KeyCode::Char('v') => {
-                match self.anchor.take() {
-                    Some(start) => {
-                        let (a, b) = if start <= self.cursor {
-                            (start, self.cursor)
-                        } else {
-                            (self.cursor, start)
-                        };
-                        for r in &self.rows[a..=b] {
-                            self.selected.insert(r.id);
-                        }
-                        self.status = format!("{} selected", self.selected.len());
+            KeyCode::Char('v') => match self.anchor.take() {
+                Some(start) => {
+                    let (a, b) = if start <= self.cursor {
+                        (start, self.cursor)
+                    } else {
+                        (self.cursor, start)
+                    };
+                    for r in &self.rows[a..=b] {
+                        self.selected.insert(r.id);
                     }
-                    None => {
-                        self.anchor = Some(self.cursor);
-                        self.status = "range start; press v again to close".into();
-                    }
+                    self.status = format!("{} selected", self.selected.len());
                 }
-            }
+                None => {
+                    self.anchor = Some(self.cursor);
+                    self.status = "range start; press v again to close".into();
+                }
+            },
             // Esc zooms out of the single view, pairing with Enter zooming in.
             // Elsewhere it clears the selection, which is what it is for when
             // there is nothing to back out of.
@@ -806,7 +803,12 @@ impl App {
     }
 
     fn run_action(&mut self, key: char) -> Result<()> {
-        let Some(a) = self.actions.iter().find(|a| a.key == key.to_string()).cloned() else {
+        let Some(a) = self
+            .actions
+            .iter()
+            .find(|a| a.key == key.to_string())
+            .cloned()
+        else {
             self.status = format!("no action bound to `{key}`");
             return Ok(());
         };
@@ -818,15 +820,20 @@ impl App {
         // guard never sees it. Refuse rather than hand a protected file to
         // something that can modify it.
         for &sid in &ids {
-            let dir: String = match self.cat.conn.query_row(
-                "SELECT dir FROM stack WHERE id = ?1",
-                [sid],
-                |r| r.get(0),
-            ) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if self.config.ensure_mutable(std::path::Path::new(&dir)).is_err() {
+            let dir: String =
+                match self
+                    .cat
+                    .conn
+                    .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))
+                {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+            if self
+                .config
+                .ensure_mutable(std::path::Path::new(&dir))
+                .is_err()
+            {
                 self.status = format!(
                     "{} not launched: {} is protected, and an external editor \
                      cannot be stopped from writing there",
@@ -985,7 +992,9 @@ impl App {
         if self.show_actions {
             let mut text = String::from("Press a key to run:\n\n");
             if self.actions.is_empty() {
-                text.push_str("  no actions available\n  (none of the configured programs are on PATH)");
+                text.push_str(
+                    "  no actions available\n  (none of the configured programs are on PATH)",
+                );
             }
             for a in &self.actions {
                 text.push_str(&format!("  {}   {}\n", a.key, a.name));
@@ -1024,14 +1033,30 @@ impl App {
             .rows
             .iter()
             .map(|r| {
-                let sel = if self.selected.contains(&r.id) { "*" } else { " " };
+                let sel = if self.selected.contains(&r.id) {
+                    "*"
+                } else {
+                    " "
+                };
                 let stars = "*".repeat(r.rating.unwrap_or(0).clamp(0, 5) as usize);
-                let mark = if r.flag { "F" } else if r.reject { "X" } else { " " };
-                let date = r.captured.map(format_date).unwrap_or_else(|| "----------".into());
+                let mark = if r.flag {
+                    "F"
+                } else if r.reject {
+                    "X"
+                } else {
+                    " "
+                };
+                let date = r
+                    .captured
+                    .map(format_date)
+                    .unwrap_or_else(|| "----------".into());
                 ListItem::new(Line::from(vec![
                     Span::styled(sel.to_string(), Style::default().fg(Color::Yellow)),
                     Span::raw(format!(" {:<20}", r.base)),
-                    Span::styled(format!("{:<9}", r.roles), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<9}", r.roles),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::raw(format!("{date}  ")),
                     Span::styled(format!("{stars:<5}"), Style::default().fg(Color::Yellow)),
                     Span::styled(
@@ -1103,13 +1128,23 @@ impl App {
                 Style::default().fg(Color::DarkGray)
             };
             let stars = "*".repeat(row.rating.unwrap_or(0).clamp(0, 5) as usize);
-            let mark = if row.flag { " F" } else if row.reject { " X" } else { "" };
+            let mark = if row.flag {
+                " F"
+            } else if row.reject {
+                " X"
+            } else {
+                ""
+            };
             let tile = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border)
                 .title(Line::from(vec![Span::styled(
                     format!(" {}{} ", stars, mark),
-                    Style::default().fg(if row.reject { Color::Red } else { Color::Yellow }),
+                    Style::default().fg(if row.reject {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    }),
                 )]));
             let picture = tile.inner(cell);
             f.render_widget(tile, cell);
@@ -1270,14 +1305,12 @@ impl App {
         let area = centered(68, 92, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
-            Paragraph::new(body)
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .title(title),
-                ),
+            Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            ),
             area,
         );
     }
@@ -1710,7 +1743,9 @@ mod tests {
         crate::scan::derive_events(&mut app.cat).unwrap();
         press(&mut app, 's');
         assert!(
-            app.sidebar_items.iter().any(|(d, n)| d == "undated" && *n == 3),
+            app.sidebar_items
+                .iter()
+                .any(|(d, n)| d == "undated" && *n == 3),
             "undated bucket missing: {:?}",
             app.sidebar_items
         );
@@ -2001,14 +2036,30 @@ mod tests {
     /// orientation 8 for a portrait shot.
     #[test]
     fn portrait_is_decided_after_rotation() {
-        let landscape = Exif { width: 6016, height: 4016, orientation: 1, ..Default::default() };
+        let landscape = Exif {
+            width: 6016,
+            height: 4016,
+            orientation: 1,
+            ..Default::default()
+        };
         assert!(!landscape.is_portrait());
 
-        let rotated = Exif { width: 6016, height: 4016, orientation: 8, ..Default::default() };
-        assert!(rotated.is_portrait(), "orientation 8 must display as portrait");
+        let rotated = Exif {
+            width: 6016,
+            height: 4016,
+            orientation: 8,
+            ..Default::default()
+        };
+        assert!(
+            rotated.is_portrait(),
+            "orientation 8 must display as portrait"
+        );
 
         let unknown = Exif::default();
-        assert!(!unknown.is_portrait(), "no dimensions must not claim portrait");
+        assert!(
+            !unknown.is_portrait(),
+            "no dimensions must not claim portrait"
+        );
     }
 
     #[test]

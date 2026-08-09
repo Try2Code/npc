@@ -1,0 +1,31 @@
+[package]
+name = "npc-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+npc = { path = ".." }
+tempfile = "3"
+
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sidecar"
+path = "fuzz_targets/sidecar.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false

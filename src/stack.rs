@@ -154,7 +154,10 @@ mod tests {
     #[test]
     fn only_configured_suffixes_strip() {
         assert_eq!(c("750_5744_1.NEF"), ("750_5744_1".into(), Role::Raw));
-        assert_eq!(c("750_6262_modified.JPG"), ("750_6262_modified".into(), Role::OocJpg));
+        assert_eq!(
+            c("750_6262_modified.JPG"),
+            ("750_6262_modified".into(), Role::OocJpg)
+        );
     }
 
     /// RawTherapee profiles are not ours. Ignoring them outright is simpler
@@ -178,8 +181,17 @@ mod tests {
             assert!(classify(name).is_some(), "{name} should be catalogued");
         }
         for name in [
-            "a.pp3", "a.CR2", "a.ARW", "a.dng", "a.tif", "a.png", "a.mov",
-            "a.txt", "a.xml", "a.json", "Thumbs.db",
+            "a.pp3",
+            "a.CR2",
+            "a.ARW",
+            "a.dng",
+            "a.tif",
+            "a.png",
+            "a.mov",
+            "a.txt",
+            "a.xml",
+            "a.json",
+            "Thumbs.db",
         ] {
             assert!(classify(name).is_none(), "{name} should be ignored");
         }

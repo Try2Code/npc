@@ -156,10 +156,7 @@ pub fn restore(cat: &mut Catalog, stack_id: i64, config: &Config) -> Result<usiz
             for (orig, now) in moved.iter().rev() {
                 let _: std::io::Result<()> = std::fs::rename(now, orig);
             }
-            bail!(
-                "{} already exists; not overwriting it",
-                dst.display()
-            );
+            bail!("{} already exists; not overwriting it", dst.display());
         }
         std::fs::rename(src, &dst)?;
         moved.push((src.clone(), dst));

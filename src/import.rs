@@ -131,7 +131,10 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
             .iter()
             .map(|(src, role, size)| {
                 let name = src.file_name().unwrap_or_default().to_string_lossy();
-                let suffix = name.strip_prefix(base.as_str()).unwrap_or(&name).to_string();
+                let suffix = name
+                    .strip_prefix(base.as_str())
+                    .unwrap_or(&name)
+                    .to_string();
                 let dest = dest_dir.join(format!("{dest_base}{suffix}"));
                 PlannedFile {
                     src: src.clone(),
@@ -231,7 +234,8 @@ fn copy_verified(src: &Path, dest: &Path) -> Result<u64> {
         let mut f = File::open(src).with_context(|| format!("opening {}", src.display()))?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
-        let mut out = File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+        let mut out =
+            File::create(&part).with_context(|| format!("creating {}", part.display()))?;
         loop {
             let n = f.read(&mut buf)?;
             if n == 0 {
@@ -254,8 +258,7 @@ fn copy_verified(src: &Path, dest: &Path) -> Result<u64> {
     }
 
     let size = std::fs::metadata(&part)?.len();
-    std::fs::rename(&part, dest)
-        .with_context(|| format!("renaming into {}", dest.display()))?;
+    std::fs::rename(&part, dest).with_context(|| format!("renaming into {}", dest.display()))?;
     Ok(size)
 }
 
@@ -302,7 +305,9 @@ fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), String>> {
 /// EXIF reader uses, so a shot's folder always matches its recorded date.
 pub fn date_path(unix: i64) -> PathBuf {
     let (y, m, d) = civil_from_days(unix.div_euclid(86_400));
-    PathBuf::from(format!("{y:04}")).join(format!("{m:02}")).join(format!("{d:02}"))
+    PathBuf::from(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -461,11 +466,7 @@ mod safety_tests {
         let plans = plan(&cat, card.path(), lib.path()).unwrap();
         execute(&plans, &Config::default(), false).unwrap();
 
-        assert_eq!(
-            before,
-            fingerprint(card.path()),
-            "import modified the card"
-        );
+        assert_eq!(before, fingerprint(card.path()), "import modified the card");
     }
 
     #[test]
@@ -513,7 +514,9 @@ mod safety_tests {
         assert!(
             left.is_empty(),
             "a partial stack was left behind: {:?}",
-            left.iter().map(|e| e.path().display().to_string()).collect::<Vec<_>>()
+            left.iter()
+                .map(|e| e.path().display().to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -555,7 +558,11 @@ mod safety_tests {
         // And the hash check itself: a source that changes under us.
         let hash_a = hash_file(&src).unwrap();
         std::fs::write(&src, vec![2u8; 100_000]).unwrap();
-        assert_ne!(hash_a, hash_file(&src).unwrap(), "hashing is not detecting change");
+        assert_ne!(
+            hash_a,
+            hash_file(&src).unwrap(),
+            "hashing is not detecting change"
+        );
     }
 
     #[test]
@@ -603,6 +610,10 @@ mod safety_tests {
         let plans = plan(&cat, card.path(), lib.path()).unwrap();
         assert_eq!(plans.len(), 1);
         assert!(plans[0].capture_time.is_none());
-        assert!(plans[0].dest_dir.ends_with("undated"), "{:?}", plans[0].dest_dir);
+        assert!(
+            plans[0].dest_dir.ends_with("undated"),
+            "{:?}",
+            plans[0].dest_dir
+        );
     }
 }

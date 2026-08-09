@@ -81,9 +81,12 @@ fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<(PathBuf, bool, u16
         },
     );
     match row {
-        Ok((path, role, base, orient)) => {
-            Ok(Some((PathBuf::from(path), role == "raw", orient as u16, base)))
-        }
+        Ok((path, role, base, orient)) => Ok(Some((
+            PathBuf::from(path),
+            role == "raw",
+            orient as u16,
+            base,
+        ))),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -95,8 +98,12 @@ fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<(PathBuf, bool, u16
 pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()> {
     config.ensure_mutable(target)?;
 
-    let t = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
-    let l = library.canonicalize().unwrap_or_else(|_| library.to_path_buf());
+    let t = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let l = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
     if t.starts_with(&l) {
         bail!(
             "refusing to export into {} -- it is inside the library at {}.\n\
@@ -136,9 +143,9 @@ pub fn export(
 
         let ext = opts.preset.map(|p| p.ext.as_str()).unwrap_or("jpg");
         let dir = if opts.keep_structure {
-            let stack_dir: String = cat
-                .conn
-                .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))?;
+            let stack_dir: String =
+                cat.conn
+                    .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))?;
             let rel = Path::new(&stack_dir)
                 .strip_prefix(library)
                 .unwrap_or(Path::new(""));
@@ -179,13 +186,7 @@ pub fn export(
 }
 
 /// The built-in path: decode, downscale, re-encode.
-fn render(
-    src: &Path,
-    embedded: bool,
-    orientation: u16,
-    dst: &Path,
-    opts: &Options,
-) -> Result<()> {
+fn render(src: &Path, embedded: bool, orientation: u16, dst: &Path, opts: &Options) -> Result<()> {
     let bytes = if embedded {
         // Ask for more than any tier holds, so Exiv2 yields its largest --
         // full sensor resolution on a D750.
@@ -198,8 +199,8 @@ fn render(
         std::fs::read(src)?
     };
 
-    let img = image::load_from_memory(&bytes)
-        .with_context(|| format!("decoding {}", src.display()))?;
+    let img =
+        image::load_from_memory(&bytes).with_context(|| format!("decoding {}", src.display()))?;
 
     let long = img.width().max(img.height());
     let img = if long > opts.long_edge {
@@ -365,7 +366,10 @@ mod tests {
 
         let mut cat = Catalog::open_memory().unwrap();
         crate::scan::scan(&mut cat, dir.path(), true).unwrap();
-        let sid = cat.stack_id(day.to_str().unwrap(), "750_0001").unwrap().unwrap();
+        let sid = cat
+            .stack_id(day.to_str().unwrap(), "750_0001")
+            .unwrap()
+            .unwrap();
         crate::edit::apply(
             &mut cat,
             &[sid],
@@ -395,7 +399,15 @@ mod tests {
         let (lib, cat, sid) = library();
         let out = tempfile::tempdir().unwrap();
 
-        let stats = export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &opts()).unwrap();
+        let stats = export(
+            &cat,
+            &[sid],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &opts(),
+        )
+        .unwrap();
         assert_eq!(stats.written, 1, "errors: {:?}", stats.errors);
 
         let made = image::open(out.path().join("750_0001.jpg")).unwrap();
@@ -407,10 +419,18 @@ mod tests {
     fn tags_and_rating_travel_with_the_copy() {
         let (lib, cat, sid) = library();
         let out = tempfile::tempdir().unwrap();
-        export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &opts()).unwrap();
+        export(
+            &cat,
+            &[sid],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &opts(),
+        )
+        .unwrap();
 
-        let doc = crate::meta::read_sidecar(out.path().join("750_0001.jpg").to_str().unwrap())
-            .unwrap();
+        let doc =
+            crate::meta::read_sidecar(out.path().join("750_0001.jpg").to_str().unwrap()).unwrap();
         assert_eq!(doc.tags, vec!["beach".to_string()]);
         assert_eq!(doc.rating, 4);
     }
@@ -423,8 +443,8 @@ mod tests {
         o.strip = true;
         export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &o).unwrap();
 
-        let doc = crate::meta::read_sidecar(out.path().join("750_0001.jpg").to_str().unwrap())
-            .unwrap();
+        let doc =
+            crate::meta::read_sidecar(out.path().join("750_0001.jpg").to_str().unwrap()).unwrap();
         assert!(doc.tags.is_empty(), "--strip left tags on the copy");
     }
 
@@ -437,7 +457,15 @@ mod tests {
         let original = lib.path().join("2026/08/09/750_0001.JPG");
         let before = std::fs::read(&original).unwrap();
 
-        export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &opts()).unwrap();
+        export(
+            &cat,
+            &[sid],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &opts(),
+        )
+        .unwrap();
 
         assert_eq!(std::fs::read(&original).unwrap(), before);
     }
@@ -490,7 +518,15 @@ mod tests {
         };
         let mut o2 = opts();
         o2.preset = Some(&broken);
-        let stats = export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &o2).unwrap();
+        let stats = export(
+            &cat,
+            &[sid],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &o2,
+        )
+        .unwrap();
         assert_eq!(stats.written, 0);
         assert_eq!(stats.errors.len(), 1);
     }
@@ -500,13 +536,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES (?1, 'empty')",
-                     [dir.path().to_str().unwrap()])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES (?1, 'empty')",
+                [dir.path().to_str().unwrap()],
+            )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
         let out = tempfile::tempdir().unwrap();
 
-        let stats = export(&cat, &[sid], out.path(), dir.path(), &Config::default(), &opts());
+        let stats = export(
+            &cat,
+            &[sid],
+            out.path(),
+            dir.path(),
+            &Config::default(),
+            &opts(),
+        );
         // The target is inside the "library" here, so this is refused first --
         // use a separate library root to exercise the skip.
         assert!(stats.is_err() || stats.unwrap().skipped == 1);

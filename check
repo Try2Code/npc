@@ -7,6 +7,7 @@
 #
 #   ./check            fmt, clippy, tests, tripwire
 #   ./check coverage   the above plus an HTML coverage report
+#   ./check fuzz       the above plus 30s on each fuzz target
 #   ./check quick      skip the slow real-library tests
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -63,6 +64,21 @@ if [ -d "$LIBRARY" ]; then
   rm -f "$CURRENT"
 else
   printf '   skip  %s not present\n' "$LIBRARY"
+fi
+
+if [ "$MODE" = fuzz ]; then
+  step "fuzzing"
+  if command -v cargo-fuzz >/dev/null; then
+    for t in query classify sidecar; do
+      if cargo +nightly fuzz run "$t" -- -max_total_time=30 >/tmp/fuzz-$t.log 2>&1; then
+        ok "$t (30s, no crashes)"
+      else
+        bad "$t"; tail -20 /tmp/fuzz-$t.log | sed 's/^/      /'
+      fi
+    done
+  else
+    bad "cargo-fuzz not installed (cargo install cargo-fuzz)"
+  fi
 fi
 
 if [ "$MODE" = coverage ]; then

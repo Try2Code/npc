@@ -106,18 +106,15 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        groups
-            .entry((dir, c.base))
-            .or_default()
-            .push(Member {
-                name,
-                ext,
-                role: c.role,
-                size,
-                mtime_ns,
-                // Only image members carry EXIF worth parsing.
-                needs_parse: !unchanged && c.role.is_image(),
-            });
+        groups.entry((dir, c.base)).or_default().push(Member {
+            name,
+            ext,
+            role: c.role,
+            size,
+            mtime_ns,
+            // Only image members carry EXIF worth parsing.
+            needs_parse: !unchanged && c.role.is_image(),
+        });
     }
 
     // --- split real stacks from orphans -------------------------------------
@@ -270,7 +267,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         )?;
         let json = serde_json_array(&seen_paths);
         let prefix = format!("{}%", root.to_string_lossy());
-        stats.vanished = mark.execute(rusqlite::params![prefix, json])? ;
+        stats.vanished = mark.execute(rusqlite::params![prefix, json])?;
     }
 
     tx.commit()?;

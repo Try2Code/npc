@@ -289,7 +289,11 @@ pub fn ingest_sidecar(cat: &mut Catalog, stack_id: i64, sidecar: &Path) -> Resul
          WHERE id = ?1",
         params![
             stack_id,
-            if doc.rating >= 0 { Some(doc.rating as i64) } else { None },
+            if doc.rating >= 0 {
+                Some(doc.rating as i64)
+            } else {
+                None
+            },
             flag,
             reject,
             (!doc.title.is_empty()).then_some(doc.title.clone()),
@@ -297,7 +301,10 @@ pub fn ingest_sidecar(cat: &mut Catalog, stack_id: i64, sidecar: &Path) -> Resul
             (doc.orientation > 0).then_some(doc.orientation as i64),
         ],
     )?;
-    tx.execute("DELETE FROM stack_tag WHERE stack_id = ?1", params![stack_id])?;
+    tx.execute(
+        "DELETE FROM stack_tag WHERE stack_id = ?1",
+        params![stack_id],
+    )?;
     for t in &doc.tags {
         let t = normalise_tag(t);
         if t.is_empty() {
@@ -333,7 +340,10 @@ mod tests {
     fn seeded() -> (Catalog, i64) {
         let cat = Catalog::open_memory().unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES ('/d', '750_0001')", [])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES ('/d', '750_0001')",
+                [],
+            )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
         (cat, sid)
@@ -350,18 +360,42 @@ mod tests {
     #[test]
     fn adding_and_removing_tags() {
         let (mut cat, sid) = seeded();
-        apply(&mut cat, &[sid], &[Change::AddTags(vec!["beach".into(), "anna".into()])], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::AddTags(vec!["beach".into(), "anna".into()])],
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(build_doc(&cat, sid).unwrap().tags, vec!["anna", "beach"]);
 
-        apply(&mut cat, &[sid], &[Change::RemoveTags(vec!["anna".into()])], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::RemoveTags(vec!["anna".into()])],
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(build_doc(&cat, sid).unwrap().tags, vec!["beach"]);
     }
 
     #[test]
     fn adding_the_same_tag_twice_is_idempotent() {
         let (mut cat, sid) = seeded();
-        apply(&mut cat, &[sid], &[Change::AddTags(vec!["beach".into()])], &Config::default()).unwrap();
-        apply(&mut cat, &[sid], &[Change::AddTags(vec!["BEACH".into()])], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::AddTags(vec!["beach".into()])],
+            &Config::default(),
+        )
+        .unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::AddTags(vec!["BEACH".into()])],
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(build_doc(&cat, sid).unwrap().tags.len(), 1);
     }
 
@@ -369,10 +403,22 @@ mod tests {
     #[test]
     fn flag_and_reject_exclude_each_other() {
         let (mut cat, sid) = seeded();
-        apply(&mut cat, &[sid], &[Change::SetFlag(true)], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::SetFlag(true)],
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(build_doc(&cat, sid).unwrap().label, "Flagged");
 
-        apply(&mut cat, &[sid], &[Change::SetReject(true)], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::SetReject(true)],
+            &Config::default(),
+        )
+        .unwrap();
         let doc = build_doc(&cat, sid).unwrap();
         assert_eq!(doc.label, "Rejected");
 
@@ -386,7 +432,13 @@ mod tests {
     #[test]
     fn editing_marks_the_stack_dirty_and_queues_it() {
         let (mut cat, sid) = seeded();
-        apply(&mut cat, &[sid], &[Change::SetRating(Some(4))], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::SetRating(Some(4))],
+            &Config::default(),
+        )
+        .unwrap();
 
         let dirty: i64 = cat
             .conn
@@ -394,7 +446,11 @@ mod tests {
             .unwrap();
         let queued: i64 = cat
             .conn
-            .query_row("SELECT COUNT(*) FROM pending WHERE stack_id = ?1", [sid], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM pending WHERE stack_id = ?1",
+                [sid],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!((dirty, queued), (1, 1));
     }
@@ -404,7 +460,13 @@ mod tests {
     #[test]
     fn edits_to_a_missing_directory_stay_queued() {
         let (mut cat, sid) = seeded(); // dir '/d' does not exist
-        apply(&mut cat, &[sid], &[Change::SetRating(Some(5))], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::SetRating(Some(5))],
+            &Config::default(),
+        )
+        .unwrap();
 
         let stats = flush(&mut cat, &Config::default()).unwrap();
         assert_eq!(stats.sidecars_written, 0);
@@ -430,10 +492,16 @@ mod tests {
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
 
-        apply(&mut cat, &[sid], &[
+        apply(
+            &mut cat,
+            &[sid],
+            &[
                 Change::AddTags(vec!["beach".into()]),
                 Change::SetRating(Some(4)),
-            ], &Config::default()).unwrap();
+            ],
+            &Config::default(),
+        )
+        .unwrap();
 
         let stats = flush(&mut cat, &Config::default()).unwrap();
         assert_eq!(stats.sidecars_written, 1, "errors: {:?}", stats.errors);
@@ -506,7 +574,13 @@ mod tests {
             )
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
-        apply(&mut cat, &[sid], &[Change::SetRating(Some(4))], &Config::default()).unwrap();
+        apply(
+            &mut cat,
+            &[sid],
+            &[Change::SetRating(Some(4))],
+            &Config::default(),
+        )
+        .unwrap();
 
         let config = Config {
             protected_roots: vec![dir.path().to_path_buf()],
@@ -533,18 +607,27 @@ mod tests {
             .unwrap();
         let sid = cat.conn.last_insert_rowid();
 
-        apply(&mut cat, &[sid], &[
+        apply(
+            &mut cat,
+            &[sid],
+            &[
                 Change::AddTags(vec!["beach".into(), "anna".into()]),
                 Change::SetRating(Some(4)),
                 Change::SetFlag(true),
                 Change::SetTitle("Ostsee".into()),
                 Change::SetDescription("low tide".into()),
-            ], &Config::default()).unwrap();
+            ],
+            &Config::default(),
+        )
+        .unwrap();
         flush(&mut cat, &Config::default()).unwrap();
 
         // Wipe the catalog's view, then read it back off disk.
         cat.conn
-            .execute("UPDATE stack SET rating=NULL, flag=0, title=NULL, description=NULL", [])
+            .execute(
+                "UPDATE stack SET rating=NULL, flag=0, title=NULL, description=NULL",
+                [],
+            )
             .unwrap();
         cat.conn.execute("DELETE FROM stack_tag", []).unwrap();
 

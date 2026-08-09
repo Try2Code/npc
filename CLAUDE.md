@@ -104,8 +104,13 @@ has caused a bug here.
   The exact-count tests skip themselves there, because those numbers are
   ground truth for one directory and mean nothing anywhere else.
 - The data is **not in the repository**, being 98 MB of RAW. A fresh clone has
-  none, and the real-data tests skip with a message telling you how to get
-  them rather than failing.
+  none.
+- **A sentinel test fails when the photographs are absent.** Rust has no
+  skipped state, so twelve guarded tests returning early would report as
+  twelve passes — a green suite that verified nothing, which is the exact
+  failure this project keeps designing against. `NPC_ALLOW_MISSING_TEST_DATA=1`
+  acknowledges it deliberately. Do not reach for that to make a red suite go
+  away.
 
 ## Working practice
 

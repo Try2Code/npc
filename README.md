@@ -317,8 +317,12 @@ sidecars, then destroys metadata in the field.
 The suite runs against real camera files rather than fixtures: maker notes,
 preview pyramids and orientation tags are exactly what fixtures lack, and each
 has caused a bug here. They are too large for git, so they are fetched once and
-verified by checksum. Without them the 165 other tests still run and the
-real-data ones skip.
+verified by checksum before extraction.
+
+Without them, a sentinel test **fails** rather than letting the twelve
+real-data tests report as passing while verifying nothing. Rust has no skipped
+state, and a green suite that tested nothing is worse than a red one that says
+so. `NPC_ALLOW_MISSING_TEST_DATA=1` acknowledges it if you only want to build.
 
 See `CLAUDE.md` for design decisions worth not re-deriving, and `PLAN.md` for
 the original design plus a record of where it turned out to be wrong.

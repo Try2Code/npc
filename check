@@ -33,6 +33,16 @@ else
   bad "clippy"; grep -E '^(error|warning)' /tmp/clippy.log | head -15
 fi
 
+# Without the photographs the real-data tests are inert, and a sentinel test
+# fails to say so. Report it here first, so the cause is obvious before the
+# test output scrolls past.
+if [ ! -d "$LIBRARY" ]; then
+  printf '\n\033[1m== test photographs\033[0m\n'
+  bad "not present at $LIBRARY"
+  printf '         ./fetch-test-data          download them (98 MB, once)\n'
+  printf '         NPC_TEST_LIBRARY=<path>    use a library you already have\n'
+fi
+
 step "tests"
 if [ "$MODE" = quick ]; then
   cargo test --release --lib --test invariant && ok "unit + invariant" || bad "tests"

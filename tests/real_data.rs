@@ -64,6 +64,40 @@ fn counts_apply() -> bool {
     std::env::var_os("NPC_TEST_LIBRARY").is_none()
 }
 
+/// The sentinel.
+///
+/// Rust has no skipped state, so twelve guarded tests returning early report
+/// as twelve passes -- a green suite that verified nothing, which is the exact
+/// failure this project keeps designing against. This test fails instead, so
+/// the absence is impossible to miss.
+///
+/// It is the one test here that is *about the suite* rather than about the
+/// photographs.
+#[test]
+fn the_test_photographs_are_present() {
+    if library().is_some() {
+        return;
+    }
+    if std::env::var_os("NPC_ALLOW_MISSING_TEST_DATA").is_some() {
+        eprintln!("real-data tests inert: NPC_ALLOW_MISSING_TEST_DATA is set");
+        return;
+    }
+    panic!(
+        "\n\n  No test photographs at {}\n\n  \
+         The {} tests in this file cannot verify anything without them, and\n  \
+         would otherwise report as passing.\n\n    \
+         ./fetch-test-data                     download them (98 MB, once)\n    \
+         NPC_TEST_LIBRARY=<path> cargo test    use a library you already have\n    \
+         NPC_ALLOW_MISSING_TEST_DATA=1         acknowledge and move on\n",
+        library_path().display(),
+        REAL_DATA_TEST_COUNT,
+    );
+}
+
+/// Guarded tests in this file. If you add one, add it here -- the sentinel
+/// quotes this number when it explains what is not running.
+const REAL_DATA_TEST_COUNT: usize = 12;
+
 macro_rules! require_ground_truth {
     () => {
         if !counts_apply() {
@@ -83,11 +117,9 @@ macro_rules! require_library {
         match library() {
             Some(p) => p,
             None => {
-                eprintln!(
-                    "skipping: no test photographs at {}\n\
-                     run ./fetch-test-data (98 MB), or set NPC_TEST_LIBRARY",
-                    library_path().display()
-                );
+                // The sentinel above reports this loudly; here it only needs
+                // to be traceable with --nocapture.
+                eprintln!("inert: no photographs at {}", library_path().display());
                 return;
             }
         }

@@ -800,6 +800,31 @@ impl App {
             return Ok(());
         };
         let ids = self.targets();
+
+        // A protected root protects against *this* program's writes. It says
+        // nothing about a program this program launches -- RawTherapee will
+        // write a .pp3, an image viewer will happily embed a rating, and the
+        // guard never sees it. Refuse rather than hand a protected file to
+        // something that can modify it.
+        for &sid in &ids {
+            let dir: String = match self.cat.conn.query_row(
+                "SELECT dir FROM stack WHERE id = ?1",
+                [sid],
+                |r| r.get(0),
+            ) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if self.config.ensure_mutable(std::path::Path::new(&dir)).is_err() {
+                self.status = format!(
+                    "{} not launched: {} is protected, and an external editor \
+                     cannot be stopped from writing there",
+                    a.name, dir
+                );
+                return Ok(());
+            }
+        }
+
         let current = self.rows.get(self.cursor).map(|r| r.id);
         let sel = action::gather(&self.cat, &ids, current, &self.query)?;
 
@@ -2020,6 +2045,34 @@ mod tests {
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::List, "zoom stole the sidebar's Enter");
         assert!(app.query.starts_with("date="), "query: {}", app.query);
+    }
+
+    /// Protected roots must gate actions too. The guard stops this program
+    /// writing; it cannot stop RawTherapee or an image viewer, so the only
+    /// safe thing is not to hand them the file. Learned the hard way: five
+    /// JPGs on the protected drive picked up embedded ratings from an external
+    /// application while the guard reported everything was fine.
+    #[test]
+    fn actions_are_refused_inside_a_protected_root() {
+        let (dir, mut app) = app();
+        app.config = Config {
+            protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        app.actions = vec![crate::action::Action {
+            key: "z".into(),
+            name: "Editor".into(),
+            cmd: vec!["true".into(), "{raw}".into()],
+            mode: crate::action::Mode::Detach,
+            shell: false,
+        }];
+
+        app.run_action('z').unwrap();
+        assert!(
+            app.status.contains("protected"),
+            "an action was launched against a protected root: {}",
+            app.status
+        );
     }
 
     #[test]

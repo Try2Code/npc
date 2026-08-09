@@ -150,25 +150,31 @@ Token counts are not included: the tooling does not expose them to the agent,
 and inventing them would defeat the purpose of the exercise. The API and wall
 figures came from the human's side of the session.
 
-**What the human caught that the machine did not.** Worth recording, since it
-is the honest measure of where the boundary sat:
+**What the human contributed beyond requirements.** Worth recording precisely,
+since it is the honest measure of where the boundary sat:
 
-- thumbnails being unusably small — twice, before the real cause was found
-- the single view being too slow, and the suggestion (use a smaller embedded
-  preview) that fixed it
+- thumbnails being unusably small — reported twice, before the real cause was
+  found
+- the single view being too slow, *and* the fix: use a smaller embedded
+  preview. That suggestion was correct and made it 6x faster
 - an inconsistency between three different names for the same program
 - a hardcoded path that made the binary useless on any other machine
+- **asking for a test coverage workflow**, which then exposed an import-safety
+  suite that had been written into the plan and never implemented
 - unplugging the drive, which revealed that the entire offline mode — a
   headline feature, written hours earlier — had never worked once
 
-The last one is the sharpest: no test written by the agent would have found
-it, because the agent never pulled the cable.
+The last two are the sharpest. No test written by the agent would have found
+the offline bug, because the agent never pulled the cable. And the coverage
+gap was the agent failing to do what its own plan said, found only because
+someone asked for the instrument that measures it.
 
-**What the machine caught that a human might not have.** Coverage measurement
-immediately exposed an import-safety suite that had been written into the plan
-and never implemented. The consistency checker found 540 byte-identical
-duplicate pairs in the library, and identified Shotwell silently embedding
-ratings into originals.
+**What the agent found on its own.** Ground truth that contradicted its own
+plan: 1790 stacks rather than the 1722 asserted, computed in shell before
+writing the code. That `_NEF_embedded.jpg` files are the full-resolution tier
+and not the shortcut the plan called them — 4.7x, measured. And `doctor`,
+which surfaced 540 byte-identical duplicate pairs and identified Shotwell as
+the thing silently embedding ratings into originals.
 
 ## Coverage
 

@@ -14,8 +14,18 @@ npc find 'beach rating>=4'     # select
 npc tui                        # browse
 ```
 
+**Written entirely by an AI agent, with no manual coding.** If that is why you
+are here, [How this was built](#how-this-was-built) is the honest account and
+comes first.
+
 ## Contents
 
+- [How this was built](#how-this-was-built)
+  - [The structural fact](#the-structural-fact)
+  - [What actually worked](#what-actually-worked)
+  - [What failed](#what-failed)
+  - [Where the human time went](#where-the-human-time-went)
+  - [The honest summary](#the-honest-summary)
 - [Why](#why)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
@@ -24,129 +34,27 @@ npc tui                        # browse
 - [The browser](#the-browser)
 - [What it will not do](#what-it-will-not-do)
 - [Offline](#offline)
-- [How this was built](#how-this-was-built)
-  - [The structural fact](#the-structural-fact)
-  - [What actually worked](#what-actually-worked)
-  - [What failed](#what-failed)
-  - [Where the human time went](#where-the-human-time-went)
-  - [The honest summary](#the-honest-summary)
 - [Coverage](#coverage)
 - [Portability](#portability)
 - [Development](#development)
 
-## Why
-
-Shotwell's core, in a terminal, fast enough for a large library and stable
-enough to trust with originals. Full-resolution thumbnails come out of the
-RAW's embedded preview pyramid, so a 1790-shot library previews in 23 seconds
-and rescans in 0.07.
-
-## Requirements
-
-- Linux, `libexiv2-dev` (0.27 or 0.28), a C++17 compiler, Rust
-- **kitty** (or any terminal with the kitty graphics protocol) for thumbnails.
-  Sixel terminals work but band visibly on photographs; everything else falls
-  back to unreadable half-blocks.
-
-```
-cargo build --release          # target/release/npc
-```
-
-## Configuration
-
-`~/.config/npc/config.toml`:
-
-```toml
-library = "~/Pictures"                      # default for --root
-protected_roots = ["/media/me/Archive"]     # never written to, ever
-
-[thumbs]
-grid_px = 1280      # long edge for grid tiles
-view_px = 1620      # match your RAW's preview tier; higher is much slower
-quality = 80
-
-[[action]]                                  # what the `a` menu launches
-key  = "r"
-name = "RawTherapee"
-cmd  = ["rawtherapee", "{raw}"]
-mode = "detach"
-
-[[export]]                                  # named export presets
-name = "web"
-cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
-```
-
-## Commands
-
-| | |
-|---|---|
-| `scan` `find` `tags` | build the catalog and query it |
-| `tag` `rate` `mark` `set` `rotate` | edit metadata, written to sidecars |
-| `tui` | the browser: list, grid, single-image |
-| `import` `dupes` `trash` `untrash` | ingest from a card, find copies, reversible delete |
-| `export` `exec` `thumbs` | resized copies, run an action, pre-warm thumbnails |
-| `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state |
-
-`npc find --help-syntax` documents the query language.
-
-## The query language
-
-Barewords are tags; adjacency means AND.
-
-```
-beach anna rating>=4
-beach and (anna or ben) and -private
-year=2026 camera~D750 untagged
-date=2026-08-01..2026-08-09 iso>1600
-flagged and not rejected
-```
-
-Keys: `tag rating year date event camera lens serial ext role iso shutter
-width height path name title description`. Flags: `tagged untagged rated
-unrated flagged rejected offline`.
-
-## The browser
-
-```
-j k g G              move            page-up/down   one screen
-space  v  esc        select, range, clear
-enter / esc          zoom into / out of the single view
-tab / shift-tab      list -> grid -> single
-/                    query           t T   tag / untag
-1-5  0               rate            f x c flag / reject / clear
-- +                  grid tiles across
-a                    actions         u     undo
-```
-
-## What it will not do
-
-- **Edit pixels.** Crop, colour and retouching belong in RawTherapee, which
-  the action menu launches on your selection.
-- **Write to an original.** Sidecars only. Two functions in the codebase write
-  anything, and a test fails if a third appears.
-- **Touch a protected root.** Including refusing to launch an external editor
-  against one, since an editor cannot be told not to write.
-
-## Offline
-
-The catalog lives on your machine, not the drive. With the drive unplugged you
-can still search, browse thumbnails, tag and rate — edits queue and are written
-to sidecars the next time it is connected. Commands that need the files
-themselves say so rather than failing obscurely.
-
 ## How this was built
 
-Written end to end by Claude Opus 5 in Claude Code, in one sitting, as a test
-of whether a real application could be produced with no manual coding. Not a
-line was typed by hand. This section is for developers evaluating that
-question; the photography is incidental.
+This is first because it is the point. The application below is real and in
+use, but it exists to answer a question: can a working program be produced
+with no manual coding at all?
+
+Written end to end by Claude Opus 5 in Claude Code, in one sitting. Not a line
+was typed by hand. What follows is the honest account -- the numbers, what
+failed, and what held -- for developers weighing that question. The
+photography is incidental.
 
 | | |
 |---|---|
 | Wall clock | **7 h 50 m** |
 | — of which planning | ~1 h 15 m before the first line of code |
 | API time | **2 h 10 m** — 28% of wall clock |
-| Commits | 33 |
+| Commits | 36 |
 | Rust | ~10,800 lines incl. tests |
 | C++ | 447 lines (the Exiv2 shim) |
 | Tests | 177, 84% region / 86% line coverage |
@@ -254,6 +162,106 @@ The mitigations that worked were structural, not attentional:
   and then detached
 
 That last one found more than every test in this repository combined.
+
+## Why
+
+Shotwell's core, in a terminal, fast enough for a large library and stable
+enough to trust with originals. Full-resolution thumbnails come out of the
+RAW's embedded preview pyramid, so a 1790-shot library previews in 23 seconds
+and rescans in 0.07.
+
+## Requirements
+
+- Linux, `libexiv2-dev` (0.27 or 0.28), a C++17 compiler, Rust
+- **kitty** (or any terminal with the kitty graphics protocol) for thumbnails.
+  Sixel terminals work but band visibly on photographs; everything else falls
+  back to unreadable half-blocks.
+
+```
+cargo build --release          # target/release/npc
+```
+
+## Configuration
+
+`~/.config/npc/config.toml`:
+
+```toml
+library = "~/Pictures"                      # default for --root
+protected_roots = ["/media/me/Archive"]     # never written to, ever
+
+[thumbs]
+grid_px = 1280      # long edge for grid tiles
+view_px = 1620      # match your RAW's preview tier; higher is much slower
+quality = 80
+
+[[action]]                                  # what the `a` menu launches
+key  = "r"
+name = "RawTherapee"
+cmd  = ["rawtherapee", "{raw}"]
+mode = "detach"
+
+[[export]]                                  # named export presets
+name = "web"
+cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
+```
+
+## Commands
+
+| | |
+|---|---|
+| `scan` `find` `tags` | build the catalog and query it |
+| `tag` `rate` `mark` `set` `rotate` | edit metadata, written to sidecars |
+| `tui` | the browser: list, grid, single-image |
+| `import` `dupes` `trash` `untrash` | ingest from a card, find copies, reversible delete |
+| `export` `exec` `thumbs` | resized copies, run an action, pre-warm thumbnails |
+| `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state |
+
+`npc find --help-syntax` documents the query language.
+
+## The query language
+
+Barewords are tags; adjacency means AND.
+
+```
+beach anna rating>=4
+beach and (anna or ben) and -private
+year=2026 camera~D750 untagged
+date=2026-08-01..2026-08-09 iso>1600
+flagged and not rejected
+```
+
+Keys: `tag rating year date event camera lens serial ext role iso shutter
+width height path name title description`. Flags: `tagged untagged rated
+unrated flagged rejected offline`.
+
+## The browser
+
+```
+j k g G              move            page-up/down   one screen
+space  v  esc        select, range, clear
+enter / esc          zoom into / out of the single view
+tab / shift-tab      list -> grid -> single
+/                    query           t T   tag / untag
+1-5  0               rate            f x c flag / reject / clear
+- +                  grid tiles across
+a                    actions         u     undo
+```
+
+## What it will not do
+
+- **Edit pixels.** Crop, colour and retouching belong in RawTherapee, which
+  the action menu launches on your selection.
+- **Write to an original.** Sidecars only. Two functions in the codebase write
+  anything, and a test fails if a third appears.
+- **Touch a protected root.** Including refusing to launch an external editor
+  against one, since an editor cannot be told not to write.
+
+## Offline
+
+The catalog lives on your machine, not the drive. With the drive unplugged you
+can still search, browse thumbnails, tag and rate — edits queue and are written
+to sidecars the next time it is connected. Commands that need the files
+themselves say so rather than failing obscurely.
 
 ## Coverage
 

@@ -277,12 +277,39 @@ fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
         std::fs::read(&src.path).with_context(|| format!("reading {}", src.path.display()))?
     };
 
+    // Fast path: an embedded JPEG that already fits and needs no rotation is
+    // exactly what we would produce, so decode-then-re-encode is wasted work.
+    // Roughly a third of a landscape-heavy shoot takes this path.
+    if src.embedded && src.orientation <= 1 {
+        if let Ok(image::ImageFormat::Jpeg) = image::guess_format(&bytes) {
+            let dims = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok());
+            if let Some((w, h)) = dims {
+                if w.max(h) <= size.px() {
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let part = out.with_extension("part");
+                    std::fs::write(&part, &bytes)?;
+                    std::fs::rename(&part, out)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let img = image::load_from_memory(&bytes)
         .with_context(|| format!("decoding preview for {}", src.path.display()))?;
 
     let (w, h) = (img.width(), img.height());
     let long = w.max(h);
-    let img = if long > size.px() {
+    // Resampling a preview that is already the right size is pure cost. The
+    // view size is chosen to match an embedded tier exactly, so this is the
+    // common path, not an edge case.
+    let close_enough = long <= size.px() + size.px() / 20;
+    let img = if long > size.px() && !close_enough {
         let scale = size.px() as f32 / long as f32;
         img.resize(
             (w as f32 * scale).round().max(1.0) as u32,
@@ -539,6 +566,48 @@ mod tests {
     /// Pruning must delete previous generations and keep the live ones. It is
     /// the only thing here that removes files, so it gets a test that proves
     /// it does not remove the wrong ones.
+    /// The passthrough must only fire when the bytes really are what we would
+    /// have produced: right size, no rotation needed. Rotation is the trap --
+    /// most of a portrait-heavy shoot must NOT take this path.
+    #[test]
+    fn rotated_sources_never_take_the_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("shot.NEF");
+        std::fs::write(&raw, jpeg(400, 200)).unwrap();
+
+        // orientation 8 = rotate 270; the output must come out portrait, which
+        // is only possible if it was decoded and rotated rather than copied.
+        let src = Source {
+            path: dir.path().join("shot.jpg"),
+            embedded: false,
+            mtime: 1,
+            orientation: 8,
+            stack_id: 1,
+        };
+        std::fs::write(&src.path, jpeg(400, 200)).unwrap();
+        let out = dir.path().join("t.jpg");
+        generate(&src, Size::View, &out).unwrap();
+
+        let made = image::open(&out).unwrap();
+        assert!(
+            made.height() > made.width(),
+            "a rotated source was passed through unrotated: {}x{}",
+            made.width(),
+            made.height()
+        );
+    }
+
+    /// ..and a source larger than the target must still be downscaled.
+    #[test]
+    fn oversized_sources_never_take_the_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source(dir.path(), 4000, 3000, 1);
+        let out = dir.path().join("t.jpg");
+        generate(&src, Size::Grid, &out).unwrap();
+        let made = image::open(&out).unwrap();
+        assert_eq!(made.width().max(made.height()), Size::Grid.px());
+    }
+
     #[test]
     fn prune_removes_stale_generations_but_keeps_the_current_one() {
         let dir = tempfile::tempdir().unwrap();

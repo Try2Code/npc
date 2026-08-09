@@ -31,15 +31,20 @@ impl Default for Thumbs {
         //   grid : 3440 / 5 tiles across = 688 px, and 1147 px if narrowed to
         //          3 across with `-`. 1280 covers the widest tile without
         //          upscaling.
-        //   view : a 3:2 frame in a 3440x1400 window is height-limited, so the
-        //          long edge needed is 1400 * 1.5 = 2100 px. 2560 leaves room
-        //          for wider crops without paying for a 3200 px cache.
+        //   view : deliberately matched to the NEF's 1620x1080 preview tier.
+        //          Asking for more forces Exiv2 up to the 6016x4016 tier, so
+        //          every frame decodes a 24 MP JPEG and Lanczos-downscales it
+        //          -- 140 ms, which is visible stutter when walking a shoot.
+        //          At 1620 the tier is used as-is with no resampling at all.
+        //          It is softer than the 2100 px a full-screen 3:2 frame could
+        //          use; the single view is for choosing, and anything needing
+        //          real inspection goes to RawTherapee via `a`.
         //
         // Both are overridable in config.toml; the cache key includes the pixel
         // size, so changing them regenerates exactly what is affected.
         Self {
             grid_px: 1280,
-            view_px: 2560,
+            view_px: 1620,
             quality: 80,
         }
     }

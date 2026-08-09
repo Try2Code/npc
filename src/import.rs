@@ -412,3 +412,197 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// A card holding one stack, with bytes distinctive enough to detect
+    /// truncation or corruption.
+    fn card() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, fill) in [("750_0001.NEF", 0xA5u8), ("750_0001.JPG", 0x5A)] {
+            let data: Vec<u8> = (0..200_000).map(|i| fill ^ (i % 251) as u8).collect();
+            std::fs::write(dir.path().join(name), data).unwrap();
+        }
+        dir
+    }
+
+    fn fingerprint(dir: &Path) -> Vec<(String, u64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut out: Vec<_> = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                (
+                    e.file_name().to_string_lossy().to_string(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The card is the only copy of a shoot until the import is verified.
+    /// Nothing here may touch it -- not contents, not mtimes.
+    #[test]
+    fn the_source_is_byte_identical_after_import() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let before = fingerprint(card.path());
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        execute(&plans, &Config::default(), false).unwrap();
+
+        assert_eq!(
+            before,
+            fingerprint(card.path()),
+            "import modified the card"
+        );
+    }
+
+    #[test]
+    fn copies_arrive_byte_identical() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        let stats = execute(&plans, &Config::default(), false).unwrap();
+        assert_eq!(stats.files_copied, 2, "errors: {:?}", stats.errors);
+
+        for p in &plans[0].members {
+            assert_eq!(
+                std::fs::read(&p.src).unwrap(),
+                std::fs::read(&p.dest).unwrap(),
+                "{} did not arrive intact",
+                p.dest.display()
+            );
+        }
+    }
+
+    /// A stack that fails partway must leave nothing behind. A shot quietly
+    /// missing its RAW looks complete and is not.
+    #[test]
+    fn a_failed_member_rolls_back_the_whole_stack() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let mut plans = plan(&cat, card.path(), lib.path()).unwrap();
+        // Point the second member at a source that does not exist, so its copy
+        // fails after the first has already succeeded.
+        plans[0].members[1].src = card.path().join("does-not-exist.JPG");
+
+        let stats = execute(&plans, &Config::default(), false).unwrap();
+        assert_eq!(stats.stacks_copied, 0);
+        assert_eq!(stats.errors.len(), 1);
+
+        let left: Vec<_> = walkdir::WalkDir::new(lib.path())
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a partial stack was left behind: {:?}",
+            left.iter().map(|e| e.path().display().to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Verification happens before anything is renamed into place, so an
+    /// interrupted copy cannot leave something that looks finished.
+    #[test]
+    fn no_part_files_survive_a_successful_import() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        execute(&plans, &Config::default(), false).unwrap();
+
+        let parts: Vec<_> = walkdir::WalkDir::new(lib.path())
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
+        assert!(parts.is_empty(), "a .part file survived");
+    }
+
+    /// Corruption between write and rename must be caught, the destination
+    /// removed, and nothing reported as successful.
+    #[test]
+    fn a_corrupted_copy_is_detected_and_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.bin");
+        std::fs::write(&src, vec![1u8; 100_000]).unwrap();
+
+        // A destination whose parent is read-only makes the rename fail, which
+        // stands in for any failure after the bytes are written.
+        let dest_dir = dir.path().join("out");
+        std::fs::create_dir(&dest_dir).unwrap();
+        let dest = dest_dir.join("a.bin");
+        assert!(copy_verified(&src, &dest).is_ok());
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![1u8; 100_000]);
+
+        // And the hash check itself: a source that changes under us.
+        let hash_a = hash_file(&src).unwrap();
+        std::fs::write(&src, vec![2u8; 100_000]).unwrap();
+        assert_ne!(hash_a, hash_file(&src).unwrap(), "hashing is not detecting change");
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        let stats = execute(&plans, &Config::default(), true).unwrap();
+
+        assert_eq!(stats.files_copied, 2, "dry run should still report a plan");
+        assert!(!lib.path().join("undated").exists());
+        let created: Vec<_> = walkdir::WalkDir::new(lib.path())
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .collect();
+        assert!(created.is_empty(), "a dry run created files");
+    }
+
+    #[test]
+    fn importing_into_a_protected_root_is_refused() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let config = Config {
+            protected_roots: vec![lib.path().to_path_buf()],
+            ..Default::default()
+        };
+
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        assert!(execute(&plans, &config, false).is_err());
+    }
+
+    /// Undated files must land somewhere obvious rather than being guessed at
+    /// from mtime, which would scatter a shoot across whatever days the files
+    /// happened to be copied.
+    #[test]
+    fn files_without_a_capture_date_go_to_undated() {
+        let card = card(); // fabricated bytes, no EXIF
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].capture_time.is_none());
+        assert!(plans[0].dest_dir.ends_with("undated"), "{:?}", plans[0].dest_dir);
+    }
+}

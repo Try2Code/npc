@@ -62,7 +62,10 @@ pub struct ExportStats {
 /// RAW. What it is not is a developed RAW: it carries the camera's picture
 /// control and white balance. Anything where the development matters wants
 /// `rawtherapee-cli`, which is what the shell-out presets are for.
-fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<(PathBuf, bool, u16, String)>> {
+/// Source path, whether it needs Exiv2 extraction, orientation, stack base.
+type ExportSource = (PathBuf, bool, u16, String);
+
+fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<ExportSource>> {
     let row = cat.conn.query_row(
         "SELECT s.dir || '/' || f.name, f.role, s.base,
                 COALESCE(s.orientation, f.exif_orientation, 1)

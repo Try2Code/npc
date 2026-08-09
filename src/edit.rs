@@ -194,9 +194,9 @@ pub fn flush(cat: &mut Catalog, config: &Config) -> Result<EditStats> {
             Ok(()) => {
                 let mtime = std::fs::metadata(&sidecar)
                     .ok()
-                    .and_then(|m| {
+                    .map(|m| {
                         use std::os::unix::fs::MetadataExt;
-                        Some(m.mtime() * 1_000_000_000 + m.mtime_nsec())
+                        m.mtime() * 1_000_000_000 + m.mtime_nsec()
                     })
                     .unwrap_or(0);
                 cat.conn.execute(

@@ -13,7 +13,7 @@
 use crate::config::Config;
 use crate::db::Catalog;
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Severity {
@@ -81,17 +81,17 @@ impl Finding {
 }
 
 pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> {
-    let mut out = Vec::new();
-    out.push(check_modified_originals(cat)?);
-    out.push(check_missing(cat)?);
-    out.push(check_orphan_sidecars(cat)?);
-    out.push(check_pending(cat)?);
-    out.push(check_undated(cat)?);
-    out.push(check_duplicates(cat)?);
-    out.push(check_actions());
-    out.push(check_cache(root)?);
-    out.push(check_protection(root, config));
-    Ok(out)
+    Ok(vec![
+        check_modified_originals(cat)?,
+        check_missing(cat)?,
+        check_orphan_sidecars(cat)?,
+        check_pending(cat)?,
+        check_undated(cat)?,
+        check_duplicates(cat)?,
+        check_actions(),
+        check_cache(root)?,
+        check_protection(root, config),
+    ])
 }
 
 /// A file whose size or mtime no longer matches what was catalogued has been
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn unwritten_edits_are_reported() {
-        let (dir, mut cat) = library();
+        let (dir, cat) = library();
         let sid = cat
             .stack_id(dir.path().join("2026/08/09").to_str().unwrap(), "750_0001")
             .unwrap()

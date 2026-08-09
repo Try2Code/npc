@@ -182,7 +182,9 @@ impl Catalog {
                 if path.extension().and_then(|e| e.to_str()) != Some("sqlite") {
                     continue;
                 }
-                let Ok(conn) = Connection::open(&path) else { continue };
+                let Ok(conn) = Connection::open(&path) else {
+                    continue;
+                };
                 let recorded: Option<String> = conn
                     .query_row("SELECT last_root FROM volume LIMIT 1", [], |r| r.get(0))
                     .ok();
@@ -449,7 +451,10 @@ mod tests {
         let cat = Catalog::open_at(store.path().join("VOL1-08-abcdef12.sqlite")).unwrap();
         cat.register_volume("VOL1", Some("MyPics"), absent).unwrap();
         cat.conn
-            .execute("INSERT INTO stack (dir, base) VALUES ('/media/nowhere/MyPics/2026/08/09', 'x')", [])
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES ('/media/nowhere/MyPics/2026/08/09', 'x')",
+                [],
+            )
             .unwrap();
         drop(cat);
 
@@ -461,9 +466,10 @@ mod tests {
     #[test]
     fn an_unknown_root_says_so_rather_than_creating_an_empty_catalog() {
         let store = tempfile::tempdir().unwrap();
-        let err = Catalog::open_for_root_in(store.path(), Path::new("/media/nowhere/never-scanned"))
-            .unwrap_err()
-            .to_string();
+        let err =
+            Catalog::open_for_root_in(store.path(), Path::new("/media/nowhere/never-scanned"))
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("never been scanned"), "got: {err}");
     }
 

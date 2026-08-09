@@ -77,7 +77,7 @@ fn mount_for_dev(major: u32, minor: u32) -> Option<(PathBuf, Option<String>)> {
             .split(" - ")
             .nth(1)
             .and_then(|tail| tail.split(' ').nth(1))
-            .map(|s| unescape(s));
+            .map(unescape);
         // Later entries shadow earlier ones for the same device; keep the last.
         best = Some((PathBuf::from(unescape(mountpoint)), source));
     }

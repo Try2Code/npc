@@ -48,7 +48,11 @@ if [ -d "$LIBRARY" ]; then
   MANIFEST=.tripwire/library-stat.tsv
   mkdir -p .tripwire
   CURRENT=$(mktemp)
-  find "$LIBRARY" -type f \! -name '*.xmp' -printf '%s\t%T@\t%p\n' | sort -k3 > "$CURRENT"
+  # Only originals. Sidecars are ours and profiles are RawTherapee's; both
+  # appear during normal use, and a tripwire that fires on legitimate activity
+  # gets ignored, which defeats it.
+  find "$LIBRARY" -type f \! -name '*.xmp' \! -name '*.pp3' \
+       -printf '%s\t%T@\t%p\n' | sort -k3 > "$CURRENT"
   if [ -f "$MANIFEST" ]; then
     if diff -q "$MANIFEST" "$CURRENT" >/dev/null; then
       ok "$(wc -l < "$CURRENT") originals unchanged"

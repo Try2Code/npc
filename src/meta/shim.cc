@@ -333,7 +333,7 @@ void write_sidecar(rust::Str xmp_path_, const SidecarDoc &doc) {
 
     auto out = Exiv2::ImageFactory::create(Exiv2::ImageType::xmp, path);
     out->setXmpData(xmp);
-    out->writeMetadata(); // <-- the only writeMetadata() in this codebase
+    out->writeMetadata(); // <-- one of exactly two writers; see shim.h
 }
 
 void stamp_export(rust::Str dest_path_, const SidecarDoc &doc) {

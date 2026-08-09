@@ -69,9 +69,12 @@ enum Input {
 /// One reversible batch. Undo restores the exact prior state of each stack
 /// rather than guessing an inverse, so it is correct for partial overlaps
 /// (tagging things that were already tagged, say).
+/// Prior state of one stack: tags, rating, flag, reject.
+type StackState = (i64, Vec<String>, Option<i64>, bool, bool);
+
 struct UndoStep {
     label: String,
-    prior: Vec<(i64, Vec<String>, Option<i64>, bool, bool)>,
+    prior: Vec<StackState>,
 }
 
 pub struct App {
@@ -462,7 +465,7 @@ impl App {
             .collect()
     }
 
-    fn snapshot(&self, ids: &[i64]) -> Result<Vec<(i64, Vec<String>, Option<i64>, bool, bool)>> {
+    fn snapshot(&self, ids: &[i64]) -> Result<Vec<StackState>> {
         let mut out = Vec::new();
         for &id in ids {
             let tags: Vec<String> = self
@@ -832,10 +835,7 @@ impl App {
             return Ok(());
         };
         if !self.online {
-            self.status = format!(
-                "{} not launched: the library is not mounted",
-                a.name
-            );
+            self.status = format!("{} not launched: the library is not mounted", a.name);
             return Ok(());
         }
         let ids = self.targets();
@@ -949,14 +949,20 @@ impl App {
         let pending: i64 = self
             .cat
             .conn
-            .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         let offline_badge = if self.online {
             String::new()
         } else {
             format!(
                 "  OFFLINE{}  ",
-                if pending > 0 { format!(" - {pending} pending") } else { String::new() }
+                if pending > 0 {
+                    format!(" - {pending} pending")
+                } else {
+                    String::new()
+                }
             )
         };
 

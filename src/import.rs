@@ -21,6 +21,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// A file on the card: path, role, size.
+type SourceFile = (PathBuf, Role, u64);
+
 #[derive(Debug, Clone)]
 pub struct PlannedStack {
     pub base: String,
@@ -58,7 +61,7 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
     }
 
     // Group source files into stacks, exactly as the scanner does.
-    let mut groups: HashMap<(PathBuf, String), Vec<(PathBuf, Role, u64)>> = HashMap::new();
+    let mut groups: HashMap<(PathBuf, String), Vec<SourceFile>> = HashMap::new();
     for entry in walkdir::WalkDir::new(source)
         .follow_links(false)
         .into_iter()
@@ -328,7 +331,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn free_base(
     dest_dir: &Path,
     base: &str,
-    members: &[(PathBuf, Role, u64)],
+    members: &[SourceFile],
     claimed: &std::collections::HashSet<PathBuf>,
 ) -> String {
     let taken = |candidate: &str| -> bool {

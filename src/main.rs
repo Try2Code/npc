@@ -26,7 +26,7 @@ enum Cmd {
     },
     /// Walk a library into the catalog. Read-only with respect to your files.
     Scan {
-        root: PathBuf,
+        root: Option<PathBuf>,
         /// Reparse every file rather than trusting size+mtime
         #[arg(long)]
         full: bool,
@@ -34,15 +34,15 @@ enum Cmd {
     /// Report which volume a path lives on, and where its catalog would go.
     Volume { path: PathBuf },
     /// Catalog summary.
-    Status { root: PathBuf },
+    Status { root: Option<PathBuf> },
     /// Select stacks with the query language. See `npc find --help-syntax`.
     Find {
         /// e.g. "beach and rating>=4", "year=2026 camera~D750 -private"
         #[arg(default_value = "")]
         query: String,
         /// Which library to search
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Print every file of each matching stack rather than the stack
         #[arg(long)]
         files: bool,
@@ -60,8 +60,8 @@ enum Cmd {
     },
     /// List tags with counts.
     Tags {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Add or remove tags on the stacks a query selects.
     Tag {
@@ -100,8 +100,8 @@ enum Cmd {
         action: String,
         #[arg(short = 'q', long)]
         query: Option<String>,
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Show the available actions and exit
         #[arg(long)]
         list: bool,
@@ -119,8 +119,8 @@ enum Cmd {
     },
     /// Generate thumbnails ahead of time.
     Thumbs {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Restrict to the stacks a query selects
         #[arg(short = 'q', long)]
         query: Option<String>,
@@ -142,8 +142,8 @@ enum Cmd {
         /// Where the copies go. Must be outside the library.
         #[arg(short = 'o', long)]
         out: PathBuf,
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Long edge in pixels
         #[arg(long, default_value_t = npc::export::DEFAULT_LONG_EDGE)]
         size: u32,
@@ -171,14 +171,11 @@ enum Cmd {
         shell: clap_complete::Shell,
     },
     /// The browser.
-    Tui {
-        #[arg(default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
-    },
+    Tui { root: Option<PathBuf> },
     /// Write every pending edit out to its sidecar.
     Sync {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Copy photos from a card into a dated library. The source is never modified.
     Import {
@@ -193,8 +190,8 @@ enum Cmd {
     },
     /// List shooting days, and give them names.
     Events {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Name an event: `npc events --name 3 "Ostsee"`. Names survive
         /// rescanning; pass an empty string to clear one.
         #[arg(long, num_args = 2, value_names = ["ID", "NAME"])]
@@ -202,16 +199,16 @@ enum Cmd {
     },
     /// Check the catalog against what is actually on disk.
     Doctor {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Exit non-zero if anything needs attention, for scripting
         #[arg(long)]
         strict: bool,
     },
     /// Report shots that appear more than once.
     Dupes {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Move stacks to <library>/.trash/. Reversible; nothing is deleted.
     Trash {
@@ -222,18 +219,18 @@ enum Cmd {
     Untrash {
         /// Stack basename, as shown by `trash-list`
         base: String,
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// What is currently in the trash.
     TrashList {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Permanently delete everything in the trash. The only real delete.
     TrashEmpty {
-        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-        root: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Required. Without it this only reports what would go.
         #[arg(long)]
         yes: bool,
@@ -247,8 +244,8 @@ struct Target {
     query: Option<String>,
     /// Explicit stack paths (dir/base), if not using a query
     paths: Vec<String>,
-    #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
-    root: PathBuf,
+    #[arg(long)]
+    root: Option<PathBuf>,
     /// Show what would change without changing it
     #[arg(long)]
     dry_run: bool,
@@ -299,6 +296,27 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// The library to act on: `--root` if given, else `library` from the config.
+///
+/// Deliberately errors rather than defaulting to the current directory --
+/// scanning whatever happens to be underfoot is not a helpful guess.
+fn library(explicit: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(r) = explicit {
+        return Ok(r.clone());
+    }
+    if let Some(r) = npc::config::Config::load()
+        .unwrap_or_default()
+        .library_root()
+    {
+        return Ok(r);
+    }
+    anyhow::bail!(
+        "no library given. Pass --root <path>, or set one in {}:\n\n    \
+         library = \"~/Pictures\"",
+        npc::config::Config::path().display()
+    )
+}
+
 fn open_for(root: &Path) -> Result<Catalog> {
     Ok(open_checked(root)?.0)
 }
@@ -332,7 +350,8 @@ fn require_online(root: &Path) -> Result<Catalog> {
 /// catalog: the files on disk are the source of truth.
 fn edit_and_flush(t: &Target, changes: Vec<npc::edit::Change>, verb: &str) -> Result<()> {
     let config = npc::config::Config::load()?;
-    let mut cat = open_for(&t.root)?;
+    let root = library(&t.root)?;
+    let mut cat = open_for(&root)?;
     let ids = resolve(&cat, t)?;
 
     if ids.is_empty() {
@@ -418,6 +437,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Scan { root, full } => {
+            let root = library(&root)?;
             let started = std::time::Instant::now();
             let (stats, cat) = scan::scan_root(&root, full)?;
             let elapsed = started.elapsed();
@@ -476,6 +496,8 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             let mut prepared = cat.conn.prepare(&stmt)?;
             let params: Vec<&dyn rusqlite::ToSql> = compiled
@@ -484,7 +506,9 @@ fn main() -> Result<()> {
                 .map(|p| p as &dyn rusqlite::ToSql)
                 .collect();
 
-            let rows: Vec<(i64, String, String, Option<i64>, i64, i64, Option<i64>)> = prepared
+            /// id, dir, base, rating, flag, reject, captured
+            type FoundStack = (i64, String, String, Option<i64>, i64, i64, Option<i64>);
+            let rows: Vec<FoundStack> = prepared
                 .query_map(params.as_slice(), |r| {
                     Ok((
                         r.get(0)?,
@@ -526,6 +550,8 @@ fn main() -> Result<()> {
         }
 
         Cmd::Tags { root } => {
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             let mut stmt = cat.conn.prepare(
                 "SELECT t.name, COUNT(st.stack_id) AS n
@@ -636,7 +662,7 @@ fn main() -> Result<()> {
                 if actions.is_empty() {
                     println!("no actions available (none of the configured programs are on PATH)");
                 } else {
-                    println!("{:<4} {:<14} {}", "key", "name", "command");
+                    println!("{:<4} {:<14} command", "key", "name");
                     for a in &actions {
                         println!("{:<4} {:<14} {}", a.key, a.name, a.cmd.join(" "));
                     }
@@ -650,11 +676,13 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no action `{action}`; try `npc exec --list`"))?;
 
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             let target = Target {
                 query: query.clone(),
                 paths: Vec::new(),
-                root: root.clone(),
+                root: Some(root.clone()),
                 dry_run,
             };
             let ids = resolve(&cat, &target)?;
@@ -696,6 +724,8 @@ fn main() -> Result<()> {
 
         Cmd::Sync { root } => {
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let mut cat = open_for(&root)?;
             let stats = npc::edit::flush(&mut cat, &config)?;
             println!("sidecars written  {}", stats.sidecars_written);
@@ -771,6 +801,8 @@ fn main() -> Result<()> {
         }
 
         Cmd::Events { root, name } => {
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
 
             if let Some(args) = name {
@@ -821,6 +853,8 @@ fn main() -> Result<()> {
 
         Cmd::Doctor { root, strict } => {
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             println!("{}\n", cat.path.display());
 
@@ -866,6 +900,8 @@ fn main() -> Result<()> {
         }
 
         Cmd::Dupes { root } => {
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             let groups = npc::dupes::find(&cat)?;
             if groups.is_empty() {
@@ -884,7 +920,8 @@ fn main() -> Result<()> {
 
         Cmd::Trash { target } => {
             let config = npc::config::Config::load()?;
-            let mut cat = require_online(&target.root)?;
+            let root = library(&target.root)?;
+            let mut cat = require_online(&root)?;
             let ids = resolve(&cat, &target)?;
             if ids.is_empty() {
                 println!("nothing matched");
@@ -894,12 +931,12 @@ fn main() -> Result<()> {
                 println!("would trash {} stack(s)", ids.len());
                 return Ok(());
             }
-            let stats = npc::trash::trash(&mut cat, &target.root, &ids, &config)?;
+            let stats = npc::trash::trash(&mut cat, &root, &ids, &config)?;
             println!(
                 "trashed {} stack(s), {} files -> {}/.trash/",
                 stats.stacks,
                 stats.files,
-                target.root.display()
+                root.display()
             );
             println!("restore with `npc untrash <base>`; nothing was deleted");
             for e in &stats.errors {
@@ -909,6 +946,8 @@ fn main() -> Result<()> {
 
         Cmd::Untrash { base, root } => {
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let mut cat = open_for(&root)?;
             let entry = npc::trash::list(&cat)?
                 .into_iter()
@@ -919,6 +958,8 @@ fn main() -> Result<()> {
         }
 
         Cmd::TrashList { root } => {
+            let root = library(&root)?;
+
             let cat = open_for(&root)?;
             let entries = npc::trash::list(&cat)?;
             if entries.is_empty() {
@@ -934,6 +975,8 @@ fn main() -> Result<()> {
 
         Cmd::TrashEmpty { root, yes } => {
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let mut cat = open_for(&root)?;
             let entries = npc::trash::list(&cat)?;
             if entries.is_empty() {
@@ -970,6 +1013,8 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unknown size `{other}`; use grid or view"),
             };
             // Generating needs the originals; pruning does not.
+            let root = library(&root)?;
+
             let (cat, online) = open_checked(&root)?;
             let uuid: String = cat
                 .conn
@@ -1120,11 +1165,13 @@ fn main() -> Result<()> {
             };
 
             let config = npc::config::Config::load()?;
+            let root = library(&root)?;
+
             let cat = require_online(&root)?;
             let target = Target {
                 query: query.clone(),
                 paths: Vec::new(),
-                root: root.clone(),
+                root: Some(root.clone()),
                 dry_run,
             };
             let ids = resolve(&cat, &target)?;
@@ -1173,9 +1220,11 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Cmd::Tui { root } => npc::tui::run(root)?,
+        Cmd::Tui { root } => npc::tui::run(library(&root)?)?,
 
         Cmd::Status { root } => {
+            let root = library(&root)?;
+
             let (cat, online) = open_checked(&root)?;
             println!("catalog {}", cat.path.display());
             let recorded: Option<String> = cat
@@ -1183,7 +1232,10 @@ fn main() -> Result<()> {
                 .query_row("SELECT vol_uuid FROM volume LIMIT 1", [], |r| r.get(0))
                 .ok();
             println!("  volume  {}", recorded.unwrap_or_else(|| "-".into()));
-            println!("  library {}", if online { "mounted" } else { "NOT MOUNTED" });
+            println!(
+                "  library {}",
+                if online { "mounted" } else { "NOT MOUNTED" }
+            );
             println!("  stacks  {}", cat.stack_count()?);
             println!("  files   {}", cat.file_count()?);
             println!("  orphans {}", cat.orphan_count()?);

@@ -347,25 +347,6 @@ pub fn scan_root(root: &Path, full: bool) -> Result<(ScanStats, Catalog)> {
     Ok((stats, cat))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_array_escapes_hostile_filenames() {
-        let items = vec![
-            r#"/d/quote".NEF"#.to_string(),
-            "/d/back\\slash.NEF".to_string(),
-            "/d/new\nline.NEF".to_string(),
-        ];
-        let json = serde_json_array(&items);
-        assert!(json.starts_with('['));
-        assert!(json.contains(r#"quote\""#));
-        assert!(json.contains(r"back\\slash"));
-        assert!(json.contains(r"new\nline"));
-    }
-}
-
 /// Group stacks into events: one per day of shooting.
 ///
 /// The day comes from capture time, never from the file's mtime or its
@@ -413,4 +394,23 @@ pub fn derive_events(cat: &mut Catalog) -> Result<usize> {
     let n: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
     tx.commit()?;
     Ok(n as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_array_escapes_hostile_filenames() {
+        let items = vec![
+            r#"/d/quote".NEF"#.to_string(),
+            "/d/back\\slash.NEF".to_string(),
+            "/d/new\nline.NEF".to_string(),
+        ];
+        let json = serde_json_array(&items);
+        assert!(json.starts_with('['));
+        assert!(json.contains(r#"quote\""#));
+        assert!(json.contains(r"back\\slash"));
+        assert!(json.contains(r"new\nline"));
+    }
 }

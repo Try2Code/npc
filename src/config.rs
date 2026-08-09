@@ -58,6 +58,13 @@ pub struct Config {
     pub protected_roots: Vec<PathBuf>,
     #[serde(default)]
     pub thumbs: Thumbs,
+    /// The library this tool works on when `--root` is not given.
+    ///
+    /// Without it every command would need an explicit path, and hardcoding
+    /// one makes the binary useless on any other machine -- which is exactly
+    /// what it was doing.
+    #[serde(default)]
+    pub library: Option<PathBuf>,
     /// Where catalogs live. Defaults to the XDG data directory.
     ///
     /// Worth moving if the default lands somewhere you would rather it did
@@ -68,6 +75,11 @@ pub struct Config {
 }
 
 impl Config {
+    /// The configured library, with `~` expanded.
+    pub fn library_root(&self) -> Option<PathBuf> {
+        self.library.as_deref().map(expand_home)
+    }
+
     /// Where catalogs are kept, honouring `catalog_dir` if it is set.
     pub fn catalog_store(&self) -> PathBuf {
         if let Some(dir) = &self.catalog_dir {
@@ -201,6 +213,21 @@ mod tests {
         assert!(c
             .ensure_mutable(Path::new("/media/ram/MyPicsBackup/x.xmp"))
             .is_ok());
+    }
+
+    #[test]
+    fn the_library_root_comes_from_config_and_expands_home() {
+        assert!(Config::default().library_root().is_none());
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let c = Config {
+            library: Some(PathBuf::from("~/Pictures/library")),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.library_root(),
+            Some(PathBuf::from(home).join("Pictures/library"))
+        );
     }
 
     #[test]

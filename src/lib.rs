@@ -7,9 +7,12 @@
 
 pub mod config;
 pub mod db;
+pub mod dupes;
 pub mod edit;
+pub mod import;
 pub mod meta;
 pub mod query;
 pub mod scan;
 pub mod stack;
+pub mod trash;
 pub mod vol;

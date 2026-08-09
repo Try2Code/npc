@@ -450,6 +450,9 @@ fn day_bounds(s: &str) -> Result<(i64, i64)> {
     Ok((start, end))
 }
 
+/// Public wrapper so `import` can assert its inverse round-trips.
+pub fn days_from_civil_pub(y: i64, m: i64, d: i64) -> i64 { days_from_civil(y, m, d) }
+
 /// Howard Hinnant's civil-to-days algorithm; avoids a chrono dependency.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

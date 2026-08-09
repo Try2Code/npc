@@ -339,7 +339,7 @@ fn serde_json_array(items: &[String]) -> String {
 /// Convenience for the CLI: identify the volume, open its catalog, scan.
 pub fn scan_root(root: &Path, full: bool) -> Result<(ScanStats, Catalog)> {
     let vol = crate::vol::identify(root)?;
-    let mut cat = Catalog::open_for_volume(&vol.uuid)?;
+    let mut cat = Catalog::open_for(&vol.uuid, root)?;
     cat.register_volume(&vol.uuid, vol.label.as_deref(), root)?;
     let stats = scan(&mut cat, root, full).context("scanning")?;
     Ok((stats, cat))

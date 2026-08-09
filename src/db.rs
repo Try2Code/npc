@@ -112,15 +112,35 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Open (or create) the catalog for a volume. Kept on the laptop and keyed
-    /// by volume UUID, so the library stays queryable with the drive unplugged.
-    pub fn open_for_volume(vol_uuid: &str) -> Result<Self> {
+    /// Open (or create) the catalog for one library.
+    ///
+    /// Keyed by volume UUID **and** library root. Keying on the volume alone
+    /// was wrong: two libraries on one filesystem then shared a catalog, and
+    /// import saw every incoming file as a duplicate of the other library's.
+    /// Both components are known without the drive mounted, so offline queries
+    /// still work.
+    pub fn open_for(vol_uuid: &str, root: &Path) -> Result<Self> {
         let dir = directories::ProjectDirs::from("", "", "photo-catalog")
             .map(|d| d.data_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from(".photo-catalog"));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating catalog directory {}", dir.display()))?;
-        Self::open_at(dir.join(format!("{vol_uuid}.sqlite")))
+
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let digest = blake3::hash(canonical.to_string_lossy().as_bytes());
+        let short = &digest.to_hex()[..8];
+
+        // A readable fragment of the path keeps the directory browsable.
+        let label: String = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "root".into())
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .take(24)
+            .collect();
+
+        Self::open_at(dir.join(format!("{vol_uuid}-{label}-{short}.sqlite")))
     }
 
     pub fn open_at(path: PathBuf) -> Result<Self> {

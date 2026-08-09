@@ -95,6 +95,47 @@ enum Cmd {
         #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
         root: PathBuf,
     },
+    /// Copy photos from a card into a dated library. The source is never modified.
+    Import {
+        /// Where the photos are now (a card, an inbox directory)
+        source: PathBuf,
+        /// Library root; files land in <library>/YYYY/MM/DD/
+        #[arg(long)]
+        library: PathBuf,
+        /// Show the plan without copying anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Report shots that appear more than once.
+    Dupes {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+    },
+    /// Move stacks to <library>/.trash/. Reversible; nothing is deleted.
+    Trash {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Put a trashed stack back where it came from.
+    Untrash {
+        /// Stack basename, as shown by `trash-list`
+        base: String,
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+    },
+    /// What is currently in the trash.
+    TrashList {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+    },
+    /// Permanently delete everything in the trash. The only real delete.
+    TrashEmpty {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Required. Without it this only reports what would go.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args, Clone)]
@@ -158,7 +199,7 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
 
 fn open_for(root: &Path) -> Result<Catalog> {
     let v = vol::identify(root)?;
-    Catalog::open_for_volume(&v.uuid)
+    Catalog::open_for(&v.uuid, root)
 }
 
 /// Apply changes, then immediately flush. Edits are useless sitting in the
@@ -292,8 +333,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let v = vol::identify(&root)?;
-            let cat = Catalog::open_for_volume(&v.uuid)?;
+            let cat = open_for(&root)?;
             let mut prepared = cat.conn.prepare(&stmt)?;
             let params: Vec<&dyn rusqlite::ToSql> = compiled
                 .params
@@ -343,8 +383,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Tags { root } => {
-            let v = vol::identify(&root)?;
-            let cat = Catalog::open_for_volume(&v.uuid)?;
+            let cat = open_for(&root)?;
             let mut stmt = cat.conn.prepare(
                 "SELECT t.name, COUNT(st.stack_id) AS n
                  FROM tag t LEFT JOIN stack_tag st ON st.tag_id = t.id
@@ -431,9 +470,168 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Import {
+            source,
+            library,
+            dry_run,
+        } => {
+            let config = npc::config::Config::load()?;
+            config.ensure_mutable(&library)?;
+            // Importing into a library that does not exist yet is the normal
+            // first run, and must not fail on volume resolution.
+            std::fs::create_dir_all(&library)
+                .with_context(|| format!("creating library {}", library.display()))?;
+            let mut cat = open_for(&library)?;
+
+            let plans = npc::import::plan(&cat, &source, &library)?;
+            let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
+            let fresh = plans.len() - dupes;
+
+            println!("import {} -> {}", source.display(), library.display());
+            println!("  stacks found      {}", plans.len());
+            println!("  already in library {dupes}");
+            println!("  to copy           {fresh}");
+
+            let mut by_day: std::collections::BTreeMap<String, usize> = Default::default();
+            for p in plans.iter().filter(|p| p.duplicate_of.is_none()) {
+                *by_day
+                    .entry(
+                        p.dest_dir
+                            .strip_prefix(&library)
+                            .unwrap_or(&p.dest_dir)
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                    .or_default() += 1;
+            }
+            for (day, n) in &by_day {
+                println!("    {day:<14} {n} stack(s)");
+            }
+
+            let stats = npc::import::execute(&plans, &config, dry_run)?;
+            if dry_run {
+                println!(
+                    "\ndry run: would copy {} files, {:.1} GB",
+                    stats.files_copied,
+                    stats.bytes_copied as f64 / 1e9
+                );
+            } else {
+                println!(
+                    "\ncopied {} stacks, {} files, {:.1} GB (source untouched)",
+                    stats.stacks_copied,
+                    stats.files_copied,
+                    stats.bytes_copied as f64 / 1e9
+                );
+                if stats.duplicates_skipped > 0 {
+                    println!("skipped {} duplicate(s)", stats.duplicates_skipped);
+                }
+                for e in &stats.errors {
+                    eprintln!("error: {e}");
+                }
+                let (s, _) = scan::scan_root(&library, false)?;
+                println!("catalog now holds {} stacks", s.stacks);
+            }
+        }
+
+        Cmd::Dupes { root } => {
+            let cat = open_for(&root)?;
+            let groups = npc::dupes::find(&cat)?;
+            if groups.is_empty() {
+                println!("no duplicates found");
+            }
+            for g in &groups {
+                println!("{}", g.reason);
+                for p in &g.paths {
+                    println!("    {p}");
+                }
+            }
+            if !groups.is_empty() {
+                println!("\n{} duplicate group(s)", groups.len());
+            }
+        }
+
+        Cmd::Trash { target } => {
+            let config = npc::config::Config::load()?;
+            let mut cat = open_for(&target.root)?;
+            let ids = resolve(&cat, &target)?;
+            if ids.is_empty() {
+                println!("nothing matched");
+                return Ok(());
+            }
+            if target.dry_run {
+                println!("would trash {} stack(s)", ids.len());
+                return Ok(());
+            }
+            let stats = npc::trash::trash(&mut cat, &target.root, &ids, &config)?;
+            println!(
+                "trashed {} stack(s), {} files -> {}/.trash/",
+                stats.stacks,
+                stats.files,
+                target.root.display()
+            );
+            println!("restore with `photo untrash <base>`; nothing was deleted");
+            for e in &stats.errors {
+                eprintln!("error: {e}");
+            }
+        }
+
+        Cmd::Untrash { base, root } => {
+            let config = npc::config::Config::load()?;
+            let mut cat = open_for(&root)?;
+            let entry = npc::trash::list(&cat)?
+                .into_iter()
+                .find(|e| e.base == base)
+                .ok_or_else(|| anyhow::anyhow!("`{base}` is not in the trash"))?;
+            let n = npc::trash::restore(&mut cat, entry.stack_id, &config)?;
+            println!("restored {base}: {n} files -> {}", entry.orig_dir);
+        }
+
+        Cmd::TrashList { root } => {
+            let cat = open_for(&root)?;
+            let entries = npc::trash::list(&cat)?;
+            if entries.is_empty() {
+                println!("trash is empty");
+            }
+            for e in &entries {
+                println!("{:<24} from {}", e.base, e.orig_dir);
+            }
+            if !entries.is_empty() {
+                println!("\n{} stack(s) in the trash", entries.len());
+            }
+        }
+
+        Cmd::TrashEmpty { root, yes } => {
+            let config = npc::config::Config::load()?;
+            let mut cat = open_for(&root)?;
+            let entries = npc::trash::list(&cat)?;
+            if entries.is_empty() {
+                println!("trash is empty");
+                return Ok(());
+            }
+            if !yes {
+                println!(
+                    "{} stack(s) would be permanently deleted:",
+                    entries.len()
+                );
+                for e in entries.iter().take(10) {
+                    println!("    {}", e.base);
+                }
+                if entries.len() > 10 {
+                    println!("    ... and {} more", entries.len() - 10);
+                }
+                println!("\nThis cannot be undone. Re-run with --yes to proceed.");
+                return Ok(());
+            }
+            let stats = npc::trash::empty(&mut cat, &config)?;
+            println!("deleted {} stack(s), {} files", stats.stacks, stats.files);
+            for e in &stats.errors {
+                eprintln!("error: {e}");
+            }
+        }
+
         Cmd::Status { root } => {
             let v = vol::identify(&root)?;
-            let cat = Catalog::open_for_volume(&v.uuid)?;
+            let cat = open_for(&root)?;
             println!("catalog {}", cat.path.display());
             println!("  volume  {}", v.uuid);
             println!("  stacks  {}", cat.stack_count()?);

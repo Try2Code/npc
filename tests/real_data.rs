@@ -211,7 +211,11 @@ fn the_duplicate_pair_is_found() {
     require_library!();
     let cat = scanned().unwrap();
     let groups = npc::dupes::find(&cat).unwrap();
-    assert_eq!(groups.len(), 1, "expected exactly one duplicate group: {groups:?}");
+    assert_eq!(
+        groups.len(),
+        1,
+        "expected exactly one duplicate group: {groups:?}"
+    );
     assert_eq!(groups[0].paths.len(), 2);
 }
 
@@ -235,7 +239,8 @@ fn real_exif_lands_in_the_catalog() {
     // eleven files or on forty thousand.
     let total = cat.file_count().unwrap();
     assert_eq!(
-        with_capture, total,
+        with_capture,
+        total,
         "{} of {total} files have no capture time; EXIF parsing regressed",
         total - with_capture
     );

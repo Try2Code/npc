@@ -1,0 +1,12 @@
+# Coverage shortcuts.
+#
+# main.rs and tests/ are excluded: main.rs is argument plumbing whose coverage
+# number says nothing useful, and measuring the tests themselves inflates the
+# figure without meaning anything.
+#
+# Note the C++ shim is invisible to this. Rust coverage cannot see across the
+# FFI boundary, so `meta` will read as covered while shim.cc is measured by
+# nothing here -- the invariant tests are what stand behind that file.
+[alias]
+cov = ["llvm-cov", "--release", "--html", "--output-dir", "target/coverage", "--ignore-filename-regex", "(main\\.rs|tests/)"]
+cov-summary = ["llvm-cov", "--release", "--summary-only", "--ignore-filename-regex", "(main\\.rs|tests/)"]

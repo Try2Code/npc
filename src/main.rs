@@ -110,6 +110,37 @@ enum Cmd {
     /// Report what this terminal can actually do. Run it inside the terminal
     /// you use for `photo tui`.
     Term,
+    /// Write resized copies into a directory outside the library.
+    Export {
+        /// Which stacks
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// Where the copies go. Must be outside the library.
+        #[arg(short = 'o', long)]
+        out: PathBuf,
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Long edge in pixels
+        #[arg(long, default_value_t = npc::export::DEFAULT_LONG_EDGE)]
+        size: u32,
+        /// JPEG quality, 1-100
+        #[arg(long, default_value_t = npc::export::DEFAULT_QUALITY)]
+        quality: u8,
+        /// Use a named preset from config.toml instead of the built-in resize
+        #[arg(long)]
+        preset: Option<String>,
+        /// Mirror YYYY/MM/DD under the target
+        #[arg(long)]
+        keep_structure: bool,
+        /// Do not carry tags and rating onto the copies
+        #[arg(long)]
+        strip: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// List the presets defined in config.toml and exit
+        #[arg(long)]
+        list_presets: bool,
+    },
     /// The browser.
     Tui {
         #[arg(default_value = "/home/ram/src/tasks/test-data")]
@@ -799,6 +830,97 @@ fn main() -> Result<()> {
                     println!("could not query the terminal: {e}");
                     println!("(this needs a real tty -- not a pipe or a pager)");
                 }
+            }
+        }
+
+        Cmd::Export {
+            query,
+            out,
+            root,
+            size,
+            quality,
+            preset,
+            keep_structure,
+            strip,
+            dry_run,
+            list_presets,
+        } => {
+            let available = npc::export::presets();
+            if list_presets {
+                println!("built-in: {}px long edge, quality {}, from the largest",
+                         npc::export::DEFAULT_LONG_EDGE, npc::export::DEFAULT_QUALITY);
+                println!("          embedded preview (full sensor resolution on a D750)");
+                if available.is_empty() {
+                    println!("\nno presets in {}", npc::config::Config::path().display());
+                    println!("add one like:\n");
+                    println!("  [[export]]");
+                    println!("  name = \"web\"");
+                    println!("  cmd  = [\"convert\", \"{{src}}\", \"-resize\", \"2000x2000>\", \"-quality\", \"95\", \"{{dst}}\"]");
+                } else {
+                    println!();
+                    for p in &available {
+                        println!("  {:<12} .{:<4} {}", p.name, p.ext, p.cmd.join(" "));
+                    }
+                }
+                return Ok(());
+            }
+
+            let chosen = match &preset {
+                Some(want) => Some(
+                    available
+                        .iter()
+                        .find(|p| &p.name == want)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no export preset named `{want}`; try --list-presets"
+                        ))?,
+                ),
+                None => None,
+            };
+
+            let config = npc::config::Config::load()?;
+            let cat = open_for(&root)?;
+            let target = Target {
+                query: query.clone(),
+                paths: Vec::new(),
+                root: root.clone(),
+                dry_run,
+            };
+            let ids = resolve(&cat, &target)?;
+            if ids.is_empty() {
+                println!("nothing matched");
+                return Ok(());
+            }
+
+            let opts = npc::export::Options {
+                long_edge: size,
+                quality,
+                keep_structure,
+                strip,
+                preset: chosen,
+                dry_run,
+            };
+            let started = std::time::Instant::now();
+            let stats = npc::export::export(&cat, &ids, &out, &root, &config, &opts)?;
+            let secs = started.elapsed().as_secs_f64();
+
+            println!(
+                "{} {} stack(s) -> {}",
+                if dry_run { "would export" } else { "exported" },
+                stats.written,
+                out.display()
+            );
+            match chosen {
+                Some(p) => println!("  preset    {}", p.name),
+                None => println!("  {}px long edge, quality {quality}", size),
+            }
+            if stats.skipped > 0 {
+                println!("  skipped   {} (no image member)", stats.skipped);
+            }
+            for e in stats.errors.iter().take(10) {
+                eprintln!("  error: {e}");
+            }
+            if !dry_run && stats.written > 0 {
+                println!("  took      {secs:.1}s");
             }
         }
 

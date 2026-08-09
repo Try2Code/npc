@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod dupes;
 pub mod edit;
+pub mod export;
 pub mod import;
 pub mod meta;
 pub mod query;

@@ -33,4 +33,9 @@ PreviewBlob extract_preview(rust::Str path, uint32_t min_dim);
 // keys in place, never constructs a fresh XmpData and never calls clear().
 void write_sidecar(rust::Str xmp_path, const SidecarDoc &doc);
 
+// Writes tags and rating into a JPEG this tool just created under an export
+// target. Never sees a library path: the Rust side proves the destination is
+// outside every library and protected root before calling.
+void stamp_export(rust::Str dest_path, const SidecarDoc &doc);
+
 } // namespace npc

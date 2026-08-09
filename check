@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Everything that has to pass before a change is trustworthy.
+#
+# There is no CI, deliberately: the tests that matter most depend on 40 GB of
+# the user's photographs and on this machine's exiv2 build. See PLAN.md. This
+# script is what stands in for it.
+#
+#   ./check            fmt, clippy, tests, tripwire
+#   ./check coverage   the above plus an HTML coverage report
+#   ./check quick      skip the slow real-library tests
+set -uo pipefail
+cd "$(dirname "$0")"
+export PATH="$HOME/.cargo/bin:$PATH"
+
+LIBRARY=${PHOTO_TEST_LIBRARY:-/home/ram/src/tasks/test-data}
+MODE=${1:-all}
+fail=0
+
+step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
+ok()   { printf '   \033[32mok\033[0m  %s\n' "$1"; }
+bad()  { printf '   \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+
+step "formatting"
+if cargo fmt --check >/dev/null 2>&1; then ok "rustfmt"; else
+  bad "rustfmt (run: cargo fmt)"
+fi
+
+step "lints"
+if cargo clippy --all-targets --quiet -- -D warnings 2>/tmp/clippy.log; then
+  ok "clippy"
+else
+  bad "clippy"; grep -E '^(error|warning)' /tmp/clippy.log | head -15
+fi
+
+step "tests"
+if [ "$MODE" = quick ]; then
+  cargo test --release --lib --test invariant && ok "unit + invariant" || bad "tests"
+else
+  cargo test --release && ok "full suite" || bad "tests"
+fi
+
+# The tripwire: the library must be byte-identical after everything above.
+# Scanning and thumbnailing are read-only operations, and this is what proves
+# it rather than asserting it.
+step "tripwire"
+if [ -d "$LIBRARY" ]; then
+  MANIFEST=.tripwire/library-stat.tsv
+  mkdir -p .tripwire
+  CURRENT=$(mktemp)
+  find "$LIBRARY" -type f \! -name '*.xmp' -printf '%s\t%T@\t%p\n' | sort -k3 > "$CURRENT"
+  if [ -f "$MANIFEST" ]; then
+    if diff -q "$MANIFEST" "$CURRENT" >/dev/null; then
+      ok "$(wc -l < "$CURRENT") originals unchanged"
+    else
+      bad "originals changed since the last run:"
+      diff "$MANIFEST" "$CURRENT" | head -10 | sed 's/^/      /'
+      echo "      (accept with: cp $CURRENT $MANIFEST)"
+    fi
+  else
+    cp "$CURRENT" "$MANIFEST"
+    ok "baseline recorded: $(wc -l < "$CURRENT") originals"
+  fi
+  rm -f "$CURRENT"
+else
+  printf '   skip  %s not present\n' "$LIBRARY"
+fi
+
+if [ "$MODE" = coverage ]; then
+  step "coverage"
+  if command -v cargo-llvm-cov >/dev/null; then
+    cargo llvm-cov --release --html --output-dir target/coverage \
+      --ignore-filename-regex '(main\.rs|tests/)' >/tmp/cov.log 2>&1
+    cargo llvm-cov --release --summary-only \
+      --ignore-filename-regex '(main\.rs|tests/)' 2>/dev/null | tail -25
+    ok "report: target/coverage/html/index.html"
+  else
+    bad "cargo-llvm-cov not installed (cargo install cargo-llvm-cov)"
+  fi
+fi
+
+printf '\n'
+[ $fail -eq 0 ] && printf '\033[32mall good\033[0m\n' || printf '\033[31msomething failed\033[0m\n'
+exit $fail

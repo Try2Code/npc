@@ -336,6 +336,34 @@ void write_sidecar(rust::Str xmp_path_, const SidecarDoc &doc) {
     out->writeMetadata(); // <-- the only writeMetadata() in this codebase
 }
 
+void stamp_export(rust::Str dest_path_, const SidecarDoc &doc) {
+    const std::string path = to_std(dest_path_);
+
+    auto image = Exiv2::ImageFactory::open(path);
+    if (image.get() == nullptr) {
+        throw std::runtime_error("cannot open export for stamping: " + path);
+    }
+    image->readMetadata();
+
+    Exiv2::XmpData xmp = image->xmpData();
+    erase_key(xmp, "Xmp.dc.subject");
+    if (!doc.tags.empty()) {
+        Exiv2::Value::AutoPtr v = Exiv2::Value::create(Exiv2::xmpBag);
+        for (const auto &t : doc.tags) v->read(std::string(t));
+        xmp.add(Exiv2::XmpKey("Xmp.dc.subject"), v.get());
+    }
+    erase_key(xmp, "Xmp.xmp.Rating");
+    if (doc.rating >= 0) xmp["Xmp.xmp.Rating"] = static_cast<int32_t>(doc.rating);
+    erase_key(xmp, "Xmp.dc.title");
+    if (!doc.title.empty()) set_lang_alt(xmp, "Xmp.dc.title", std::string(doc.title));
+    erase_key(xmp, "Xmp.dc.description");
+    if (!doc.description.empty())
+        set_lang_alt(xmp, "Xmp.dc.description", std::string(doc.description));
+
+    image->setXmpData(xmp);
+    image->writeMetadata();
+}
+
 PreviewBlob extract_preview(rust::Str path_, uint32_t min_dim) {
     const std::string path = to_std(path_);
     auto image = open_image(path); // read-only

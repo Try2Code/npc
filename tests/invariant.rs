@@ -138,11 +138,19 @@ fn preserves_foreign_properties_written_by_other_applications() {
     assert_eq!(back.tags, vec!["beach".to_string()]);
 }
 
-/// A source-level audit, cheap enough to run every time. If `writeMetadata()`
-/// ever appears outside the guarded function, this fails -- which is the point
-/// of confining all of Exiv2 to one file.
+/// A source-level audit, cheap enough to run every time. Exactly two calls to
+/// `writeMetadata()` may exist, both in shim.cc:
+///
+///   write_sidecar  -- refuses any path not ending in `.xmp`
+///   stamp_export   -- writes only to a copy this tool just created, under a
+///                     target proved to be outside every library and protected
+///                     root (see export::check_target)
+///
+/// Neither can reach an original. A third would need the same argument made
+/// for it, which is what this count is for -- it fails until someone justifies
+/// the addition rather than sliding it in.
 #[test]
-fn writemetadata_appears_only_inside_the_guarded_writer() {
+fn writemetadata_appears_only_inside_the_guarded_writers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let mut offenders = Vec::new();
@@ -177,8 +185,9 @@ fn writemetadata_appears_only_inside_the_guarded_writer() {
         "writeMetadata() called outside src/meta/shim.cc: {offenders:?}"
     );
     assert_eq!(
-        total, 1,
-        "expected exactly one writeMetadata() call in the codebase, found {total}. \
-         Every additional one is a path that could reach an original file."
+        total, 2,
+        "expected exactly two writeMetadata() calls (write_sidecar and \
+         stamp_export), found {total}. Every additional one is a path that \
+         could reach an original file, and needs justifying here."
     );
 }

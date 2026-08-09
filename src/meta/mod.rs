@@ -75,6 +75,7 @@ pub mod ffi {
         fn extract_preview(path: &str, min_dim: u32) -> Result<PreviewBlob>;
 
         fn write_sidecar(xmp_path: &str, doc: &SidecarDoc) -> Result<()>;
+        fn stamp_export(dest_path: &str, doc: &SidecarDoc) -> Result<()>;
     }
 }
 
@@ -112,7 +113,16 @@ pub fn extract_preview(path: &str, min_dim: u32) -> anyhow::Result<PreviewBlob> 
     guarded!(ffi::extract_preview(path, min_dim).map_err(|e| anyhow::anyhow!("{path}: {e}")))
 }
 
-/// The only write in the program. Refuses any path not ending in `.xmp`.
+/// The only write to a path beside your photographs. Refuses anything not
+/// ending in `.xmp`.
 pub fn write_sidecar(xmp_path: &str, doc: &SidecarDoc) -> anyhow::Result<()> {
     guarded!(ffi::write_sidecar(xmp_path, doc).map_err(|e| anyhow::anyhow!("{xmp_path}: {e}")))
+}
+
+/// Stamp metadata onto an exported copy. The caller must already have proved
+/// the destination is outside every library and protected root -- see
+/// `export::check_target`. This never touches an original, because the file it
+/// writes to is one this tool created moments earlier.
+pub fn stamp_export(dest_path: &str, doc: &SidecarDoc) -> anyhow::Result<()> {
+    guarded!(ffi::stamp_export(dest_path, doc).map_err(|e| anyhow::anyhow!("{dest_path}: {e}")))
 }

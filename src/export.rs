@@ -1,0 +1,349 @@
+//! Exporting copies.
+//!
+//! Two routes. The built-in one resizes and re-encodes in process: 2000 px on
+//! the long edge at quality 95, from the best pixels available. Anything else
+//! is a named preset in config that shells out, so `convert` and friends can
+//! do what they are better at than I would be.
+//!
+//! Export only ever *creates* files under the target directory, and refuses if
+//! that target resolves inside a library or a protected root. The write
+//! invariant is about originals; a copy this tool just made is not one.
+
+use crate::config::Config;
+use crate::db::Catalog;
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// The default: full quality, web-sized.
+pub const DEFAULT_LONG_EDGE: u32 = 2000;
+pub const DEFAULT_QUALITY: u8 = 95;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Preset {
+    pub name: String,
+    /// argv, with `{src}` and `{dst}` placeholders. Built directly, never
+    /// through a shell -- same rule as actions, for the same reason.
+    pub cmd: Vec<String>,
+    /// Output extension, so `{dst}` is named sensibly. Defaults to jpg.
+    #[serde(default = "default_ext")]
+    pub ext: String,
+}
+
+fn default_ext() -> String {
+    "jpg".into()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PresetConfig {
+    #[serde(default, rename = "export")]
+    pub presets: Vec<Preset>,
+}
+
+pub fn presets() -> Vec<Preset> {
+    std::fs::read_to_string(Config::path())
+        .ok()
+        .and_then(|t| toml::from_str::<PresetConfig>(&t).ok())
+        .map(|c| c.presets)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Default)]
+pub struct ExportStats {
+    pub written: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Where a stack's pixels come from when exporting.
+///
+/// The RAW's largest embedded preview is full sensor resolution on a D750
+/// (6016x4016), so it is the best source available without developing the
+/// RAW. What it is not is a developed RAW: it carries the camera's picture
+/// control and white balance. Anything where the development matters wants
+/// `rawtherapee-cli`, which is what the shell-out presets are for.
+fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<(PathBuf, bool, u16, String)>> {
+    let row = cat.conn.query_row(
+        "SELECT s.dir || '/' || f.name, f.role, s.base,
+                COALESCE(s.orientation, f.exif_orientation, 1)
+         FROM file f JOIN stack s ON s.id = f.stack_id
+         WHERE f.stack_id = ?1 AND f.present = 1 AND f.role IN ('raw','oocjpg','derived')
+         ORDER BY CASE f.role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END
+         LIMIT 1",
+        [stack_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    );
+    match row {
+        Ok((path, role, base, orient)) => {
+            Ok(Some((PathBuf::from(path), role == "raw", orient as u16, base)))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuse to export into a library. Writing copies next to originals is how a
+/// library grows files nobody meant to keep, and the resized copy would be
+/// picked up by the next scan as though it were a shot.
+pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()> {
+    config.ensure_mutable(target)?;
+
+    let t = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
+    let l = library.canonicalize().unwrap_or_else(|_| library.to_path_buf());
+    if t.starts_with(&l) {
+        bail!(
+            "refusing to export into {} -- it is inside the library at {}.\n\
+             The copies would be scanned back in as though they were shots.",
+            target.display(),
+            library.display()
+        );
+    }
+    Ok(())
+}
+
+pub struct Options<'a> {
+    pub long_edge: u32,
+    pub quality: u8,
+    pub keep_structure: bool,
+    pub strip: bool,
+    pub preset: Option<&'a Preset>,
+    pub dry_run: bool,
+}
+
+pub fn export(
+    cat: &Catalog,
+    stack_ids: &[i64],
+    target: &Path,
+    library: &Path,
+    config: &Config,
+    opts: &Options,
+) -> Result<ExportStats> {
+    check_target(target, library, config)?;
+    let mut stats = ExportStats::default();
+
+    for &sid in stack_ids {
+        let Some((src, embedded, orientation, base)) = source_for(cat, sid)? else {
+            stats.skipped += 1;
+            continue;
+        };
+
+        let ext = opts.preset.map(|p| p.ext.as_str()).unwrap_or("jpg");
+        let dir = if opts.keep_structure {
+            let stack_dir: String = cat
+                .conn
+                .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))?;
+            let rel = Path::new(&stack_dir)
+                .strip_prefix(library)
+                .unwrap_or(Path::new(""));
+            target.join(rel)
+        } else {
+            target.to_path_buf()
+        };
+        let dst = dir.join(format!("{base}.{ext}"));
+
+        if opts.dry_run {
+            stats.written += 1;
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            stats.errors.push(format!("{}: {e}", dir.display()));
+            continue;
+        }
+
+        let result = match opts.preset {
+            Some(p) => run_preset(p, &src, &dst),
+            None => render(&src, embedded, orientation, &dst, opts),
+        };
+
+        match result {
+            Ok(()) => {
+                if !opts.strip && opts.preset.is_none() {
+                    if let Err(e) = stamp(cat, sid, &dst) {
+                        stats.errors.push(format!("{}: {e}", dst.display()));
+                    }
+                }
+                stats.written += 1;
+            }
+            Err(e) => stats.errors.push(format!("{}: {e}", src.display())),
+        }
+    }
+
+    Ok(stats)
+}
+
+/// The built-in path: decode, downscale, re-encode.
+fn render(
+    src: &Path,
+    embedded: bool,
+    orientation: u16,
+    dst: &Path,
+    opts: &Options,
+) -> Result<()> {
+    let bytes = if embedded {
+        // Ask for more than any tier holds, so Exiv2 yields its largest --
+        // full sensor resolution on a D750.
+        let blob = crate::meta::extract_preview(&src.to_string_lossy(), u32::MAX / 2)?;
+        if !blob.ok {
+            bail!("{}", blob.error);
+        }
+        blob.data
+    } else {
+        std::fs::read(src)?
+    };
+
+    let img = image::load_from_memory(&bytes)
+        .with_context(|| format!("decoding {}", src.display()))?;
+
+    let long = img.width().max(img.height());
+    let img = if long > opts.long_edge {
+        let scale = opts.long_edge as f32 / long as f32;
+        img.resize(
+            (img.width() as f32 * scale).round().max(1.0) as u32,
+            (img.height() as f32 * scale).round().max(1.0) as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let img = crate::thumbs::apply_orientation(img, orientation);
+
+    let part = dst.with_extension("part");
+    {
+        let file = std::fs::File::create(&part)?;
+        let mut w = std::io::BufWriter::new(file);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, opts.quality);
+        let rgb = img.to_rgb8();
+        enc.encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )?;
+    }
+    std::fs::rename(&part, dst)?;
+    Ok(())
+}
+
+/// A configured command. argv is built directly; `{src}` and `{dst}` are
+/// whole arguments, so a filename cannot alter the command.
+fn run_preset(preset: &Preset, src: &Path, dst: &Path) -> Result<()> {
+    let argv: Vec<String> = preset
+        .cmd
+        .iter()
+        .map(|part| match part.as_str() {
+            "{src}" => src.to_string_lossy().to_string(),
+            "{dst}" => dst.to_string_lossy().to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    if argv.is_empty() {
+        bail!("preset `{}` has an empty command", preset.name);
+    }
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .with_context(|| format!("running {}", argv[0]))?;
+    if !status.success() {
+        bail!("preset `{}` exited with {status}", preset.name);
+    }
+    if !dst.exists() {
+        bail!("preset `{}` produced no output", preset.name);
+    }
+    Ok(())
+}
+
+/// Carry tags and rating onto the copy. Writes to a file this tool created
+/// outside the library, which is why it does not go through `write_sidecar`.
+fn stamp(cat: &Catalog, stack_id: i64, dst: &Path) -> Result<()> {
+    let doc = crate::edit::build_doc(cat, stack_id)?;
+    if doc.tags.is_empty() && doc.rating < 0 && doc.title.is_empty() {
+        return Ok(());
+    }
+    crate::meta::stamp_export(&dst.to_string_lossy(), &doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exporting_into_the_library_is_refused() {
+        let lib = tempfile::tempdir().unwrap();
+        let inside = lib.path().join("exports");
+        let outside = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+
+        assert!(check_target(&inside, lib.path(), &cfg).is_err());
+        assert!(check_target(lib.path(), lib.path(), &cfg).is_err());
+        assert!(check_target(outside.path(), lib.path(), &cfg).is_ok());
+    }
+
+    #[test]
+    fn exporting_into_a_protected_root_is_refused() {
+        let lib = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            protected_roots: vec![target.path().to_path_buf()],
+            ..Default::default()
+        };
+        assert!(check_target(target.path(), lib.path(), &cfg).is_err());
+    }
+
+    #[test]
+    fn presets_parse_from_config() {
+        let cfg: PresetConfig = toml::from_str(
+            r#"
+            [[export]]
+            name = "web"
+            cmd = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
+
+            [[export]]
+            name = "tiff"
+            cmd = ["convert", "{src}", "{dst}"]
+            ext = "tif"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.presets.len(), 2);
+        assert_eq!(cfg.presets[0].ext, "jpg", "ext should default to jpg");
+        assert_eq!(cfg.presets[1].ext, "tif");
+    }
+
+    /// Same rule as actions: a filename that looks like shell syntax is one
+    /// argument, not a command.
+    #[test]
+    fn preset_arguments_are_not_shell_interpreted() {
+        let preset = Preset {
+            name: "t".into(),
+            cmd: vec!["echo".into(), "{src}".into(), "-q".into(), "{dst}".into()],
+            ext: "jpg".into(),
+        };
+        let src = PathBuf::from(r#"/lib/DSC 01'23"; rm -rf x.NEF"#);
+        let dst = PathBuf::from("/out/a.jpg");
+        let argv: Vec<String> = preset
+            .cmd
+            .iter()
+            .map(|p| match p.as_str() {
+                "{src}" => src.to_string_lossy().to_string(),
+                "{dst}" => dst.to_string_lossy().to_string(),
+                o => o.to_string(),
+            })
+            .collect();
+        assert_eq!(argv.len(), 4);
+        assert_eq!(argv[1], src.to_string_lossy());
+    }
+
+    #[test]
+    fn the_documented_defaults_are_what_was_asked_for() {
+        assert_eq!(DEFAULT_LONG_EDGE, 2000);
+        assert_eq!(DEFAULT_QUALITY, 95);
+    }
+}

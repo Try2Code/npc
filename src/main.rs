@@ -35,6 +35,36 @@ enum Cmd {
     Volume { path: PathBuf },
     /// Catalog summary.
     Status { root: PathBuf },
+    /// Select stacks with the query language. See `photo find --help-syntax`.
+    Find {
+        /// e.g. "beach and rating>=4", "year=2026 camera~D750 -private"
+        #[arg(default_value = "")]
+        query: String,
+        /// Which library to search
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+        /// Print every file of each matching stack rather than the stack
+        #[arg(long)]
+        files: bool,
+        /// NUL-separated output, for `xargs -0`
+        #[arg(long)]
+        print0: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print the compiled SQL instead of running it
+        #[arg(long)]
+        explain: bool,
+    },
+    /// List tags with counts.
+    Tags {
+        #[arg(long, default_value = "/home/ram/src/tasks/test-data")]
+        root: PathBuf,
+    },
+}
+
+fn stars(rating: Option<i64>) -> String {
+    let n = rating.unwrap_or(0).clamp(0, 5) as usize;
+    format!("{}{}", "*".repeat(n), " ".repeat(5 - n))
 }
 
 fn main() -> Result<()> {
@@ -111,6 +141,96 @@ fn main() -> Result<()> {
             }
             let rate = stats.files_seen as f64 / elapsed.as_secs_f64().max(1e-9);
             println!("  took        {:.2}s  ({rate:.0} files/s)", elapsed.as_secs_f64());
+        }
+
+        Cmd::Find {
+            query,
+            root,
+            files,
+            print0,
+            limit,
+            explain,
+        } => {
+            let compiled = npc::query::compile(&query)?;
+            let stmt = compiled.select_stacks(limit);
+
+            if explain {
+                println!("{stmt}");
+                println!("\n-- parameters:");
+                for (i, p) in compiled.params.iter().enumerate() {
+                    println!("--   ?{} = {:?}", i + 1, p);
+                }
+                return Ok(());
+            }
+
+            let v = vol::identify(&root)?;
+            let cat = Catalog::open_for_volume(&v.uuid)?;
+            let mut prepared = cat.conn.prepare(&stmt)?;
+            let params: Vec<&dyn rusqlite::ToSql> = compiled
+                .params
+                .iter()
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
+
+            let rows: Vec<(i64, String, String, Option<i64>, i64, i64, Option<i64>)> = prepared
+                .query_map(params.as_slice(), |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+
+            let sep = if print0 { '\0' } else { '\n' };
+
+            for (id, dir, base, rating, flag, reject, _captured) in &rows {
+                if files {
+                    let mut fq = cat.conn.prepare(
+                        "SELECT name FROM file WHERE stack_id = ?1 AND present = 1 ORDER BY role, name",
+                    )?;
+                    for name in fq.query_map([id], |r| r.get::<_, String>(0))? {
+                        print!("{dir}/{}{sep}", name?);
+                    }
+                } else if print0 {
+                    print!("{dir}/{base}{sep}");
+                } else {
+                    let marks = format!(
+                        "{}{}",
+                        if *flag == 1 { "F" } else { " " },
+                        if *reject == 1 { "X" } else { " " }
+                    );
+                    println!("{} {marks}  {dir}/{base}", stars(*rating));
+                }
+            }
+
+            if !print0 && !files {
+                eprintln!("\n{} stack(s)", rows.len());
+            }
+        }
+
+        Cmd::Tags { root } => {
+            let v = vol::identify(&root)?;
+            let cat = Catalog::open_for_volume(&v.uuid)?;
+            let mut stmt = cat.conn.prepare(
+                "SELECT t.name, COUNT(st.stack_id) AS n
+                 FROM tag t LEFT JOIN stack_tag st ON st.tag_id = t.id
+                 GROUP BY t.id ORDER BY n DESC, t.name",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut any = false;
+            for row in rows {
+                let (name, n) = row?;
+                println!("{n:>6}  {name}");
+                any = true;
+            }
+            if !any {
+                println!("no tags yet (tagging arrives in M2)");
+            }
         }
 
         Cmd::Status { root } => {

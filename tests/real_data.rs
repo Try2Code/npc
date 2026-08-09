@@ -6,9 +6,9 @@
 //! preview pyramids, or the orientation tag that decides half the UI.
 //!
 //! **The set is deliberately minimal**: 11 files, 98 MB, chosen so every
-//! property under test is present exactly once. The full 41 GB library is 428x
-//! larger and asserts nothing extra. Point `NPC_TEST_LIBRARY` at it to run
-//! these against the whole thing.
+//! property under test is present exactly once. Fetch it with
+//! `./fetch-test-data`; point `NPC_TEST_LIBRARY` at a larger library to run
+//! the property tests against that instead.
 //!
 //! What each file is here for:
 //!
@@ -41,10 +41,17 @@ const EXPECTED_DERIVED: i64 = 2;
 const EXPECTED_ORPHANS: i64 = 0;
 const EXPECTED_EVENTS: usize = 2;
 
+/// Where the test photographs live: `./testdata`, fetched by
+/// `./fetch-test-data`, or wherever `NPC_TEST_LIBRARY` points.
+///
+/// Deliberately not a path on anyone's machine. The data is 98 MB of RAW and
+/// too large for git, so a fresh clone has none and these tests skip until it
+/// is fetched.
 fn library_path() -> PathBuf {
-    std::env::var_os("NPC_TEST_LIBRARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/ram/src/tasks/test-data-min"))
+    if let Some(p) = std::env::var_os("NPC_TEST_LIBRARY") {
+        return PathBuf::from(p);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata")
 }
 
 /// True when running against the set these counts were computed from.
@@ -76,7 +83,11 @@ macro_rules! require_library {
         match library() {
             Some(p) => p,
             None => {
-                eprintln!("skipping: {} not present", library_path().display());
+                eprintln!(
+                    "skipping: no test photographs at {}\n\
+                     run ./fetch-test-data (98 MB), or set NPC_TEST_LIBRARY",
+                    library_path().display()
+                );
                 return;
             }
         }

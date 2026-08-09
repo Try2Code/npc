@@ -96,15 +96,16 @@ The suite runs against **real photographs**, not fixtures. Maker notes,
 preview pyramids and orientation tags are exactly what fixtures lack, and each
 has caused a bug here.
 
-- Default: a deliberately minimal set — 11 files, ~98 MB — in which every
-  property under test appears exactly once. `tests/real_data.rs` documents
-  what each file is for. Its ground truth was computed in shell over the
-  files, not read out of the code.
+- **`./fetch-test-data`** downloads them into `./testdata` — 11 files, 98 MB,
+  checksum-verified before extraction. Every property under test appears
+  exactly once; `tests/real_data.rs` documents what each file is for. Ground
+  truth was computed in shell over the files, not read out of the code.
 - `NPC_TEST_LIBRARY=<path>` runs the property tests against a larger library.
   The exact-count tests skip themselves there, because those numbers are
   ground truth for one directory and mean nothing anywhere else.
-- The data is **not in the repository**. A fresh clone has none, and the
-  real-data tests skip with a message rather than failing.
+- The data is **not in the repository**, being 98 MB of RAW. A fresh clone has
+  none, and the real-data tests skip with a message telling you how to get
+  them rather than failing.
 
 ## Working practice
 

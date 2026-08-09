@@ -308,10 +308,17 @@ sidecars, then destroys metadata in the field.
 ## Development
 
 ```
+./fetch-test-data    the test photographs (98 MB, once)
 ./check              fmt, clippy, tests, and a tripwire proving the library is unchanged
 ./check coverage     + HTML coverage report
 ./check fuzz         + the fuzz targets
 ```
+
+The suite runs against real camera files rather than fixtures: maker notes,
+preview pyramids and orientation tags are exactly what fixtures lack, and each
+has caused a bug here. They are too large for git, so they are fetched once and
+verified by checksum. Without them the 165 other tests still run and the
+real-data ones skip.
 
 See `CLAUDE.md` for design decisions worth not re-deriving, and `PLAN.md` for
 the original design plus a record of where it turned out to be wrong.

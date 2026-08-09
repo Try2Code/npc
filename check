@@ -13,7 +13,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-LIBRARY=${NPC_TEST_LIBRARY:-/home/ram/src/tasks/test-data-min}
+LIBRARY=${NPC_TEST_LIBRARY:-$PWD/testdata}
 MODE=${1:-all}
 fail=0
 
@@ -67,7 +67,7 @@ if [ -d "$LIBRARY" ]; then
   fi
   rm -f "$CURRENT"
 else
-  printf '   skip  %s not present\n' "$LIBRARY"
+  printf '   skip  no test photographs at %s (run ./fetch-test-data)\n' "$LIBRARY"
 fi
 
 if [ "$MODE" = fuzz ]; then

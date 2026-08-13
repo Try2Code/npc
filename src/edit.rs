@@ -68,7 +68,7 @@ pub fn apply(
             "refusing to edit {} stack(s): {} {} inside a protected root.\n\
              Nothing was changed. Protected roots live in {}.",
             stack_ids.len(),
-            blocked.first().map(String::as_str).unwrap_or(""),
+            blocked.first().map_or("", String::as_str),
             if blocked.len() > 1 {
                 format!("and {} other directories are", blocked.len() - 1)
             } else {
@@ -124,14 +124,14 @@ pub fn apply(
                         tx.execute(
                             "UPDATE stack SET flag = ?2, reject = CASE WHEN ?2 = 1 THEN 0 ELSE reject END
                              WHERE id = ?1",
-                            params![sid, *v as i64],
+                            params![sid, i64::from(*v)],
                         )?;
                     }
                     Change::SetReject(v) => {
                         tx.execute(
                             "UPDATE stack SET reject = ?2, flag = CASE WHEN ?2 = 1 THEN 0 ELSE flag END
                              WHERE id = ?1",
-                            params![sid, *v as i64],
+                            params![sid, i64::from(*v)],
                         )?;
                     }
                     Change::SetTitle(t) => {
@@ -146,7 +146,7 @@ pub fn apply(
                     Change::SetOrientation(o) => {
                         tx.execute(
                             "UPDATE stack SET orientation = ?2 WHERE id = ?1",
-                            params![sid, *o as i64],
+                            params![sid, i64::from(*o)],
                         )?;
                     }
                 }
@@ -192,13 +192,10 @@ pub fn flush(cat: &mut Catalog, config: &Config) -> Result<EditStats> {
         let doc = build_doc(cat, sid)?;
         match meta::write_sidecar(sidecar.to_str().unwrap_or_default(), &doc) {
             Ok(()) => {
-                let mtime = std::fs::metadata(&sidecar)
-                    .ok()
-                    .map(|m| {
-                        use std::os::unix::fs::MetadataExt;
-                        m.mtime() * 1_000_000_000 + m.mtime_nsec()
-                    })
-                    .unwrap_or(0);
+                let mtime = std::fs::metadata(&sidecar).ok().map_or(0, |m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.mtime() * 1_000_000_000 + m.mtime_nsec()
+                });
                 cat.conn.execute(
                     "UPDATE stack SET dirty = 0, sidecar_mtime = ?2 WHERE id = ?1",
                     params![sid, mtime],
@@ -259,11 +256,13 @@ pub fn build_doc(cat: &Catalog, stack_id: i64) -> Result<SidecarDoc> {
     Ok(SidecarDoc {
         exists: true,
         tags,
-        rating: rating.unwrap_or(-1) as i32,
+        // A catalog value outside the valid range means the row is corrupt, and
+        // the right answer is the neutral default rather than a wrapped one.
+        rating: i32::try_from(rating.unwrap_or(-1)).unwrap_or(-1),
         label,
         title: title.unwrap_or_default(),
         description: description.unwrap_or_default(),
-        orientation: orientation.unwrap_or(0) as u16,
+        orientation: u16::try_from(orientation.unwrap_or(0)).unwrap_or(0),
     })
 }
 
@@ -290,7 +289,7 @@ pub fn ingest_sidecar(cat: &mut Catalog, stack_id: i64, sidecar: &Path) -> Resul
         params![
             stack_id,
             if doc.rating >= 0 {
-                Some(doc.rating as i64)
+                Some(i64::from(doc.rating))
             } else {
                 None
             },
@@ -298,7 +297,7 @@ pub fn ingest_sidecar(cat: &mut Catalog, stack_id: i64, sidecar: &Path) -> Resul
             reject,
             (!doc.title.is_empty()).then_some(doc.title.clone()),
             (!doc.description.is_empty()).then_some(doc.description.clone()),
-            (doc.orientation > 0).then_some(doc.orientation as i64),
+            (doc.orientation > 0).then_some(i64::from(doc.orientation)),
         ],
     )?;
     tx.execute(

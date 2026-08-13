@@ -89,7 +89,7 @@ pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> 
         check_undated(cat)?,
         check_duplicates(cat)?,
         check_actions(),
-        check_cache(root)?,
+        check_cache(root),
         check_protection(root, config),
     ])
 }
@@ -121,7 +121,7 @@ fn check_modified_originals(cat: &Catalog) -> Result<Finding> {
         match std::fs::metadata(&path) {
             Ok(md) => {
                 let now_mtime = md.mtime() * 1_000_000_000 + md.mtime_nsec();
-                if md.size() as i64 != size || now_mtime != mtime {
+                if i64::try_from(md.size()).unwrap_or(i64::MAX) != size || now_mtime != mtime {
                     changed.push(format!("{path}  ({} -> {} bytes)", size, md.size()));
                 }
             }
@@ -276,9 +276,9 @@ fn check_actions() -> Finding {
     ))
 }
 
-fn check_cache(root: &Path) -> Result<Finding> {
+fn check_cache(root: &Path) -> Finding {
     let Ok(vol) = crate::vol::identify(root) else {
-        return Ok(Finding::note("cache not checked (volume unresolved)"));
+        return Finding::note("cache not checked (volume unresolved)");
     };
     let dir = crate::config::Config::load()
         .unwrap_or_default()
@@ -286,8 +286,8 @@ fn check_cache(root: &Path) -> Result<Finding> {
         .join(&vol.uuid);
 
     if !dir.exists() {
-        return Ok(Finding::note("no thumbnail cache yet")
-            .fix("Built on demand, or all at once with `npc thumbs`."));
+        return Finding::note("no thumbnail cache yet")
+            .fix("Built on demand, or all at once with `npc thumbs`.");
     }
     let (mut files, mut bytes) = (0u64, 0u64);
     for e in walkdir::WalkDir::new(&dir)
@@ -296,14 +296,14 @@ fn check_cache(root: &Path) -> Result<Finding> {
     {
         if e.file_type().is_file() {
             files += 1;
-            bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            bytes += e.metadata().map_or(0, |m| m.len());
         }
     }
-    Ok(Finding::fine(format!(
+    Finding::fine(format!(
         "thumbnail cache: {files} files, {:.0} MB",
         bytes as f64 / 1e6
     ))
-    .fix("`npc thumbs --prune` removes entries nothing asks for any more."))
+    .fix("`npc thumbs --prune` removes entries nothing asks for any more.")
 }
 
 fn check_protection(root: &Path, config: &Config) -> Finding {
@@ -427,7 +427,7 @@ mod tests {
         let (dir, cat) = library();
 
         let open = run(&cat, dir.path(), &Config::default()).unwrap();
-        assert!(find(&open, "no protected roots").severity == Severity::Note);
+        assert_eq!(find(&open, "no protected roots").severity, Severity::Note);
 
         let guarded = Config {
             protected_roots: vec![dir.path().to_path_buf()],

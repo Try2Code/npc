@@ -11,7 +11,7 @@ use std::path::Path;
 fn doc_with_tags(tags: &[&str]) -> SidecarDoc {
     SidecarDoc {
         exists: true,
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: tags.iter().map(std::string::ToString::to_string).collect(),
         rating: -1,
         label: String::new(),
         title: String::new(),
@@ -163,14 +163,13 @@ fn writemetadata_appears_only_inside_the_guarded_writers() {
         if !entry.file_type().is_file() {
             continue;
         }
-        let text = match fs::read_to_string(entry.path()) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
         };
         for (i, line) in text.lines().enumerate() {
             // Skip comments -- the header documents the rule and would match.
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+            if trimmed.starts_with("//") || trimmed.starts_with('*') {
                 continue;
             }
             if line.contains("writeMetadata()") {
@@ -193,4 +192,95 @@ fn writemetadata_appears_only_inside_the_guarded_writers() {
          stamp_export), found {total}. Every additional one is a path that \
          could reach an original file, and needs justifying here."
     );
+}
+
+/// A second source-level audit, in the same spirit as the count above: every
+/// argument this tool advertises in `--help` must actually be consulted.
+///
+/// This exists because `--read-only` did not. It was declared global, defaulted
+/// to `true`, and told every subcommand's `--help` that it would "fail any
+/// mutating operation at dispatch" -- while nothing ever read it. Anyone
+/// checking `npc scan --help` would conclude their originals were protected at
+/// dispatch. They were not. The real guarantees are the shim's `.xmp` assertion
+/// and `protected_roots`, both of which work; the flag was decoration over
+/// them.
+///
+/// No clippy lint catches this, which is why it is a test. clap's derived
+/// `Parser` impl both writes and reads the field, so `dead_code` never fires --
+/// the deadness is behavioural, not lexical, and only a reader who asks "does
+/// anything consult this?" can see it.
+#[test]
+fn every_declared_cli_flag_is_actually_read() {
+    let main_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let text = fs::read_to_string(&main_rs).expect("reading src/main.rs");
+
+    let code_lines = || {
+        text.lines().filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with('*')
+        })
+    };
+
+    // Field names carrying an `#[arg(...)]` attribute: exactly the flags and
+    // positionals clap puts in front of the user.
+    let mut declared: Vec<(String, usize)> = Vec::new();
+    let mut pending = false;
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') {
+            continue;
+        }
+        if t.starts_with("#[arg") {
+            pending = true;
+            continue;
+        }
+        if t.starts_with('#') {
+            continue; // some other attribute; the field is still coming
+        }
+        if pending {
+            if let Some(name) = field_name(t) {
+                declared.push((name, i + 1));
+            }
+            pending = false;
+        }
+    }
+
+    assert!(
+        !declared.is_empty(),
+        "no #[arg] fields found at all -- this audit has stopped working, \
+         which is worse than it failing"
+    );
+
+    // An identifier occurring once occurs only in its own declaration, so
+    // nothing anywhere consults the parsed value.
+    let dead: Vec<String> = declared
+        .iter()
+        .filter(|(name, _)| code_lines().map(|l| idents(l, name)).sum::<usize>() < 2)
+        .map(|(name, line)| format!("{name} (src/main.rs:{line})"))
+        .collect();
+
+    assert!(
+        dead.is_empty(),
+        "these arguments are declared, and advertised in --help, but never \
+         read: {dead:?}. Consult the value or remove the argument -- a flag \
+         promising behaviour it does not deliver is worse than no flag."
+    );
+}
+
+/// `name: Type,` -> `name`. `None` for anything that is not a field.
+fn field_name(line: &str) -> Option<String> {
+    let name = line.split_once(':')?.0.trim();
+    let plausible = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    plausible.then(|| name.to_string())
+}
+
+/// Occurrences of `needle` in `line` as a whole identifier, so `root` does not
+/// match inside `protected_roots`.
+fn idents(line: &str, needle: &str) -> usize {
+    line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|tok| *tok == needle)
+        .count()
 }

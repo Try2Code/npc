@@ -92,10 +92,10 @@ pub fn classify(filename: &str) -> Option<Classified> {
 
     if JPG_EXTS.contains(&ext) {
         let stripped = strip_derived(stem);
-        let role = if stripped.len() != stem.len() {
-            Role::Derived
-        } else {
+        let role = if stripped.len() == stem.len() {
             Role::OocJpg
+        } else {
+            Role::Derived
         };
         return Some(Classified {
             base: stripped.to_string(),

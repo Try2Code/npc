@@ -101,8 +101,7 @@ fn on_path(program: &str) -> bool {
         return std::path::Path::new(program).exists();
     }
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-        .unwrap_or(false)
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// What a placeholder expands to, gathered from the catalog.
@@ -284,7 +283,7 @@ mod tests {
         Action {
             key: "r".into(),
             name: "test".into(),
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            cmd: cmd.iter().map(std::string::ToString::to_string).collect(),
             mode: Mode::Detach,
             shell: false,
         }
@@ -292,9 +291,9 @@ mod tests {
 
     fn selection(files: &[&str]) -> Selection {
         Selection {
-            all_files: files.iter().map(|s| s.to_string()).collect(),
-            raws: files.iter().map(|s| s.to_string()).collect(),
-            current: files.first().map(|s| s.to_string()),
+            all_files: files.iter().map(std::string::ToString::to_string).collect(),
+            raws: files.iter().map(std::string::ToString::to_string).collect(),
+            current: files.first().map(std::string::ToString::to_string),
             ..Default::default()
         }
     }

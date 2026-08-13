@@ -6,13 +6,31 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(name = "npc", about = "Terminal photo catalog", version)]
 struct Cli {
-    /// Fail any mutating operation at dispatch. Defaults on until the write
-    /// path is verified end to end; see PLAN.md.
-    #[arg(long, global = true, default_value_t = true)]
-    read_only: bool,
-
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// The library root, accepted either positionally or as `--root`.
+///
+/// `scan`, `status` and `tui` took a bare positional while every other
+/// subcommand took `--root`, so `npc scan --root <path>` failed with an
+/// unknown-flag error -- including when that is exactly what the tool had just
+/// advised in `library()` below. Accepting both keeps the short positional form
+/// and makes the flag uniform across the CLI.
+#[derive(clap::Args)]
+struct RootArg {
+    /// Library root
+    #[arg(value_name = "ROOT")]
+    positional: Option<PathBuf>,
+    /// Library root, for symmetry with the other subcommands
+    #[arg(long = "root", value_name = "PATH", conflicts_with = "positional")]
+    flag: Option<PathBuf>,
+}
+
+impl RootArg {
+    fn get(&self) -> Option<PathBuf> {
+        self.flag.clone().or_else(|| self.positional.clone())
+    }
 }
 
 #[derive(Subcommand)]
@@ -26,7 +44,8 @@ enum Cmd {
     },
     /// Walk a library into the catalog. Read-only with respect to your files.
     Scan {
-        root: Option<PathBuf>,
+        #[command(flatten)]
+        root: RootArg,
         /// Reparse every file rather than trusting size+mtime
         #[arg(long)]
         full: bool,
@@ -34,7 +53,10 @@ enum Cmd {
     /// Report which volume a path lives on, and where its catalog would go.
     Volume { path: PathBuf },
     /// Catalog summary.
-    Status { root: Option<PathBuf> },
+    Status {
+        #[command(flatten)]
+        root: RootArg,
+    },
     /// Select stacks with the query language. See `npc find --help-syntax`.
     Find {
         /// e.g. "beach and rating>=4", "year=2026 camera~D750 -private"
@@ -171,7 +193,10 @@ enum Cmd {
         shell: clap_complete::Shell,
     },
     /// The browser.
-    Tui { root: Option<PathBuf> },
+    Tui {
+        #[command(flatten)]
+        root: RootArg,
+    },
     /// Write every pending edit out to its sidecar.
     Sync {
         #[arg(long)]
@@ -300,9 +325,9 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
 ///
 /// Deliberately errors rather than defaulting to the current directory --
 /// scanning whatever happens to be underfoot is not a helpful guess.
-fn library(explicit: &Option<PathBuf>) -> Result<PathBuf> {
+fn library(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(r) = explicit {
-        return Ok(r.clone());
+        return Ok(r.to_path_buf());
     }
     if let Some(r) = npc::config::Config::load()
         .unwrap_or_default()
@@ -348,9 +373,9 @@ fn require_online(root: &Path) -> Result<Catalog> {
 
 /// Apply changes, then immediately flush. Edits are useless sitting in the
 /// catalog: the files on disk are the source of truth.
-fn edit_and_flush(t: &Target, changes: Vec<npc::edit::Change>, verb: &str) -> Result<()> {
+fn edit_and_flush(t: &Target, changes: &[npc::edit::Change], verb: &str) -> Result<()> {
     let config = npc::config::Config::load()?;
-    let root = library(&t.root)?;
+    let root = library(t.root.as_deref())?;
     let mut cat = open_for(&root)?;
     let ids = resolve(&cat, t)?;
 
@@ -363,7 +388,7 @@ fn edit_and_flush(t: &Target, changes: Vec<npc::edit::Change>, verb: &str) -> Re
         return Ok(());
     }
 
-    npc::edit::apply(&mut cat, &ids, &changes, &config)?;
+    npc::edit::apply(&mut cat, &ids, changes, &config)?;
     let stats = npc::edit::flush(&mut cat, &config)?;
 
     println!("{verb} {} stack(s)", ids.len());
@@ -378,7 +403,7 @@ fn edit_and_flush(t: &Target, changes: Vec<npc::edit::Change>, verb: &str) -> Re
 }
 
 fn stars(rating: Option<i64>) -> String {
-    let n = rating.unwrap_or(0).clamp(0, 5) as usize;
+    let n = usize::try_from(rating.unwrap_or(0).clamp(0, 5)).unwrap_or(0);
     format!("{}{}", "*".repeat(n), " ".repeat(5 - n))
 }
 
@@ -437,7 +462,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Scan { root, full } => {
-            let root = library(&root)?;
+            let root = library(root.get().as_deref())?;
             let started = std::time::Instant::now();
             let (stats, cat) = scan::scan_root(&root, full)?;
             let elapsed = started.elapsed();
@@ -449,6 +474,12 @@ fn main() -> Result<()> {
             println!("  parsed      {}", stats.parsed);
             println!("  unchanged   {}", stats.unchanged);
             println!("  orphans     {}", stats.orphans);
+            if stats.seeded_from_embedded > 0 {
+                println!(
+                    "  seeded      {} stack(s) from embedded rating/tags (run `npc sync` to write sidecars)",
+                    stats.seeded_from_embedded
+                );
+            }
             if stats.vanished > 0 {
                 println!(
                     "  vanished    {} (marked absent, tags kept)",
@@ -496,7 +527,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             let mut prepared = cat.conn.prepare(&stmt)?;
@@ -506,7 +537,11 @@ fn main() -> Result<()> {
                 .map(|p| p as &dyn rusqlite::ToSql)
                 .collect();
 
-            /// id, dir, base, rating, flag, reject, captured
+            // id, dir, base, rating, flag, reject, captured
+            #[allow(
+                clippy::items_after_statements,
+                reason = "the alias documents the row shape where it is read"
+            )]
             type FoundStack = (i64, String, String, Option<i64>, i64, i64, Option<i64>);
             let rows: Vec<FoundStack> = prepared
                 .query_map(params.as_slice(), |r| {
@@ -550,7 +585,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Tags { root } => {
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             let mut stmt = cat.conn.prepare(
@@ -586,7 +621,7 @@ fn main() -> Result<()> {
                 "rm" | "remove" => npc::edit::Change::RemoveTags(list),
                 other => anyhow::bail!("unknown tag action `{other}`; use `add` or `rm`"),
             };
-            edit_and_flush(&target, vec![change], &format!("tag {action}"))?;
+            edit_and_flush(&target, &[change], &format!("tag {action}"))?;
         }
 
         Cmd::Rate { value, target } => {
@@ -597,7 +632,7 @@ fn main() -> Result<()> {
                 anyhow::ensure!((0..=5).contains(&n), "rating must be between 0 and 5");
                 Some(n)
             };
-            edit_and_flush(&target, vec![npc::edit::Change::SetRating(rating)], "rated")?;
+            edit_and_flush(&target, &[npc::edit::Change::SetRating(rating)], "rated")?;
         }
 
         Cmd::Mark { state, target } => {
@@ -610,7 +645,7 @@ fn main() -> Result<()> {
                 ],
                 other => anyhow::bail!("unknown state `{other}`; use flag, reject or clear"),
             };
-            edit_and_flush(&target, changes, &format!("marked {state}"))?;
+            edit_and_flush(&target, &changes, &format!("marked {state}"))?;
         }
 
         Cmd::Set {
@@ -623,7 +658,7 @@ fn main() -> Result<()> {
                 "description" | "desc" => npc::edit::Change::SetDescription(value),
                 other => anyhow::bail!("unknown field `{other}`; use title or description"),
             };
-            edit_and_flush(&target, vec![change], &format!("set {field} on"))?;
+            edit_and_flush(&target, &[change], &format!("set {field} on"))?;
         }
 
         Cmd::Rotate { direction, target } => {
@@ -640,7 +675,7 @@ fn main() -> Result<()> {
             };
             edit_and_flush(
                 &target,
-                vec![npc::edit::Change::SetOrientation(value)],
+                &[npc::edit::Change::SetOrientation(value)],
                 &format!("rotated {direction}"),
             )?;
             println!(
@@ -676,7 +711,7 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no action `{action}`; try `npc exec --list`"))?;
 
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             let target = Target {
@@ -724,7 +759,7 @@ fn main() -> Result<()> {
 
         Cmd::Sync { root } => {
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let mut cat = open_for(&root)?;
             let stats = npc::edit::flush(&mut cat, &config)?;
@@ -759,7 +794,8 @@ fn main() -> Result<()> {
             println!("  already in library {dupes}");
             println!("  to copy           {fresh}");
 
-            let mut by_day: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut by_day: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::default();
             for p in plans.iter().filter(|p| p.duplicate_of.is_none()) {
                 *by_day
                     .entry(
@@ -801,7 +837,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Events { root, name } => {
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
 
@@ -844,16 +880,16 @@ fn main() -> Result<()> {
                 println!("{id:>4}  {day}  {n:>6} stacks   {name}");
                 any = true;
             }
-            if !any {
-                println!("no events yet; run `npc scan` first");
-            } else {
+            if any {
                 println!("\nname one with: npc events --name <id> \"<name>\"");
+            } else {
+                println!("no events yet; run `npc scan` first");
             }
         }
 
         Cmd::Doctor { root, strict } => {
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             println!("{}\n", cat.path.display());
@@ -900,7 +936,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::Dupes { root } => {
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             let groups = npc::dupes::find(&cat)?;
@@ -920,7 +956,7 @@ fn main() -> Result<()> {
 
         Cmd::Trash { target } => {
             let config = npc::config::Config::load()?;
-            let root = library(&target.root)?;
+            let root = library(target.root.as_deref())?;
             let mut cat = require_online(&root)?;
             let ids = resolve(&cat, &target)?;
             if ids.is_empty() {
@@ -946,7 +982,7 @@ fn main() -> Result<()> {
 
         Cmd::Untrash { base, root } => {
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let mut cat = open_for(&root)?;
             let entry = npc::trash::list(&cat)?
@@ -958,7 +994,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::TrashList { root } => {
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = open_for(&root)?;
             let entries = npc::trash::list(&cat)?;
@@ -975,7 +1011,7 @@ fn main() -> Result<()> {
 
         Cmd::TrashEmpty { root, yes } => {
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let mut cat = open_for(&root)?;
             let entries = npc::trash::list(&cat)?;
@@ -1013,7 +1049,7 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unknown size `{other}`; use grid or view"),
             };
             // Generating needs the originals; pruning does not.
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let (cat, online) = open_checked(&root)?;
             let uuid: String = cat
@@ -1092,14 +1128,14 @@ fn main() -> Result<()> {
                     if let Ok((cols, rows)) = crossterm::terminal::size() {
                         println!(
                             "terminal          {cols}x{rows} cells = {}x{} px",
-                            cols as u32 * cw as u32,
-                            rows as u32 * ch as u32
+                            u32::from(cols) * u32::from(cw),
+                            u32::from(rows) * u32::from(ch)
                         );
                         println!();
                         println!(
                             "a 5-across grid gives tiles of about {}x{} px",
-                            (cols as u32 / 5) * cw as u32,
-                            ((rows as u32).saturating_sub(3) / 3) * ch as u32
+                            (u32::from(cols) / 5) * u32::from(cw),
+                            (u32::from(rows).saturating_sub(3) / 3) * u32::from(ch)
                         );
                     }
                     match picker.protocol_type() {
@@ -1165,7 +1201,7 @@ fn main() -> Result<()> {
             };
 
             let config = npc::config::Config::load()?;
-            let root = library(&root)?;
+            let root = library(root.as_deref())?;
 
             let cat = require_online(&root)?;
             let target = Target {
@@ -1200,7 +1236,7 @@ fn main() -> Result<()> {
             );
             match chosen {
                 Some(p) => println!("  preset    {}", p.name),
-                None => println!("  {}px long edge, quality {quality}", size),
+                None => println!("  {size}px long edge, quality {quality}"),
             }
             if stats.skipped > 0 {
                 println!("  skipped   {} (no image member)", stats.skipped);
@@ -1220,10 +1256,10 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Cmd::Tui { root } => npc::tui::run(library(&root)?)?,
+        Cmd::Tui { root } => npc::tui::run(library(root.get().as_deref())?)?,
 
         Cmd::Status { root } => {
-            let root = library(&root)?;
+            let root = library(root.get().as_deref())?;
 
             let (cat, online) = open_checked(&root)?;
             println!("catalog {}", cat.path.display());

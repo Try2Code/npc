@@ -37,3 +37,33 @@ walkdir = "2"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Lint level lives here rather than only in `check`, so `cargo build`, `cargo
+# test` and your editor all enforce the same bar. `check` adds `-D warnings`,
+# which promotes everything below to an error there.
+#
+# The allows are triaged, not blanket: each one is a lint whose value does not
+# survive contact with this crate. Anything not listed is expected to be fixed
+# rather than silenced -- and a site-local `#[allow]` should carry a reason.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# A binary crate with one consumer. Documenting the error type of every internal
+# `Result` and marking every getter `#[must_use]` is ceremony that would bury the
+# comments that do carry weight.
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+
+# The prose here is deliberate and frequently names things that are not code:
+# camera models, file extensions, RawTherapee. Backticking them all reads worse.
+doc_markdown = "allow"
+
+# Every occurrence is an integer widened to f64 to print a human-readable rate
+# or size -- "1790 files in 23s" and "98 MB". Losing precision past 2^53 files
+# is not a failure mode this program has.
+cast_precision_loss = "allow"
+
+# The largest functions are the TUI event loop and the scan pipeline, both of
+# which are a long flat sequence of cases. Splitting them to satisfy a line
+# count would scatter one readable narrative across a dozen helpers.
+too_many_lines = "allow"

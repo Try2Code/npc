@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Run the fast checks before every commit.
+#
+# This project's own record is the argument for it: twice, a commit was made
+# before reading test output, and both times the tests were failing and right.
+# `./check` has always had fmt, clippy and the suite -- what it lacked was
+# anything making them run when someone was in a hurry.
+#
+# `quick` mode deliberately: fmt, clippy, unit and invariant tests, a few
+# seconds. The real-data suite needs 98 MB of photographs and belongs in a full
+# `./check` before reporting work as done, not in the path of every commit.
+#
+# Enable with:
+#     git config core.hooksPath .githooks
+#
+# Bypass for a genuinely trivial commit with `git commit --no-verify`. If you
+# find yourself doing that habitually, the hook is too slow -- fix the hook.
+
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if [ ! -x ./check ]; then
+    echo "pre-commit: ./check is missing or not executable" >&2
+    echo "            (the executable bit is easy to lose -- chmod +x check)" >&2
+    exit 1
+fi
+
+if ! ./check quick; then
+    echo >&2
+    echo "pre-commit: checks failed, commit refused." >&2
+    echo "            Read the output above before working around this." >&2
+    exit 1
+fi

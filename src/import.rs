@@ -73,7 +73,7 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(c) = classify(&name) else { continue };
         let dir = entry.path().parent().unwrap_or(source).to_path_buf();
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = entry.metadata().map_or(0, |m| m.len());
         groups
             .entry((dir, c.base))
             .or_default()
@@ -292,7 +292,7 @@ fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), String>> {
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)? as u32,
+            u32::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
             r.get::<_, String>(2)?,
         ))
     })?;
@@ -321,8 +321,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    // `d` is a day of month (1-31) and `m` a month (1-12) by construction of
+    // Howard Hinnant's civil_from_days, whatever the input day number. Neither
+    // can be negative or exceed u32, so these conversions cannot fail.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "day-of-month and month are 1-31 and 1-12 by construction"
+    )]
+    let (d, m) = (
+        (doy - (153 * mp + 2) / 5 + 1) as u32,
+        if mp < 10 { mp + 3 } else { mp - 9 } as u32,
+    );
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
@@ -370,7 +380,7 @@ mod tests {
     fn civil_conversion_round_trips() {
         for days in [0i64, 1, 19_000, 20_674, -1, -365] {
             let (y, m, d) = civil_from_days(days);
-            let back = crate::query::days_from_civil_pub(y, m as i64, d as i64);
+            let back = crate::query::days_from_civil_pub(y, i64::from(m), i64::from(d));
             assert_eq!(back, days, "round trip failed for {days}");
         }
     }
@@ -384,7 +394,7 @@ mod tests {
         std::fs::write(&src, &data).unwrap();
 
         let n = copy_verified(&src, &dest).unwrap();
-        assert_eq!(n as usize, data.len());
+        assert_eq!(n, data.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), data);
         assert_eq!(std::fs::read(&src).unwrap(), data, "source was modified");
 
@@ -406,7 +416,12 @@ mod tests {
             (PathBuf::from("/card/750_0001.NEF"), Role::Raw, 3),
             (PathBuf::from("/card/750_0001.JPG"), Role::OocJpg, 3),
         ];
-        let chosen = free_base(dir.path(), "750_0001", &members, &Default::default());
+        let chosen = free_base(
+            dir.path(),
+            "750_0001",
+            &members,
+            &std::collections::HashSet::default(),
+        );
         assert_eq!(chosen, "750_0001_1");
     }
 
@@ -415,7 +430,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let members = vec![(PathBuf::from("/card/750_0002.NEF"), Role::Raw, 3)];
         assert_eq!(
-            free_base(dir.path(), "750_0002", &members, &Default::default()),
+            free_base(
+                dir.path(),
+                "750_0002",
+                &members,
+                &std::collections::HashSet::default()
+            ),
             "750_0002"
         );
     }
@@ -431,7 +451,7 @@ mod safety_tests {
     fn card() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (name, fill) in [("750_0001.NEF", 0xA5u8), ("750_0001.JPG", 0x5A)] {
-            let data: Vec<u8> = (0..200_000).map(|i| fill ^ (i % 251) as u8).collect();
+            let data: Vec<u8> = (0..200_000u32).map(|i| fill ^ (i % 251) as u8).collect();
             std::fs::write(dir.path().join(name), data).unwrap();
         }
         dir

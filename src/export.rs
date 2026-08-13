@@ -9,6 +9,15 @@
 //! that target resolves inside a library or a protected root. The write
 //! invariant is about originals; a copy this tool just made is not one.
 
+// Same reasoning as `thumbs`: resizing is arithmetic between `u32` pixel
+// dimensions, `f32` ratios and `usize` buffer lengths, and none of these images
+// approach the widths where a cast would lose anything.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::config::Config;
 use crate::db::Catalog;
 use anyhow::{bail, Context, Result};
@@ -144,7 +153,7 @@ pub fn export(
             continue;
         };
 
-        let ext = opts.preset.map(|p| p.ext.as_str()).unwrap_or("jpg");
+        let ext = opts.preset.map_or("jpg", |p| p.ext.as_str());
         let dir = if opts.keep_structure {
             let stack_dir: String =
                 cat.conn

@@ -173,8 +173,7 @@ fn tokenize(input: &str) -> Result<Vec<Tok>> {
         if c == '-' && i + 1 < chars.len() && !chars[i + 1].is_whitespace() {
             let starts_term = out
                 .last()
-                .map(|t| matches!(t, Tok::LParen | Tok::And | Tok::Or | Tok::Not))
-                .unwrap_or(true);
+                .is_none_or(|t| matches!(t, Tok::LParen | Tok::And | Tok::Or | Tok::Not));
             if starts_term {
                 out.push(Tok::Not);
                 i += 1;
@@ -317,7 +316,7 @@ impl Parser {
                     self.pos += 1;
                 }
                 // Adjacency implies AND: `beach anna` == `beach and anna`.
-                Some(Tok::Word(_)) | Some(Tok::Pred(..)) | Some(Tok::LParen) | Some(Tok::Not) => {}
+                Some(Tok::Word(_) | Tok::Pred(..) | Tok::LParen | Tok::Not) => {}
                 _ => break,
             }
             let right = self.parse_unary()?;
@@ -348,7 +347,7 @@ impl Parser {
             }
             Some(Tok::Word(w)) => {
                 self.pos += 1;
-                self.bare_word(&w)
+                Ok(self.bare_word(&w))
             }
             Some(Tok::Pred(k, op, v)) => {
                 self.pos += 1;
@@ -360,8 +359,8 @@ impl Parser {
     }
 
     /// A bareword is a flag if it names one, otherwise a tag.
-    fn bare_word(&mut self, w: &str) -> Result<String> {
-        Ok(match w.to_ascii_lowercase().as_str() {
+    fn bare_word(&mut self, w: &str) -> String {
+        match w.to_ascii_lowercase().as_str() {
             "untagged" => "NOT EXISTS (SELECT 1 FROM stack_tag st WHERE st.stack_id = s.id)".into(),
             "tagged" => "EXISTS (SELECT 1 FROM stack_tag st WHERE st.stack_id = s.id)".into(),
             "flagged" => "s.flag = 1".into(),
@@ -372,7 +371,7 @@ impl Parser {
                 "NOT EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.present = 1)".into()
             }
             _ => self.tag_match(w),
-        })
+        }
     }
 
     /// Tags are hierarchical: `beach` matches `beach` and `beach/sunset`, so a
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn rating_comparisons() {
         assert!(sql("rating>=4").contains(">="));
-        assert!(sql("rating=0").contains("="));
+        assert!(sql("rating=0").contains('='));
         assert_eq!(params("rating>=4")[0], Value::Integer(4));
         assert!(compile("rating>=x").is_err());
     }
@@ -709,7 +708,7 @@ mod tests {
     /// statement. A tag is data even when it looks like SQL.
     #[test]
     fn values_are_never_interpolated_into_sql() {
-        let hostile = r#"'; DROP TABLE stack; --"#;
+        let hostile = r"'; DROP TABLE stack; --";
         let c = compile(&format!("tag:\"{hostile}\"")).unwrap();
 
         assert!(

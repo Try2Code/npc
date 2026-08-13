@@ -58,7 +58,7 @@ pub struct Config {
     pub protected_roots: Vec<PathBuf>,
     #[serde(default)]
     pub thumbs: Thumbs,
-    /// The library this tool works on when `--root` is not given.
+    /// The library this tool works on when no root is given on the command line.
     ///
     /// Without it every command would need an explicit path, and hardcoding
     /// one makes the binary useless on any other machine -- which is exactly
@@ -86,8 +86,7 @@ impl Config {
             return expand_home(dir);
         }
         directories::ProjectDirs::from("", "", "npc")
-            .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".npc"))
+            .map_or_else(|| PathBuf::from(".npc"), |d| d.data_dir().to_path_buf())
     }
 
     /// Where thumbnails are kept, under the same directory when one is
@@ -97,9 +96,10 @@ impl Config {
         if let Some(dir) = &self.catalog_dir {
             return expand_home(dir).join("thumbnails");
         }
-        directories::ProjectDirs::from("", "", "npc")
-            .map(|d| d.cache_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".npc-cache"))
+        directories::ProjectDirs::from("", "", "npc").map_or_else(
+            || PathBuf::from(".npc-cache"),
+            |d| d.cache_dir().to_path_buf(),
+        )
     }
 }
 
@@ -116,9 +116,10 @@ fn expand_home(path: &Path) -> PathBuf {
 
 impl Config {
     pub fn path() -> PathBuf {
-        directories::ProjectDirs::from("", "", "npc")
-            .map(|d| d.config_dir().join("config.toml"))
-            .unwrap_or_else(|| PathBuf::from("npc.toml"))
+        directories::ProjectDirs::from("", "", "npc").map_or_else(
+            || PathBuf::from("npc.toml"),
+            |d| d.config_dir().join("config.toml"),
+        )
     }
 
     pub fn load() -> Result<Self> {

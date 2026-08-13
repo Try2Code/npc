@@ -98,9 +98,8 @@ fn by_content(cat: &Catalog) -> Result<Vec<DupeGroup>> {
         // Only now does anything get read off disk.
         let mut by_hash: HashMap<String, Vec<String>> = HashMap::new();
         for p in paths {
-            match hash_file(Path::new(&p)) {
-                Ok(h) => by_hash.entry(h.to_hex().to_string()).or_default().push(p),
-                Err(_) => continue,
+            if let Ok(h) = hash_file(Path::new(&p)) {
+                by_hash.entry(h.to_hex().to_string()).or_default().push(p);
             }
         }
         for (hash, group) in by_hash {
@@ -193,7 +192,7 @@ mod tests {
                     rusqlite::params![
                         sid,
                         path.file_name().unwrap().to_str().unwrap(),
-                        std::fs::metadata(path).unwrap().len() as i64
+                        i64::try_from(std::fs::metadata(path).unwrap().len()).unwrap()
                     ],
                 )
                 .unwrap();

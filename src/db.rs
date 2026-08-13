@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 4;
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS volume (
     id        INTEGER PRIMARY KEY,
     vol_uuid  TEXT NOT NULL UNIQUE,
@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS file_capture  ON file(capture_time);
 CREATE INDEX IF NOT EXISTS file_dedupe   ON file(serial, shutter_count);
 CREATE INDEX IF NOT EXISTS file_stack    ON file(stack_id);
 CREATE INDEX IF NOT EXISTS stack_dir     ON stack(dir);
-"#;
+";
 
 #[derive(Debug)]
 pub struct Catalog {
@@ -135,8 +135,7 @@ impl Catalog {
         // A readable fragment of the path keeps the directory browsable.
         let label: String = canonical
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "root".into())
+            .map_or_else(|| "root".into(), |n| n.to_string_lossy().to_string())
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
             .take(24)
@@ -380,8 +379,7 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

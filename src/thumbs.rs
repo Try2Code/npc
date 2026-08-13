@@ -17,6 +17,17 @@
 //! with offline queries it means the library can be browsed visually with the
 //! drive unplugged.
 
+// Pixel dimensions are `u32`, aspect ratios are computed in `f32`, and buffer
+// lengths are `usize`. Resizing is that conversion, repeatedly. An image with a
+// dimension beyond `u32` is not one this decodes, so the truncation warned
+// about here cannot happen. Scoped to this module rather than the crate, so the
+// same cast in a data path still has to be justified.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::db::Catalog;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
@@ -155,7 +166,7 @@ impl Cache {
 
         let (tx, rx) = mpsc::channel::<(Source, Size, PathBuf)>();
         let (done_tx, done) = mpsc::channel::<PathBuf>();
-        let inflight: Arc<Mutex<std::collections::HashSet<PathBuf>>> = Default::default();
+        let inflight: Arc<Mutex<std::collections::HashSet<PathBuf>>> = Arc::default();
 
         // One worker. Decoding is the expensive half and it happens here,
         // off the UI thread, so scrolling never waits on a JPEG.
@@ -255,7 +266,7 @@ impl Cache {
             if keep.contains(&path) {
                 continue;
             }
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = entry.metadata().map_or(0, |m| m.len());
             if std::fs::remove_file(&path).is_ok() {
                 removed += 1;
                 bytes += size;
@@ -445,14 +456,22 @@ mod tests {
 
         let made = image::open(&out).unwrap();
         assert_eq!(made.width().max(made.height()), Size::Grid.px());
-        // 3:2 in, 3:2 out.
-        assert_eq!(
-            (made.width() as f32 / made.height() as f32 * 100.0).round(),
-            (1620.0 / 1080.0 * 100.0f32).round(),
-            "aspect ratio was not preserved: {}x{}",
-            made.width(),
-            made.height()
-        );
+        // 3:2 in, 3:2 out. Both sides are rounded to whole percent before
+        // comparing, which is exactly what makes an exact float comparison
+        // correct here rather than fragile.
+        #[allow(
+            clippy::float_cmp,
+            reason = "comparing two values already rounded to the same precision"
+        )]
+        {
+            assert_eq!(
+                (made.width() as f32 / made.height() as f32 * 100.0).round(),
+                (1620.0 / 1080.0 * 100.0f32).round(),
+                "aspect ratio was not preserved: {}x{}",
+                made.width(),
+                made.height()
+            );
+        }
     }
 
     #[test]

@@ -86,9 +86,8 @@ fn mount_for_dev(major: u32, minor: u32) -> Option<(PathBuf, Option<String>)> {
 
 fn mount_point_by_walking(path: &Path) -> PathBuf {
     let dev_of = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
-    let start = match dev_of(path) {
-        Some(d) => d,
-        None => return path.to_path_buf(),
+    let Some(start) = dev_of(path) else {
+        return path.to_path_buf();
     };
     let mut current = path.to_path_buf();
     while let Some(parent) = current.parent() {
@@ -112,7 +111,10 @@ fn lookup_in(dir: &str, device: &str) -> Option<String> {
     let target = Path::new(device).canonicalize().ok()?;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         if entry.path().canonicalize().ok().as_deref() == Some(target.as_path()) {
-            return entry.file_name().to_str().map(|s| s.to_string());
+            return entry
+                .file_name()
+                .to_str()
+                .map(std::string::ToString::to_string);
         }
     }
     None

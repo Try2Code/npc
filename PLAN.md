@@ -74,9 +74,10 @@ M5 is written against "nothing ever opens an original for writing", so the excep
 as a separately-tested carve-out rather than a hole present from the start.
 
 **`npc trash` is the one command that touches originals** — it *moves* them to `.trash/`.
-No bytes change, it's reversible via `npc restore`, it never runs automatically, and
-`--read-only` blocks it. Flagged here because it's the single exception to "this tool only
-ever reads your photos", even though it isn't an exception to "never changes them".
+No bytes change, it's reversible via `npc restore`, it never runs automatically, and a
+`protected_roots` entry blocks it. Flagged here because it's the single exception to "this
+tool only ever reads your photos", even though it isn't an exception to "never changes
+them".
 
 ---
 
@@ -503,7 +504,7 @@ npc trash --empty            the only real delete; counts and confirms
 A rename within one filesystem: atomic, instant, reversible. Every member moves together —
 sidecar, `_NEF_embedded.jpg`, and `.pp3` profile alongside the RAW and JPG — `.trash/` is
 excluded from scanning, and the `trashed` table remembers where each came from. This is the
-only command that relocates an original; `--read-only` blocks it.
+only command that relocates an original; a `protected_roots` entry blocks it.
 
 ## Query language
 
@@ -549,7 +550,7 @@ npc doctor             drift, orphan sidecars, pending writes, broken actions, c
                          and any original whose mtime changed behind our back
 npc tui                the browser
 
---read-only              global; fails any mutating operation at dispatch
+--root PATH              global; the library to act on, overriding the config
 ```
 
 `npc find --print0 | xargs -0` stays the escape hatch into your existing workflow.
@@ -686,7 +687,7 @@ tests stay local. Worth doing when a second machine or person is involved, not b
 
 | | |
 |---|---|
-| **M1** | The invariant first: `--read-only`, the shim's write assertion, and the hash-manifest tripwire, before anything can write. Then the bridge, `vol`, `db`, `scan`, `find`. Catalog builds, queries answer, nothing on the drive can change. |
+| **M1** | The invariant first: the shim's write assertion and the hash-manifest tripwire, before anything can write. Then the bridge, `vol`, `db`, `scan`, `find`. Catalog builds, queries answer, nothing on the drive can change. |
 | **M2** | Sidecar writes: tags, ratings, title, description, flag, reject, orientation. `sync`, offline queue. Round-trips to disk. |
 | **M3** | `import` + `dupes` + `trash`/`restore`. The commands that move files, with their safety tests. |
 | **M4** | TUI shell — list view, tag and date sidebars, query bar, tagging keys, actions. Usable daily without thumbnails. |
@@ -726,7 +727,7 @@ should be revisited -- releases are the use case that justifies it, not tests.
 
 ## What changed during the build
 
-The plan was mostly right. Four things were not, and are recorded here rather
+The plan was mostly right. Six things were not, and are recorded here rather
 than quietly corrected above:
 
 - **Stack count.** The plan asserted 1722; ground truth is 1790, because 68
@@ -740,6 +741,19 @@ than quietly corrected above:
 - **The offline path.** Written in M2, described here, and broken from the
   first line until the drive was physically unplugged in M6. Resolving a
   volume canonicalises the path, which cannot work when the path is gone.
+- **`--read-only` never existed.** Declared as a global flag defaulting to
+  `true`, documented on every subcommand's help as "fails any mutating
+  operation at dispatch", and never read once -- one occurrence of the
+  identifier in the whole codebase, the declaration. Removed rather than
+  wired up: honouring it as written would have refused every write out of the
+  box. No clippy lint catches this, because clap's derived `Parser` impl both
+  writes and reads the field, so the deadness is behavioural rather than
+  lexical. `tests/invariant.rs` now asserts that every declared flag is read,
+  in the same spirit as the `writeMetadata()` count.
+- **`--root` was not universal.** Fourteen subcommands took it; `scan`,
+  `status` and `tui` took a bare positional and rejected the flag -- including
+  when the tool's own error message had just advised it. Both forms are now
+  accepted everywhere.
 
 ## Milestones (continued)
 

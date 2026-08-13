@@ -186,7 +186,7 @@ cargo build --release          # target/release/npc
 `~/.config/npc/config.toml`:
 
 ```toml
-library = "~/Pictures"                      # default for --root
+library = "~/Pictures"                      # used when no root is given
 protected_roots = ["/media/me/Archive"]     # never written to, ever
 
 [thumbs]
@@ -246,6 +246,12 @@ tab / shift-tab      list -> grid -> single
 - +                  grid tiles across
 a                    actions         u     undo
 ```
+
+`g`/`G`/`Home`/`End` reach the true first/last of the whole result set, not
+just what's loaded — paging past a result set larger than one page (500
+stacks) turns the page automatically. Every text prompt (`/`, `t`, `T`, `i`)
+supports normal line editing: arrow keys, Home/End, and readline's
+`ctrl-a/e/b/f/k/u/w`.
 
 ## What it will not do
 
@@ -310,9 +316,17 @@ sidecars, then destroys metadata in the field.
 ```
 ./fetch-test-data    the test photographs (98 MB, once)
 ./check              fmt, clippy, tests, and a tripwire proving the library is unchanged
+./check quick        fmt, clippy, unit + invariant only -- seconds
 ./check coverage     + HTML coverage report
 ./check fuzz         + the fuzz targets
+
+git config core.hooksPath .githooks    run ./check quick before every commit
 ```
+
+The hook is opt-in per clone and versioned in `.githooks/` rather than hidden in
+`.git/hooks`, so it can be read and changed like anything else. Lint settings
+live in `[lints]` in `Cargo.toml`, so `cargo build` and your editor enforce the
+same bar the check script does.
 
 The suite runs against real camera files rather than fixtures: maker notes,
 preview pyramids and orientation tags are exactly what fixtures lack, and each

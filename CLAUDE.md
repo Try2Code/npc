@@ -40,6 +40,8 @@ If a change makes any of this harder to verify, the change is wrong.
 ./check fuzz         + 30s per fuzz target (needs nightly)
 ./check quick        skips the slow real-library tests
 
+git config core.hooksPath .githooks     <- runs `check quick` before each commit
+
 cargo build --release        binary at target/release/npc
 cargo cov-summary            coverage numbers only
 ```
@@ -47,7 +49,9 @@ cargo cov-summary            coverage numbers only
 If `~/.cargo/bin` is not on PATH, export it first. `check` must stay
 executable — rewriting it with a script drops the bit.
 
-The library to operate on comes from `library` in the config, or `--root`.
+The library to operate on comes from `library` in the config, or from the root
+given on the command line. Every subcommand accepts `--root`; `scan`, `status`
+and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
@@ -133,10 +137,18 @@ has caused a bug here.
 - **Miri and ASan have never been run** on the FFI boundary (`PLAN.md`
   verification item 7). That boundary is the risk this design introduced, and
   it is the one thing the plan said to test as such and then did not.
-- A **black-frame rendering bug** on two specific files is unconfirmed. The
-  thumbnail cache was proved clean by measurement; the fix — releasing
-  off-screen images every frame — remains a hypothesis. `r` re-sends images to
-  the terminal; if that clears it, the diagnosis was right.
+- A **black-frame rendering bug**, reproduced at real-library scale (92k
+  stacks), was diagnosed rather than left as a hypothesis: `r` (full cache
+  clear) reliably fixed it, confirming a stale kitty-protocol placement
+  rather than a bad thumbnail. Two concrete triggers were found and fixed —
+  `ensure_decoded_at` now forces a fresh decode whenever a path is drawn at a
+  new screen rect (ordinary scrolling reshuffles tile positions constantly),
+  and any terminal resize now clears the whole image cache (`App::on_resize`,
+  wired to `Event::Resize`), since a resize can invalidate the picker's
+  cell/font geometry. `r` still exists as a manual fallback. **Not yet
+  confirmed against a real kitty terminal** — that verification can't be
+  automated (a pty smoke test was tried and abandoned, see Testing notes
+  below) and is the one thing left to check by using the browser normally.
 - **Other applications write to originals.** Shotwell embeds ratings directly
   into JPGs, so anything sharing a library with this tool will disagree about
   ratings: Shotwell embeds, npc uses sidecars. `doctor` reports originals whose

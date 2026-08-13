@@ -9,6 +9,19 @@
 //! An in-session undo log means a mis-keyed bulk tag is reversible before it
 //! reaches the drive.
 
+// Terminal geometry is `u16` (ratatui's `Rect`), indices are `usize`, and
+// percentages are computed in between. Converting between them is what layout
+// code in this crate *is*, and a terminal is never 65535 columns wide, so the
+// truncation these lints warn about cannot occur. Annotating each of the forty
+// sites individually would bury the arithmetic it is meant to draw attention
+// to. The data paths -- scan, db, edit, import -- are deliberately not
+// exempted, so a cast there still has to be argued for.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::action::{self, Action};
 use crate::config::Config;
 use crate::db::Catalog;
@@ -25,6 +38,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui_image::picker::Picker;
 use ratatui_image::StatefulImage;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -77,6 +91,10 @@ struct UndoStep {
     prior: Vec<StackState>,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent UI modes, not a state machine that could be an enum"
+)]
 pub struct App {
     cat: Catalog,
     config: Config,
@@ -99,6 +117,9 @@ pub struct App {
 
     input: Input,
     buffer: String,
+    /// Char index (not byte index -- tags and titles may be non-ASCII) of
+    /// the edit cursor within `buffer`.
+    input_cursor: usize,
     status: String,
     show_help: bool,
     show_actions: bool,
@@ -110,6 +131,13 @@ pub struct App {
     /// Decoded images ready to draw, keyed by cache-file path. Bounded so a
     /// long scroll cannot grow without limit.
     images: HashMap<PathBuf, ratatui_image::protocol::StatefulProtocol>,
+    /// The screen rect each path was drawn at last frame. A kitty-protocol
+    /// placement is bound to a screen position; reusing a cached protocol
+    /// after its path moved to a new rect without telling the terminal is
+    /// what produced black tiles (confirmed: `r`, which force-clears
+    /// `images`, always fixed it). Comparing against this on every draw is
+    /// what lets that clearing happen automatically instead.
+    last_rect: HashMap<PathBuf, Rect>,
     picker: Option<Picker>,
     /// Which member of the stack the single view is showing.
     member: usize,
@@ -161,6 +189,7 @@ impl App {
             sidebar_focus: false,
             input: Input::None,
             buffer: String::new(),
+            input_cursor: 0,
             status: String::new(),
             show_help: false,
             show_actions: false,
@@ -169,6 +198,7 @@ impl App {
             view: View::List,
             cache: None,
             images: HashMap::new(),
+            last_rect: HashMap::new(),
             picker: None,
             member: 0,
             frame_used: HashSet::new(),
@@ -364,6 +394,37 @@ impl App {
         true
     }
 
+    /// Like `ensure_decoded`, but also forces a fresh decode-and-transmit
+    /// whenever `path` is about to be drawn at a different rect than it was
+    /// last frame -- the moment a stale kitty-protocol placement can occur.
+    /// Every call site that draws an image should go through this, not
+    /// `ensure_decoded` directly.
+    fn ensure_decoded_at(&mut self, path: &PathBuf, rect: Rect) -> bool {
+        if self.last_rect.get(path) != Some(&rect) {
+            self.images.remove(path);
+        }
+        self.last_rect.insert(path.clone(), rect);
+        self.ensure_decoded(path)
+    }
+
+    /// Drop every decoded image, forcing a fresh decode-and-transmit for
+    /// whatever is drawn next frame. Shared by the manual `r` key and by
+    /// `on_resize`. Returns how many were dropped, for the status line.
+    fn clear_images(&mut self) -> usize {
+        let dropped = self.images.len();
+        self.images.clear();
+        self.last_rect.clear();
+        dropped
+    }
+
+    /// A terminal resize can change the cell/font geometry a `StatefulProtocol`
+    /// was built against, so any cached protocol may no longer match what the
+    /// terminal now expects. Resizes are rare, so a full clear costs nothing
+    /// that matters.
+    fn on_resize(&mut self) {
+        self.clear_images();
+    }
+
     /// Queue thumbnails around the cursor so scrolling finds them ready.
     fn prefetch(&mut self, size: ThumbSize, span: usize) {
         let start = self.cursor.saturating_sub(span);
@@ -381,8 +442,7 @@ impl App {
         let members = self.current_members();
         let filename = members
             .get(self.member.min(members.len().saturating_sub(1)))
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| row.base.clone());
+            .map_or_else(|| row.base.clone(), |(name, _)| name.clone());
 
         let dir = std::path::Path::new(&row.dir)
             .strip_prefix(&self.root)
@@ -488,7 +548,7 @@ impl App {
         Ok(out)
     }
 
-    fn edit(&mut self, changes: Vec<Change>, label: &str) -> Result<()> {
+    fn edit(&mut self, changes: &[Change], label: &str) -> Result<()> {
         let ids = self.targets();
         if ids.is_empty() {
             self.status = "nothing selected".into();
@@ -496,7 +556,7 @@ impl App {
         }
         let prior = self.snapshot(&ids)?;
 
-        match edit::apply(&mut self.cat, &ids, &changes, &self.config) {
+        match edit::apply(&mut self.cat, &ids, changes, &self.config) {
             Ok(_) => {}
             Err(e) => {
                 self.status = format!("refused: {e}");
@@ -571,30 +631,30 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('a') => self.show_actions = true,
 
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-            KeyCode::PageDown => self.move_cursor(self.page_size as isize),
-            KeyCode::PageUp => self.move_cursor(-(self.page_size as isize)),
+            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1)?,
+            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1)?,
+            KeyCode::PageDown => self.move_cursor(self.page_size as isize)?,
+            KeyCode::PageUp => self.move_cursor(-(self.page_size as isize))?,
             // Half a screen, the vi convention.
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_cursor((self.page_size / 2).max(1) as isize)
+                self.move_cursor((self.page_size / 2).max(1) as isize)?;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_cursor(-((self.page_size / 2).max(1) as isize))
+                self.move_cursor(-((self.page_size / 2).max(1) as isize))?;
             }
-            KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => self.cursor = self.rows.len().saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.jump_to_first()?,
+            KeyCode::Char('G') | KeyCode::End => self.jump_to_last()?,
 
             KeyCode::Char(' ') => {
                 if let Some(r) = self.rows.get(self.cursor) {
                     if !self.selected.insert(r.id) {
                         self.selected.remove(&r.id);
                     }
-                    self.move_cursor(1);
+                    self.move_cursor(1)?;
                 }
             }
-            KeyCode::Char('v') => match self.anchor.take() {
-                Some(start) => {
+            KeyCode::Char('v') => {
+                if let Some(start) = self.anchor.take() {
                     let (a, b) = if start <= self.cursor {
                         (start, self.cursor)
                     } else {
@@ -604,12 +664,11 @@ impl App {
                         self.selected.insert(r.id);
                     }
                     self.status = format!("{} selected", self.selected.len());
-                }
-                None => {
+                } else {
                     self.anchor = Some(self.cursor);
                     self.status = "range start; press v again to close".into();
                 }
-            },
+            }
             // Esc zooms out of the single view, pairing with Enter zooming in.
             // Elsewhere it clears the selection, which is what it is for when
             // there is nothing to back out of.
@@ -627,29 +686,33 @@ impl App {
             KeyCode::Char('/') => {
                 self.input = Input::Query;
                 self.buffer = self.query.clone();
+                self.input_cursor = self.buffer.chars().count();
             }
             KeyCode::Char('t') => {
                 self.input = Input::AddTag;
                 self.buffer.clear();
+                self.input_cursor = 0;
             }
             KeyCode::Char('T') => {
                 self.input = Input::RemoveTag;
                 self.buffer.clear();
+                self.input_cursor = 0;
             }
             KeyCode::Char('i') => {
                 self.input = Input::Title;
                 self.buffer.clear();
+                self.input_cursor = 0;
             }
 
             KeyCode::Char(c @ '0'..='5') => {
-                let n = c.to_digit(10).unwrap() as i64;
+                let n = i64::from(c.to_digit(10).unwrap());
                 let value = if n == 0 { None } else { Some(n) };
-                self.edit(vec![Change::SetRating(value)], &format!("rate {n}"))?;
+                self.edit(&[Change::SetRating(value)], &format!("rate {n}"))?;
             }
-            KeyCode::Char('f') => self.edit(vec![Change::SetFlag(true)], "flag")?,
-            KeyCode::Char('x') => self.edit(vec![Change::SetReject(true)], "reject")?,
+            KeyCode::Char('f') => self.edit(&[Change::SetFlag(true)], "flag")?,
+            KeyCode::Char('x') => self.edit(&[Change::SetReject(true)], "reject")?,
             KeyCode::Char('c') => self.edit(
-                vec![Change::SetFlag(false), Change::SetReject(false)],
+                &[Change::SetFlag(false), Change::SetReject(false)],
                 "clear marks",
             )?,
 
@@ -687,7 +750,7 @@ impl App {
             KeyCode::Right if self.view != View::Single => {
                 self.sidebar_focus = false;
             }
-            KeyCode::Char('+') | KeyCode::Char('=') if self.view == View::Grid => {
+            KeyCode::Char('+' | '=') if self.view == View::Grid => {
                 self.grid_cols = (self.grid_cols + 1).min(12);
                 self.images.clear();
                 self.status = format!("{} tiles across (smaller)", self.grid_cols);
@@ -702,11 +765,11 @@ impl App {
                 self.member = (self.member + 1) % n;
             }
             KeyCode::Char('h') | KeyCode::Left if self.view == View::Single => {
-                self.move_cursor(-1);
+                self.move_cursor(-1)?;
                 self.member = 0;
             }
             KeyCode::Char('l') | KeyCode::Right if self.view == View::Single => {
-                self.move_cursor(1);
+                self.move_cursor(1)?;
                 self.member = 0;
             }
             // Enter zooms into whatever is under the cursor.
@@ -731,8 +794,7 @@ impl App {
             // frame renders black and this fixes it, the pixels were fine and
             // the terminal lost the placement.
             KeyCode::Char('r') => {
-                let dropped = self.images.len();
-                self.images.clear();
+                let dropped = self.clear_images();
                 self.status = format!("re-sent {dropped} image(s) to the terminal");
             }
             KeyCode::Char('u') => self.undo()?,
@@ -747,10 +809,10 @@ impl App {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.sidebar_cursor =
-                        (self.sidebar_cursor + 1).min(self.sidebar_items.len().saturating_sub(1))
+                        (self.sidebar_cursor + 1).min(self.sidebar_items.len().saturating_sub(1));
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1)
+                    self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
                 }
                 _ => {}
             }
@@ -758,18 +820,88 @@ impl App {
         Ok(())
     }
 
+    /// Readline-style editing, shared by every text prompt (`Input::Query`,
+    /// `AddTag`, `RemoveTag`, `Title`) since they all go through this one
+    /// buffer. `input_cursor` is a char index, not a byte index, so a
+    /// multi-byte tag or title can't have its cursor land mid-codepoint.
+    ///
+    /// Deliberately no `Alt`-based word-jump: many terminals intercept
+    /// Alt+letter for their own bindings or deliver it as a raw `Esc` prefix
+    /// instead of a modifier flag, which would make the feature work
+    /// inconsistently across terminals. `Ctrl-w` alone covers the common
+    /// case (delete the last word) without needing forward word-movement.
     fn on_input_key(&mut self, key: KeyEvent) -> Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let mut chars: Vec<char> = self.buffer.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+
         match key.code {
             KeyCode::Esc => {
                 self.input = Input::None;
                 self.buffer.clear();
+                self.input_cursor = 0;
+            }
+            KeyCode::Left => self.input_cursor = cursor.saturating_sub(1),
+            KeyCode::Char('b') if ctrl => self.input_cursor = cursor.saturating_sub(1),
+            KeyCode::Right => self.input_cursor = (cursor + 1).min(chars.len()),
+            KeyCode::Char('f') if ctrl => self.input_cursor = (cursor + 1).min(chars.len()),
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::Char('a') if ctrl => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = chars.len(),
+            KeyCode::Char('e') if ctrl => self.input_cursor = chars.len(),
+            // Kill to end of line.
+            KeyCode::Char('k') if ctrl => {
+                chars.truncate(cursor);
+                self.buffer = chars.into_iter().collect();
+            }
+            // Kill to start of line.
+            KeyCode::Char('u') if ctrl => {
+                chars.drain(0..cursor);
+                self.buffer = chars.into_iter().collect();
+                self.input_cursor = 0;
+            }
+            // Delete the word before the cursor.
+            KeyCode::Char('w') if ctrl => {
+                let mut start = cursor;
+                while start > 0 && chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                while start > 0 && !chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                chars.drain(start..cursor);
+                self.buffer = chars.into_iter().collect();
+                self.input_cursor = start;
+            }
+            // Forward-delete. No conflict with the list view's Ctrl-d
+            // (page down) -- this function only runs while `input != None`.
+            KeyCode::Char('d') if ctrl => {
+                if cursor < chars.len() {
+                    chars.remove(cursor);
+                    self.buffer = chars.into_iter().collect();
+                }
+            }
+            KeyCode::Delete => {
+                if cursor < chars.len() {
+                    chars.remove(cursor);
+                    self.buffer = chars.into_iter().collect();
+                }
             }
             KeyCode::Backspace => {
-                self.buffer.pop();
+                if cursor > 0 {
+                    chars.remove(cursor - 1);
+                    self.buffer = chars.into_iter().collect();
+                    self.input_cursor = cursor - 1;
+                }
             }
-            KeyCode::Char(c) => self.buffer.push(c),
+            KeyCode::Char(c) => {
+                chars.insert(cursor, c);
+                self.buffer = chars.into_iter().collect();
+                self.input_cursor = cursor + 1;
+            }
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.buffer);
+                self.input_cursor = 0;
                 let mode = std::mem::replace(&mut self.input, Input::None);
                 match mode {
                     Input::Query => {
@@ -793,7 +925,7 @@ impl App {
                             .filter(|s| !s.is_empty())
                             .collect();
                         if !tags.is_empty() {
-                            self.edit(vec![Change::AddTags(tags)], "tag")?;
+                            self.edit(&[Change::AddTags(tags)], "tag")?;
                         }
                     }
                     Input::RemoveTag => {
@@ -803,10 +935,10 @@ impl App {
                             .filter(|s| !s.is_empty())
                             .collect();
                         if !tags.is_empty() {
-                            self.edit(vec![Change::RemoveTags(tags)], "untag")?;
+                            self.edit(&[Change::RemoveTags(tags)], "untag")?;
                         }
                     }
-                    Input::Title => self.edit(vec![Change::SetTitle(text)], "title")?,
+                    Input::Title => self.edit(&[Change::SetTitle(text)], "title")?,
                     Input::None => {}
                 }
             }
@@ -815,13 +947,70 @@ impl App {
         Ok(())
     }
 
-    fn move_cursor(&mut self, delta: isize) {
+    /// Move the cursor by `delta` rows. `self.rows` only ever holds one SQL
+    /// page (`PAGE` rows) at a time, so a move that would run off either edge
+    /// turns the page instead of stopping there -- otherwise nothing could
+    /// ever reach a result past the first `PAGE` matches. Deliberately coarse
+    /// (land on the opposite edge of the new page, like `less`) rather than
+    /// preserving exact scroll distance across the seam.
+    fn move_cursor(&mut self, delta: isize) -> Result<()> {
         let len = self.rows.len() as isize;
         if len == 0 {
-            return;
+            return Ok(());
         }
-        let next = (self.cursor as isize + delta).clamp(0, len - 1);
-        self.cursor = next as usize;
+        let target = self.cursor as isize + delta;
+        if target < 0 {
+            if self.offset > 0 {
+                // Pages are always fetched in fixed `PAGE`-sized windows, so
+                // the previous page's offset is a multiple of `PAGE` back --
+                // NOT `self.rows.len()`, which is only `PAGE` on a full page
+                // and the (smaller) remainder on the last one.
+                self.offset = self.offset.saturating_sub(PAGE);
+                self.reload()?;
+                self.cursor = self.rows.len().saturating_sub(1);
+            } else {
+                self.cursor = 0;
+            }
+            return Ok(());
+        }
+        if target >= len {
+            if self.offset + self.rows.len() < self.total {
+                self.offset += PAGE;
+                self.reload()?;
+                self.cursor = 0;
+            } else {
+                self.cursor = (len - 1) as usize;
+            }
+            return Ok(());
+        }
+        self.cursor = target as usize;
+        Ok(())
+    }
+
+    /// Jump to the true first row of the whole result set, not just the
+    /// current page.
+    fn jump_to_first(&mut self) -> Result<()> {
+        if self.offset != 0 {
+            self.offset = 0;
+            self.reload()?;
+        }
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// Jump to the true last row of the whole result set, computing which
+    /// page it falls on from `self.total`.
+    fn jump_to_last(&mut self) -> Result<()> {
+        if self.total == 0 {
+            return Ok(());
+        }
+        let last_offset = (self.total - 1) / PAGE * PAGE;
+        if self.offset != last_offset {
+            self.offset = last_offset;
+            self.reload()?;
+        }
+        self.cursor = self.rows.len().saturating_sub(1);
+        Ok(())
     }
 
     fn run_action(&mut self, key: char) -> Result<()> {
@@ -1003,27 +1192,40 @@ impl App {
         ]);
         f.render_widget(Paragraph::new(identity), rows[0]);
 
-        let bottom = match self.input {
-            Input::None => Line::from(vec![Span::styled(
+        let bottom = if self.input == Input::None {
+            Line::from(vec![Span::styled(
                 format!("  {}", self.status),
                 Style::default().fg(Color::DarkGray),
-            )]),
-            _ => {
-                let prompt = match self.input {
-                    Input::Query => "query",
-                    Input::AddTag => "tag",
-                    Input::RemoveTag => "untag",
-                    Input::Title => "title",
-                    Input::None => "",
-                };
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {prompt}  "),
-                        Style::default().fg(Color::Black).bg(Color::Yellow),
-                    ),
-                    Span::raw(format!(" {}_", self.buffer)),
-                ])
-            }
+            )])
+        } else {
+            let prompt = match self.input {
+                Input::Query => "query",
+                Input::AddTag => "tag",
+                Input::RemoveTag => "untag",
+                Input::Title => "title",
+                Input::None => "",
+            };
+            // A real cursor, not a fake trailing `_`: split the buffer at
+            // `input_cursor` and reverse-video the character sitting there,
+            // or a blank cell if the cursor is past the last character --
+            // the ordinary terminal look for "end of line".
+            let chars: Vec<char> = self.buffer.chars().collect();
+            let at = self.input_cursor.min(chars.len());
+            let before: String = chars[..at].iter().collect();
+            let (cursor_ch, after): (String, String) = if at < chars.len() {
+                (chars[at].to_string(), chars[at + 1..].iter().collect())
+            } else {
+                (" ".to_string(), String::new())
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("  {prompt}  "),
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ),
+                Span::raw(format!(" {before}")),
+                Span::styled(cursor_ch, Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(after),
+            ])
         };
         f.render_widget(Paragraph::new(bottom), rows[1]);
 
@@ -1034,6 +1236,7 @@ impl App {
         // terminal lose track of placements.
         let used = std::mem::take(&mut self.frame_used);
         self.images.retain(|k, _| used.contains(k));
+        self.last_rect.retain(|k, _| used.contains(k));
         self.frame_used = used;
 
         if self.show_help {
@@ -1047,7 +1250,7 @@ impl App {
                 );
             }
             for a in &self.actions {
-                text.push_str(&format!("  {}   {}\n", a.key, a.name));
+                let _ = writeln!(text, "  {}   {}", a.key, a.name);
             }
             self.overlay(f, " actions ", &text);
         }
@@ -1096,10 +1299,7 @@ impl App {
                 } else {
                     " "
                 };
-                let date = r
-                    .captured
-                    .map(format_date)
-                    .unwrap_or_else(|| "----------".into());
+                let date = r.captured.map_or_else(|| "----------".into(), format_date);
                 ListItem::new(Line::from(vec![
                     Span::styled(sel.to_string(), Style::default().fg(Color::Yellow)),
                     Span::raw(format!(" {:<20}", r.base)),
@@ -1177,7 +1377,7 @@ impl App {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let stars = "*".repeat(row.rating.unwrap_or(0).clamp(0, 5) as usize);
+            let rating_col = "*".repeat(row.rating.unwrap_or(0).clamp(0, 5) as usize);
             let mark = if row.flag {
                 " F"
             } else if row.reject {
@@ -1189,7 +1389,7 @@ impl App {
                 .borders(Borders::ALL)
                 .border_style(border)
                 .title(Line::from(vec![Span::styled(
-                    format!(" {}{} ", stars, mark),
+                    format!(" {rating_col}{mark} "),
                     Style::default().fg(if row.reject {
                         Color::Red
                     } else {
@@ -1200,7 +1400,7 @@ impl App {
             f.render_widget(tile, cell);
 
             match self.image_for(idx, ThumbSize::Grid) {
-                Some(path) if self.ensure_decoded(&path) => {
+                Some(path) if self.ensure_decoded_at(&path, picture) => {
                     self.frame_used.insert(path.clone());
                     if let Some(p) = self.images.get_mut(&path) {
                         f.render_stateful_widget(StatefulImage::default(), picture, p);
@@ -1231,7 +1431,7 @@ impl App {
                 format!(
                     " {}  {}  {}/{}  {stars}{which} ",
                     r.base,
-                    r.captured.map(format_date).unwrap_or_else(|| "--".into()),
+                    r.captured.map_or_else(|| "--".into(), format_date),
                     self.cursor + 1,
                     self.rows.len()
                 )
@@ -1250,7 +1450,7 @@ impl App {
         // A portrait frame leaves width unused, a landscape frame leaves
         // height. Put the shooting data wherever the picture is not.
         let exif = self.current_exif();
-        let portrait = exif.as_ref().map(|e| e.is_portrait()).unwrap_or(false);
+        let portrait = exif.as_ref().is_some_and(Exif::is_portrait);
         let (picture, panel) = if portrait && inner.width > 60 {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1270,7 +1470,7 @@ impl App {
         self.prefetch(ThumbSize::View, 2);
 
         match self.image_for(self.cursor, ThumbSize::View) {
-            Some(path) if self.ensure_decoded(&path) => {
+            Some(path) if self.ensure_decoded_at(&path, picture) => {
                 self.frame_used.insert(path.clone());
                 if let Some(p) = self.images.get_mut(&path) {
                     f.render_stateful_widget(StatefulImage::default(), picture, p);
@@ -1351,6 +1551,10 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "a render method; grouping it with the others is the point"
+    )]
     fn overlay(&self, f: &mut Frame, title: &str, body: &str) {
         let area = centered(68, 92, f.area());
         f.render_widget(Clear, area);
@@ -1451,10 +1655,9 @@ fn format_datetime(unix: i64) -> String {
 
 const HELP: &str = "\
  j k  up  down        move
- g G                  first / last
- page-up page-down    one screen
- ctrl-u ctrl-d        half a screen
- home end             first / last
+ g G  home end        first / last of the WHOLE result, not just this page
+ page-up page-down    one screen  (crossing to the next/previous page of
+ ctrl-u ctrl-d        half a screen   results automatically at the edge)
  space                select / deselect
  v                    range: press once to start, again to close
  esc                  clear selection (outside single view)
@@ -1464,6 +1667,9 @@ const HELP: &str = "\
  i                    set title
  1-5                  rate    0  clear rating
  f  x  c              flag / reject / clear marks
+
+ while typing (/, t, T, i): left/right home/end to move the cursor,
+ backspace/delete, ctrl-a/e/b/f/k/u/w -- the usual readline keys
 
  enter                zoom in   (-> single view)
  esc                  zoom out  (single -> grid)
@@ -1476,7 +1682,9 @@ const HELP: &str = "\
  - +                  fewer / more tiles across (grid view)
 
  a                    actions menu
- r                    re-send images to the terminal (if one renders blank)
+ r                    re-send images to the terminal (if one still renders
+                      blank; scrolling and resizing already do this on their
+                      own where it's needed)
  w                    flush pending sidecars
  u                    undo last edit
  q                    quit
@@ -1552,10 +1760,17 @@ pub fn run(root: PathBuf) -> Result<()> {
             // Poll rather than block: thumbnails finish on a worker thread and
             // the frame they belong to has to be redrawn when they land.
             if event::poll(Duration::from_millis(120))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == event::KeyEventKind::Press {
-                        app.on_key(key)?;
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == event::KeyEventKind::Press {
+                            app.on_key(key)?;
+                        }
                     }
+                    // A resize can change the terminal's cell/font geometry,
+                    // which any cached image protocol was built against --
+                    // see `App::on_resize`.
+                    Event::Resize(_, _) => app.on_resize(),
+                    _ => {}
                 }
             }
             // Drain whatever the generator finished; each one is a reason to
@@ -1621,6 +1836,17 @@ mod tests {
             press(app, c);
         }
         press_code(app, KeyCode::Enter);
+    }
+    /// Type without committing, so mid-edit state (buffer, input_cursor) can
+    /// be inspected before `Enter`.
+    fn type_str_uncommitted(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, c);
+        }
+    }
+    fn press_ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            .unwrap();
     }
 
     #[test]
@@ -1705,6 +1931,101 @@ mod tests {
         type_str(&mut app, "colour=red");
         assert!(app.status.contains("bad query"), "status: {}", app.status);
         assert_eq!(app.total, 1, "a bad query blanked the view");
+    }
+
+    /// The point of readline support: fixing a typo in the middle of a
+    /// prefilled query without deleting everything after it.
+    #[test]
+    fn the_query_prompt_supports_in_place_cursor_editing() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beah");
+        assert_eq!(app.input_cursor, 4);
+
+        // Move left past the trailing 'h', insert the missing 'c'.
+        press_code(&mut app, KeyCode::Left);
+        press(&mut app, 'c');
+        assert_eq!(app.buffer, "beach");
+        assert_eq!(app.input_cursor, 4, "cursor sits after the inserted char");
+
+        press_code(&mut app, KeyCode::End);
+        assert_eq!(app.input_cursor, 5);
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.query, "beach");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_reach_the_ends() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beach");
+        press_ctrl(&mut app, 'a');
+        assert_eq!(app.input_cursor, 0);
+        press_ctrl(&mut app, 'e');
+        assert_eq!(app.input_cursor, 5);
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_end_of_line() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beach anna");
+        for _ in 0..4 {
+            press_code(&mut app, KeyCode::Left); // cursor after "beach "
+        }
+        press_ctrl(&mut app, 'k');
+        assert_eq!(app.buffer, "beach ");
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_start_of_line() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beach anna");
+        for _ in 0..4 {
+            press_code(&mut app, KeyCode::Left); // cursor before "anna"
+        }
+        press_ctrl(&mut app, 'u');
+        assert_eq!(app.buffer, "anna");
+        assert_eq!(app.input_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beach anna");
+        press_ctrl(&mut app, 'w');
+        assert_eq!(app.buffer, "beach ");
+
+        // Trailing whitespace before the cursor is skipped too.
+        press_ctrl(&mut app, 'w');
+        assert_eq!(app.buffer, "");
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_from_the_right_side_of_the_cursor() {
+        let (_d, mut app) = app();
+        press(&mut app, '/');
+        type_str_uncommitted(&mut app, "beach");
+        press_code(&mut app, KeyCode::Left); // cursor between 'c' and 'h'
+        press_code(&mut app, KeyCode::Backspace);
+        assert_eq!(app.buffer, "beah", "backspace removes before the cursor");
+
+        press_code(&mut app, KeyCode::Delete);
+        assert_eq!(app.buffer, "bea", "delete removes at the cursor");
+    }
+
+    /// Readline editing is shared code (`on_input_key`) -- confirm it behaves
+    /// the same for a non-query input, not just `/`.
+    #[test]
+    fn readline_editing_also_works_for_the_tag_prompt() {
+        let (_d, mut app) = app();
+        press(&mut app, 't');
+        type_str_uncommitted(&mut app, "beah");
+        press_code(&mut app, KeyCode::Left);
+        press(&mut app, 'c');
+        assert_eq!(app.buffer, "beach");
     }
 
     #[test]
@@ -1898,6 +2219,58 @@ mod tests {
         }
     }
 
+    /// The black-frame bug: a cached protocol was reused even after its path
+    /// moved to a new screen rect, which is what leaves a stale kitty
+    /// placement behind. `Picker::from_fontsize` builds a real picker without
+    /// a terminal, so this exercises the real decode path, not a stub.
+    #[test]
+    fn ensure_decoded_at_reuses_the_cache_only_when_the_rect_is_unchanged() {
+        let (_d, mut app) = app();
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = src_dir.path().join("thumb.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        app.picker = Some(Picker::from_fontsize((8, 16)));
+
+        let rect_a = Rect::new(0, 0, 10, 10);
+        assert!(
+            app.ensure_decoded_at(&path, rect_a),
+            "first decode of a real file must succeed"
+        );
+
+        // Delete the source: from here on, any FRESH decode attempt fails.
+        // If a later call still succeeds, that proves it reused the cache
+        // rather than re-opening the file -- the thing under test.
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            app.ensure_decoded_at(&path, rect_a),
+            "same rect must reuse the cached protocol, not re-decode"
+        );
+
+        let rect_b = Rect::new(0, 0, 20, 20);
+        assert!(
+            !app.ensure_decoded_at(&path, rect_b),
+            "a different rect must force a fresh decode, which fails now the file is gone"
+        );
+    }
+
+    #[test]
+    fn resize_clears_every_cached_image() {
+        let (_d, mut app) = app();
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = src_dir.path().join("thumb.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        app.picker = Some(Picker::from_fontsize((8, 16)));
+
+        assert!(app.ensure_decoded_at(&path, Rect::new(0, 0, 10, 10)));
+        assert_eq!(app.images.len(), 1);
+        assert_eq!(app.last_rect.len(), 1);
+
+        app.on_resize();
+        assert!(app.images.is_empty(), "resize must drop every cached image");
+        assert!(app.last_rect.is_empty());
+    }
+
     #[test]
     fn tab_cycles_forward_shift_tab_backward_and_arrows_reach_the_sidebar() {
         let (_d, mut app) = app();
@@ -2001,7 +2374,15 @@ mod tests {
         press(&mut app, 'o');
         let second = app.current_label().unwrap();
         assert_ne!(first, second, "the label ignored the member cycle");
-        assert!(first.ends_with(".NEF") || first.ends_with(".JPG"));
+        // The fixture names really are uppercase -- this is asserting the
+        // fixture's own naming, not classifying a real extension case-sensitively.
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "checking the fixture's literal name, not classifying a role"
+        )]
+        {
+            assert!(first.ends_with(".NEF") || first.ends_with(".JPG"));
+        }
     }
 
     /// The path is shown relative to the library root, not absolutely -- an
@@ -2223,6 +2604,87 @@ mod tests {
         press_code(&mut app, KeyCode::End);
         assert_eq!(app.cursor, 2);
         press_code(&mut app, KeyCode::Home);
+        assert_eq!(app.cursor, 0);
+    }
+
+    /// A catalog with more than one SQL page (`PAGE = 500`) of stacks, so a
+    /// query result that exceeds the page size is reachable in a test.
+    fn app_with_many_stacks(n: usize) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        for i in 0..n {
+            cat.conn
+                .execute(
+                    "INSERT INTO stack (dir, base) VALUES (?1, ?2)",
+                    rusqlite::params![dir.path().to_string_lossy(), format!("750_{i:05}")],
+                )
+                .unwrap();
+        }
+        let app = App::with_catalog(cat, dir.path().to_path_buf()).unwrap();
+        (dir, app)
+    }
+
+    /// The whole point of the fix: nothing past the first `PAGE` (500) rows
+    /// was reachable before this, no matter which key you pressed.
+    #[test]
+    fn g_and_shift_g_reach_the_true_ends_of_a_result_set_spanning_pages() {
+        let (_d, mut app) = app_with_many_stacks(520);
+        assert_eq!(app.total, 520);
+        assert_eq!(app.rows.len(), 500, "first page should be full");
+
+        press(&mut app, 'G');
+        assert_eq!(app.offset, 500, "G must land on the second page");
+        assert_eq!(app.rows.len(), 20, "remainder of 520 stacks over 500");
+        assert_eq!(app.cursor, 19, "cursor on the true last row");
+
+        press(&mut app, 'g');
+        assert_eq!(app.offset, 0, "g must return to the first page");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn moving_past_the_last_row_of_a_page_turns_to_the_next_page() {
+        let (_d, mut app) = app_with_many_stacks(520);
+        press(&mut app, 'G'); // land on the last row of the last page first,
+        press(&mut app, 'g'); // then back to the first page, cursor at 0.
+
+        // Walk to the last row of page one without leaving it.
+        app.cursor = 499;
+        press(&mut app, 'j');
+        assert_eq!(app.offset, 500, "moving past row 500 must turn the page");
+        assert_eq!(app.cursor, 0, "lands on the first row of the new page");
+        assert_eq!(app.rows.len(), 20);
+    }
+
+    #[test]
+    fn moving_before_the_first_row_of_a_page_turns_back() {
+        let (_d, mut app) = app_with_many_stacks(520);
+        press(&mut app, 'G');
+        assert_eq!(app.offset, 500);
+        app.cursor = 0;
+
+        press(&mut app, 'k');
+        assert_eq!(app.offset, 0, "moving before row 0 must turn back a page");
+        assert_eq!(
+            app.cursor, 499,
+            "lands on the last row of the previous page"
+        );
+    }
+
+    /// With a result set that fits on one page (the common case), paging
+    /// keys must behave exactly as they did before this change.
+    #[test]
+    fn small_result_sets_are_unaffected_by_paging() {
+        let (_d, mut app) = app();
+        press(&mut app, 'G');
+        assert_eq!(app.offset, 0);
+        assert_eq!(app.cursor, 2);
+        press(&mut app, 'j'); // past the last row -- nothing to page to
+        assert_eq!(app.offset, 0);
+        assert_eq!(app.cursor, 2, "clamped, not left dangling past the end");
+        press(&mut app, 'g');
+        press(&mut app, 'k'); // before the first row -- nothing to page to
+        assert_eq!(app.offset, 0);
         assert_eq!(app.cursor, 0);
     }
 

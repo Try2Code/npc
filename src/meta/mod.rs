@@ -38,6 +38,11 @@ pub mod ffi {
         pub serial: String,
         pub shutter_count: u32,
         pub rating: i32, // in-camera rating, -1 = unset
+        /// Keywords embedded directly in the original -- `Xmp.dc.subject` and
+        /// `Iptc.Application2.Keywords`, unioned. Distinct from a sidecar's
+        /// tags: this is what other applications (Shotwell, digiKam) wrote
+        /// into the file itself before this tool ever touched it.
+        pub tags: Vec<String>,
     }
 
     /// The contents of a `.xmp` sidecar that we own. Foreign properties are not

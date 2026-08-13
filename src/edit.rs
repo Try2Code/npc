@@ -324,7 +324,7 @@ pub fn ingest_sidecar(cat: &mut Catalog, stack_id: i64, sidecar: &Path) -> Resul
 
 /// Trim, collapse inner whitespace, drop leading/trailing slashes so `a/b`
 /// hierarchies stay well-formed.
-fn normalise_tag(t: &str) -> String {
+pub(crate) fn normalise_tag(t: &str) -> String {
     t.trim()
         .trim_matches('/')
         .split_whitespace()

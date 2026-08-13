@@ -10,6 +10,8 @@ use crate::stack::{classify, Role};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -23,7 +25,42 @@ pub struct ScanStats {
     pub vanished: usize,
     pub sidecars_read: usize,
     pub events: usize,
+    /// Stacks that had no rating and no tags, but carried a rating and/or
+    /// keywords embedded directly in an original (Shotwell, digiKam, and
+    /// similar tools write these into the file itself). Seeded into the
+    /// catalog and marked dirty; `npc sync` writes the sidecar.
+    pub seeded_from_embedded: usize,
     pub errors: Vec<String>,
+}
+
+/// Combine embedded ratings from a stack's RAW and JPG members. If only one
+/// carries a rating, use it; if both do, the higher one wins.
+fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> {
+    match (raw, jpg) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+/// Union embedded tags across every member that had one, case-insensitively,
+/// through the same normalisation `npc tag add` applies so casing and
+/// whitespace match what a real tagging session would have produced.
+fn union_embedded_tags<'a>(sources: impl Iterator<Item = &'a [String]>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tags in sources {
+        for t in tags {
+            let normalised = crate::edit::normalise_tag(t);
+            if normalised.is_empty() {
+                continue;
+            }
+            if seen.insert(normalised.to_lowercase()) {
+                out.push(normalised);
+            }
+        }
+    }
+    out
 }
 
 struct Member {
@@ -90,8 +127,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                 continue;
             }
         };
-        use std::os::unix::fs::MetadataExt;
-        let size = md.size() as i64;
+        let size = i64::try_from(md.size()).unwrap_or(i64::MAX);
         let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
 
         let unchanged = known
@@ -198,15 +234,35 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                  present=1",
         )?;
 
+        // Seeding embedded rating/tags: only for a stack that has neither yet,
+        // so a real edit (via npc, or a sidecar ingested below) is never
+        // clobbered. This marks the stack dirty in the catalog only -- it is
+        // not a write to the library. `npc sync` is what writes the sidecar,
+        // through the same `write_sidecar` this project already audits.
+        let mut stack_state =
+            tx.prepare("SELECT rating, (SELECT COUNT(*) FROM stack_tag WHERE stack_id = s.id) FROM stack s WHERE id = ?1")?;
+        let mut ins_tag = tx.prepare("INSERT OR IGNORE INTO tag (name) VALUES (?1)")?;
+        let mut sel_tag_id = tx.prepare("SELECT id FROM tag WHERE name = ?1")?;
+        let mut ins_stack_tag =
+            tx.prepare("INSERT OR IGNORE INTO stack_tag (stack_id, tag_id) VALUES (?1,?2)")?;
+        let mut seed_stack = tx.prepare("UPDATE stack SET rating = ?2, dirty = 1 WHERE id = ?1")?;
+        let mut ins_pending =
+            tx.prepare("INSERT OR REPLACE INTO pending (stack_id, queued_at) VALUES (?1, ?2)")?;
+
         for ((dir, base), members) in &stacks {
             let sid: i64 = ins_stack.query_row(rusqlite::params![dir, base], |r| r.get(0))?;
 
             // A sidecar is metadata about the stack, not a member of it. Record
             // it for ingestion below; never let it become a `file` row, or it
             // would be counted as a photograph.
+            let has_sidecar = members.iter().any(|m| m.role == Role::Sidecar);
             if let Some(sc) = members.iter().find(|m| m.role == Role::Sidecar) {
                 sidecars_found.push((sid, format!("{dir}/{}", sc.name), sc.mtime_ns));
             }
+
+            let mut raw_rating = None;
+            let mut jpg_rating = None;
+            let mut embedded_tags: Vec<&[String]> = Vec::new();
 
             for m in members {
                 if m.role == Role::Sidecar {
@@ -222,19 +278,55 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                     m.size,
                     m.mtime_ns,
                     fm.map(|f| f.capture_time).filter(|&t| t != 0),
-                    fm.map(|f| f.camera.as_str()).unwrap_or(""),
-                    fm.map(|f| f.lens.as_str()).unwrap_or(""),
-                    fm.map(|f| f.iso).unwrap_or(0),
-                    fm.map(|f| f.fnumber).unwrap_or(0.0),
-                    fm.map(|f| f.exposure).unwrap_or(0.0),
-                    fm.map(|f| f.focal).unwrap_or(0.0),
-                    fm.map(|f| f.width).unwrap_or(0),
-                    fm.map(|f| f.height).unwrap_or(0),
-                    fm.map(|f| f.orientation).unwrap_or(0),
-                    fm.map(|f| f.serial.as_str()).unwrap_or(""),
-                    fm.map(|f| f.shutter_count).unwrap_or(0),
+                    fm.map_or("", |f| f.camera.as_str()),
+                    fm.map_or("", |f| f.lens.as_str()),
+                    fm.map_or(0, |f| f.iso),
+                    fm.map_or(0.0, |f| f.fnumber),
+                    fm.map_or(0.0, |f| f.exposure),
+                    fm.map_or(0.0, |f| f.focal),
+                    fm.map_or(0, |f| f.width),
+                    fm.map_or(0, |f| f.height),
+                    fm.map_or(0, |f| f.orientation),
+                    fm.map_or("", |f| f.serial.as_str()),
+                    fm.map_or(0, |f| f.shutter_count),
                     fm.and_then(|f| f.has_bias.then_some(f.exposure_bias)),
                 ])?;
+
+                if let Some(fm) = fm {
+                    let rating = (fm.rating >= 0).then_some(fm.rating);
+                    match m.role {
+                        Role::Raw => raw_rating = rating,
+                        Role::OocJpg => jpg_rating = rating,
+                        _ => {}
+                    }
+                    if !fm.tags.is_empty() {
+                        embedded_tags.push(&fm.tags);
+                    }
+                }
+            }
+
+            // A stack with a real sidecar on disk must never be seeded from
+            // embedded values, dirty or not: marking it dirty here would make
+            // the sidecar-ingestion pass below skip it (a dirty stack's
+            // unflushed edit is treated as newer than the file, by design),
+            // which would silently block a real, possibly-since-cleared
+            // sidecar from ever being read back. The sidecar always wins, and
+            // the only way to guarantee that is to not touch this stack here.
+            let (existing_rating, existing_tags): (Option<i64>, i64) =
+                stack_state.query_row(rusqlite::params![sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if !has_sidecar && existing_rating.is_none() && existing_tags == 0 {
+                let rating = combine_rating(raw_rating, jpg_rating);
+                let tags = union_embedded_tags(embedded_tags.into_iter());
+                if rating.is_some() || !tags.is_empty() {
+                    seed_stack.execute(rusqlite::params![sid, rating.map(i64::from)])?;
+                    for t in &tags {
+                        ins_tag.execute(rusqlite::params![t])?;
+                        let tid: i64 = sel_tag_id.query_row(rusqlite::params![t], |r| r.get(0))?;
+                        ins_stack_tag.execute(rusqlite::params![sid, tid])?;
+                    }
+                    ins_pending.execute(rusqlite::params![sid, now_secs()])?;
+                    stats.seeded_from_embedded += 1;
+                }
             }
         }
 
@@ -328,7 +420,9 @@ fn serde_json_array(items: &[String]) -> String {
                 '\n' => s.push_str("\\n"),
                 '\r' => s.push_str("\\r"),
                 '\t' => s.push_str("\\t"),
-                c if (c as u32) < 0x20 => s.push_str(&format!("\\u{:04x}", c as u32)),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(s, "\\u{:04x}", c as u32);
+                }
                 c => s.push(c),
             }
         }
@@ -393,7 +487,7 @@ pub fn derive_events(cat: &mut Catalog) -> Result<usize> {
 
     let n: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
     tx.commit()?;
-    Ok(n as usize)
+    Ok(usize::try_from(n).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -412,5 +506,40 @@ mod tests {
         assert!(json.contains(r#"quote\""#));
         assert!(json.contains(r"back\\slash"));
         assert!(json.contains(r"new\nline"));
+    }
+
+    #[test]
+    fn rating_combines_by_your_rule() {
+        // Only one member rated: use it.
+        assert_eq!(combine_rating(Some(3), None), Some(3));
+        assert_eq!(combine_rating(None, Some(4)), Some(4));
+        // Both rated: the higher wins.
+        assert_eq!(combine_rating(Some(2), Some(5)), Some(5));
+        assert_eq!(combine_rating(Some(5), Some(2)), Some(5));
+        assert_eq!(combine_rating(Some(3), Some(3)), Some(3));
+        // Neither rated: nothing to seed.
+        assert_eq!(combine_rating(None, None), None);
+    }
+
+    #[test]
+    fn tags_union_case_insensitively_and_normalise() {
+        let nef = vec!["India".to_string(), "  berlin  ".to_string()];
+        let jpg = vec!["india".to_string(), "Carsten Geburtstag".to_string()];
+        let tags = union_embedded_tags([nef.as_slice(), jpg.as_slice()].into_iter());
+        // "India"/"india" collapse to one, casing from whichever was seen first.
+        assert_eq!(tags, vec!["India", "berlin", "Carsten Geburtstag"]);
+    }
+
+    #[test]
+    fn empty_and_blank_tags_are_dropped() {
+        let a = vec![String::new(), "   ".to_string()];
+        let tags = union_embedded_tags([a.as_slice()].into_iter());
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn no_embedded_tags_anywhere_is_an_empty_union() {
+        let tags = union_embedded_tags(std::iter::empty());
+        assert!(tags.is_empty());
     }
 }

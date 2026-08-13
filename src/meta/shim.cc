@@ -4,6 +4,7 @@
 #include <exiv2/exiv2.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -231,6 +232,60 @@ FileMeta read_meta(rust::Str path_) {
         }
     } else {
         m.rating = -1;
+    }
+
+    // Keywords another application embedded directly in the file -- Shotwell
+    // writes both of the following, other tools write one or the other, so
+    // both are read and unioned case-insensitively. This is distinct from a
+    // sidecar's tags (Xmp.dc.subject in a .xmp, read by read_sidecar): these
+    // came from the original, before this tool ever saw the library.
+    auto add_tag = [&m](const std::string &t) {
+        if (t.empty()) return;
+        for (const auto &existing : m.tags) {
+            // Convert once into a named local. Calling `.begin()`/`.end()` on
+            // two independently-constructed `std::string(existing)` temporaries
+            // (the original form of this code) compared iterators from two
+            // different objects instead of one, and silently never matched --
+            // confirmed by instrumenting it directly, not by inspection.
+            const std::string e(existing);
+            if (std::equal(t.begin(), t.end(), e.begin(), e.end(), [](char a, char b) {
+                    return std::tolower(static_cast<unsigned char>(a)) ==
+                           std::tolower(static_cast<unsigned char>(b));
+                })) {
+                return;
+            }
+        }
+        m.tags.push_back(rust::String(t));
+    };
+
+    try {
+        const Exiv2::XmpData &xd = image->xmpData();
+
+        // Not every tool that rates a file also writes the plain EXIF tag --
+        // this one was found writing only Xmp.xmp.Rating (no Exif.Image.Rating
+        // at all), which silently dropped its rating until this fallback was
+        // added. Same key `read_sidecar` already reads from a real sidecar.
+        if (m.rating < 0) {
+            m.rating = xmp_int(xd, "Xmp.xmp.Rating", -1);
+        }
+
+        auto it = xd.findKey(Exiv2::XmpKey("Xmp.dc.subject"));
+        if (it != xd.end()) {
+            for (long i = 0; i < it->count(); ++i) {
+                add_tag(it->toString(i));
+            }
+        }
+    } catch (...) {
+    }
+
+    try {
+        const Exiv2::IptcData &id = image->iptcData();
+        for (const auto &datum : id) {
+            if (datum.key() == "Iptc.Application2.Keywords") {
+                add_tag(datum.toString());
+            }
+        }
+    } catch (...) {
     }
 
     m.ok = true;

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Find exported JPGs (under <library>/export/) whose rating doesn't match
+# their true source stack, and backfill it into the export's sidecar.
+#
+#   ./fix-export-ratings /media/ram/MyPics              dry run (default)
+#   ./fix-export-ratings /media/ram/MyPics --apply       write the sidecars
+#
+# Why this exists: RawTherapee (or any export tool) can be configured to
+# strip metadata on export -- "Metadata copy mode" in its Metadata tool tab --
+# and when it does, the rating you gave the original never reaches the
+# export. This happened to a real, non-trivial fraction of one library's
+# export/ tree. If your export tool later gets misconfigured again, or you
+# import an old backlog of exports, this is the same fix, rerunnable.
+#
+# Matching an export back to its true source is the hard part, not the
+# rating comparison. A basename is NOT enough: Nikon file numbers cycle, so
+# the same "750_5235.JPG" can legitimately be six different shoots on six
+# different days. Two tiers, most reliable first:
+#
+#   1. exact camera serial + shutter count -- the same evidence npc's own
+#      `dupes` command uses to prove two files are the same actuation.
+#   2. exact capture_time, but ONLY when that timestamp belongs to exactly
+#      one original stack. Capture_time alone is not safe on its own: on a
+#      real library this collided across more than 15,000 distinct
+#      timestamps (burst shooting), so an ambiguous timestamp is reported,
+#      never guessed at.
+#
+# An export matching more than one candidate original (rare, but real -- a
+# "_modified" variant can sit right next to a true original and share its
+# serial+shutter, or an ambiguous capture_time matches more than one
+# original) is never auto-resolved either. It's listed for you to look at
+# by hand.
+#
+# A third case, found in the field and worth naming explicitly: an export
+# with NEITHER a serial+shutter candidate NOR any capture_time match at all
+# (RawTherapee, or whatever wrote it, stripped everything identifying). This
+# is not "ambiguous" -- it has zero candidates, not several -- and earlier
+# versions of this script simply never mentioned it, which reads as "no
+# problem here" when the honest answer is "couldn't check." It's now its
+# own reported category, with a count, so a clean-looking run doesn't imply
+# more than it verified. There is still no automated fix for these: with no
+# identifying metadata left, only a human who remembers which shoot it came
+# from can safely pick the right original.
+#
+# Safe to rerun on a schedule: a stack is only ever touched if its own
+# rating is missing or lower than its matched original's. Nothing here
+# reads or writes tags, titles, or the original's own rating -- and nothing
+# here can touch an original image file at all, sidecars are the only
+# thing `npc rate` ever writes.
+
+set -euo pipefail
+
+ROOT="${1:-}"
+APPLY="${2:-}"
+if [ -z "$ROOT" ]; then
+    echo "usage: $0 <library-root> [--apply]" >&2
+    exit 1
+fi
+ROOT="${ROOT%/}" # drop a trailing slash, so the LIKE prefix below is exact
+
+# Where exports live, relative to the library root. Change this if yours
+# uses a different convention.
+EXPORT_SUBDIR="export"
+
+# Locate npc: prefer PATH, fall back to this repo's own release build.
+# This script lives in scripts/, one level below the repo root.
+NPC="$(command -v npc || true)"
+if [ -z "$NPC" ]; then
+    NPC="$(dirname "$(dirname "$(readlink -f "$0")")")/target/release/npc"
+fi
+if [ ! -x "$NPC" ]; then
+    echo "can't find an npc binary (not on PATH, and not at $NPC)" >&2
+    exit 1
+fi
+
+# Capture everything before extracting a line -- piping straight through
+# `head -1` closes the pipe early, and npc (like most Rust CLIs, which don't
+# handle SIGPIPE the way C programs do) panics on the broken pipe instead of
+# exiting quietly.
+STATUS_OUTPUT=$("$NPC" status "$ROOT")
+DB=$(awk 'NR==1{print $2}' <<< "$STATUS_OUTPUT")
+if [ -z "$DB" ] || [ ! -f "$DB" ]; then
+    echo "could not resolve a catalog for $ROOT -- is it scanned, and mounted?" >&2
+    exit 1
+fi
+
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# One row per (export stack, matched original), tab-separated:
+#   stack_id  dir  real-on-disk-filename  target_rating
+#
+# The filename column is deliberately the REAL on-disk name, extension and
+# all -- not the catalog's stripped "base". Passing a bare base back into
+# `npc rate`'s path parsing re-strips a *second* trailing segment off any
+# name that already looks like it has an extension (a real file here was
+# literally named "*.tif.out.jpg", whose stored base is "*.tif.out" -- feed
+# that back in and file_stem() mangles it further). Always round-trip the
+# real filename and this class of bug can't recur.
+sqlite3 "$DB" <<SQL > "$WORKDIR/mismatches.tsv"
+.mode tabs
+.headers off
+WITH unique_times AS (
+    SELECT f.capture_time
+    FROM file f JOIN stack s ON s.id = f.stack_id
+    WHERE s.dir NOT LIKE '$ROOT/$EXPORT_SUBDIR%' AND f.capture_time IS NOT NULL
+    GROUP BY f.capture_time HAVING COUNT(DISTINCT s.id) = 1
+),
+tier1 AS (
+    SELECT DISTINCT exp_s.id AS exp_id, exp_s.dir AS exp_dir,
+           exp_f.name AS exp_name, orig_s.rating AS target_rating
+    FROM stack exp_s
+    JOIN file exp_f ON exp_f.stack_id = exp_s.id AND exp_f.role = 'oocjpg'
+    JOIN file orig_f ON orig_f.serial = exp_f.serial
+                     AND orig_f.shutter_count = exp_f.shutter_count
+                     AND orig_f.serial != '' AND orig_f.shutter_count != 0
+    JOIN stack orig_s ON orig_s.id = orig_f.stack_id
+    WHERE exp_s.dir LIKE '$ROOT/$EXPORT_SUBDIR%'
+      AND orig_s.dir NOT LIKE '$ROOT/$EXPORT_SUBDIR%'
+      AND orig_s.rating IS NOT NULL AND orig_s.rating > 0
+      AND (exp_s.rating IS NULL OR exp_s.rating < orig_s.rating)
+),
+tier2 AS (
+    SELECT DISTINCT exp_s.id AS exp_id, exp_s.dir AS exp_dir,
+           exp_f.name AS exp_name, orig_s.rating AS target_rating
+    FROM stack exp_s
+    JOIN file exp_f ON exp_f.stack_id = exp_s.id AND exp_f.role = 'oocjpg'
+    JOIN unique_times ut ON ut.capture_time = exp_f.capture_time
+    JOIN file orig_f ON orig_f.capture_time = exp_f.capture_time
+    JOIN stack orig_s ON orig_s.id = orig_f.stack_id
+    WHERE exp_s.dir LIKE '$ROOT/$EXPORT_SUBDIR%'
+      AND orig_s.dir NOT LIKE '$ROOT/$EXPORT_SUBDIR%'
+      AND (exp_f.serial = '' OR exp_f.serial IS NULL
+           OR exp_f.shutter_count = 0 OR exp_f.shutter_count IS NULL)
+      AND orig_s.rating IS NOT NULL AND orig_s.rating > 0
+      AND (exp_s.rating IS NULL OR exp_s.rating < orig_s.rating)
+      AND exp_s.id NOT IN (SELECT exp_id FROM tier1)
+)
+SELECT exp_id, exp_dir, exp_name, target_rating FROM tier1
+UNION ALL
+SELECT exp_id, exp_dir, exp_name, target_rating FROM tier2;
+SQL
+
+# Ambiguous: the same export stack id appears more than once, meaning more
+# than one original candidate matched. Never guess; report and skip.
+cut -f1 "$WORKDIR/mismatches.tsv" | sort | uniq -d > "$WORKDIR/ambiguous_ids.txt"
+grep -v -F -f "$WORKDIR/ambiguous_ids.txt" "$WORKDIR/mismatches.tsv" \
+    > "$WORKDIR/clean.tsv" 2>/dev/null || true
+
+total=$(wc -l < "$WORKDIR/mismatches.tsv" | tr -d ' ')
+clean=$(wc -l < "$WORKDIR/clean.tsv" | tr -d ' ')
+ambiguous=$(wc -l < "$WORKDIR/ambiguous_ids.txt" | tr -d ' ')
+
+echo "$total mismatch(es) found: $clean clean, $ambiguous ambiguous"
+
+if [ "$ambiguous" -gt 0 ]; then
+    echo
+    echo "ambiguous -- more than one candidate original, not touched:"
+    while IFS= read -r id; do
+        awk -F'\t' -v id="$id" '$1==id{print "  "$2"/"$3" -> rating "$4}' \
+            "$WORKDIR/mismatches.tsv"
+    done < "$WORKDIR/ambiguous_ids.txt"
+fi
+
+# Coverage: every export, independent of rating, classified by how many
+# original candidates each matching method finds. This is deliberately
+# separate from the mismatch query above -- it answers "could we identify
+# a source at all", not "does the rating need fixing", so it also counts
+# exports that already carry the right rating and would otherwise never
+# appear anywhere in this script's output.
+sqlite3 "$DB" <<SQL > "$WORKDIR/coverage.tsv"
+.mode tabs
+.headers off
+WITH exports AS (
+    SELECT exp_s.id AS exp_id, exp_s.dir AS exp_dir, exp_f.name AS exp_name,
+           exp_f.serial AS serial, exp_f.shutter_count AS shutter_count,
+           exp_f.capture_time AS capture_time
+    FROM stack exp_s
+    JOIN file exp_f ON exp_f.stack_id = exp_s.id AND exp_f.role = 'oocjpg'
+    WHERE exp_s.dir LIKE '$ROOT/$EXPORT_SUBDIR%'
+),
+serial_counts AS (
+    SELECT e.exp_id, COUNT(DISTINCT orig_s.id) AS n
+    FROM exports e
+    JOIN file orig_f ON orig_f.serial = e.serial
+                     AND orig_f.shutter_count = e.shutter_count
+                     AND e.serial != '' AND e.shutter_count != 0
+    JOIN stack orig_s ON orig_s.id = orig_f.stack_id
+                      AND orig_s.dir NOT LIKE '$ROOT/$EXPORT_SUBDIR%'
+    GROUP BY e.exp_id
+),
+time_counts AS (
+    SELECT e.exp_id, COUNT(DISTINCT orig_s.id) AS n
+    FROM exports e
+    JOIN file orig_f ON orig_f.capture_time = e.capture_time
+                     AND e.capture_time IS NOT NULL
+    JOIN stack orig_s ON orig_s.id = orig_f.stack_id
+                      AND orig_s.dir NOT LIKE '$ROOT/$EXPORT_SUBDIR%'
+    GROUP BY e.exp_id
+)
+SELECT e.exp_dir, e.exp_name,
+       COALESCE(sc.n, 0) AS n_serial,
+       COALESCE(tc.n, 0) AS n_time
+FROM exports e
+LEFT JOIN serial_counts sc ON sc.exp_id = e.exp_id
+LEFT JOIN time_counts tc ON tc.exp_id = e.exp_id;
+SQL
+
+# n_serial > 1, or (n_serial == 0 and n_time > 1): more than one candidate --
+# already covered by "ambiguous" above when it also happened to be a rating
+# mismatch; listed again here only for the cases that never entered that
+# query (its rating already agreed, or is null on the original).
+awk -F'\t' '$3 > 1 || ($3 == 0 && $4 > 1)' "$WORKDIR/coverage.tsv" \
+    > "$WORKDIR/ambiguous_coverage.tsv" || true
+# n_serial == 0 and n_time == 0: no candidate at all, by either method.
+awk -F'\t' '$3 == 0 && $4 == 0' "$WORKDIR/coverage.tsv" \
+    > "$WORKDIR/unmatched.tsv" || true
+
+exports_total=$(wc -l < "$WORKDIR/coverage.tsv" | tr -d ' ')
+unmatched=$(wc -l < "$WORKDIR/unmatched.tsv" | tr -d ' ')
+ambiguous_coverage=$(wc -l < "$WORKDIR/ambiguous_coverage.tsv" | tr -d ' ')
+
+echo
+echo "coverage: $exports_total export(s) total, $unmatched with no reliable" \
+     "source match (not fixed, not counted above -- unverifiable), " \
+     "$ambiguous_coverage with more than one candidate original"
+
+if [ "$unmatched" -gt 0 ]; then
+    echo
+    echo "no reliable source match -- no serial+shutter or capture_time" \
+         "candidate at all, cannot be fixed automatically:"
+    awk -F'\t' '{print "  "$1"/"$2}' "$WORKDIR/unmatched.tsv"
+fi
+
+if [ "$clean" -eq 0 ]; then
+    echo "nothing to backfill"
+    exit 0
+fi
+
+echo
+echo "by target rating:"
+cut -f4 "$WORKDIR/clean.tsv" | sort -n | uniq -c
+
+if [ "$APPLY" != "--apply" ]; then
+    echo
+    echo "dry run only. Rerun with --apply to write the sidecars."
+    exit 0
+fi
+
+echo
+for v in $(cut -f4 "$WORKDIR/clean.tsv" | sort -un); do
+    mapfile -t paths < <(
+        awk -F'\t' -v val="$v" '$4==val{print $2"/"$3}' "$WORKDIR/clean.tsv"
+    )
+    echo "rating $v: ${#paths[@]} file(s)"
+    "$NPC" rate "$v" --root "$ROOT" -- "${paths[@]}"
+done

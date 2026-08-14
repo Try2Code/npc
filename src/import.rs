@@ -471,22 +471,25 @@ fn find_duplicate(
     if let Some(k) = ident {
         if let Some((path, size)) = known_shots.get(k) {
             if *size == anchor_size {
-                if !verify_content || content_matches(anchor_path, Path::new(path)) {
+                if !verify_content {
                     return (Some(path.clone()), None);
                 }
-                // Identity and size matched but a full hash didn't -- explain
-                // why, for --verify-content's diagnostic output, then fall
-                // through: it's not this candidate, but another one might
-                // still match via capture_time.
-                near_miss = diff_summary(anchor_path, Path::new(path))
-                    .ok()
-                    .flatten()
-                    .map(|(diff_bytes, first_diff_offset)| NearMiss {
-                        source: anchor_path.display().to_string(),
-                        candidate: path.clone(),
-                        diff_bytes,
-                        first_diff_offset,
-                    });
+                match compare_content(anchor_path, Path::new(path)) {
+                    ContentCheck::Matched => return (Some(path.clone()), None),
+                    // Identity and size matched but the bytes didn't, beyond
+                    // tolerance -- explain why, for --verify-content's
+                    // diagnostic output, then fall through: it's not this
+                    // candidate, but another one might still match via
+                    // capture_time.
+                    ContentCheck::Differs(diff) => {
+                        near_miss = diff.map(|(diff_bytes, first_diff_offset)| NearMiss {
+                            source: anchor_path.display().to_string(),
+                            candidate: path.clone(),
+                            diff_bytes,
+                            first_diff_offset,
+                        });
+                    }
+                }
             }
         }
     }
@@ -494,7 +497,10 @@ fn find_duplicate(
     if let Some(t) = capture_time {
         if let Some(candidates) = known_by_content.get(&(t, anchor_size)) {
             for path in candidates {
-                if content_matches(anchor_path, Path::new(path)) {
+                if matches!(
+                    compare_content(anchor_path, Path::new(path)),
+                    ContentCheck::Matched
+                ) {
                     return (Some(path.clone()), None);
                 }
             }
@@ -504,10 +510,29 @@ fn find_duplicate(
     (None, near_miss)
 }
 
-/// Bytes identical, not just size and identity. The only thing that makes a
-/// duplicate a duplicate.
-fn content_matches(a: &Path, b: &Path) -> bool {
-    matches!((hash_file(a), hash_file(b)), (Ok(ha), Ok(hb)) if ha == hb)
+/// A stray single byte is what an in-place metadata rewrite looks like, not
+/// a real edit -- confirmed on a real library: every near-miss found there
+/// (Shotwell embedding something after import) differed by exactly one byte,
+/// always at the same offset for a given camera's fixed EXIF layout. That
+/// offset is an artifact of one camera/tool combination, not a general fact,
+/// so the tolerance is on *how much* differs, not *where* -- a real edit
+/// (colour, crop, recompression) touches far more than one byte.
+const TOLERATED_DIFF_BYTES: u64 = 1;
+
+enum ContentCheck {
+    Matched,
+    /// Beyond tolerance. Carries the diff, when it could be computed, for
+    /// the near-miss diagnostic -- `None` only if reading either file failed.
+    Differs(Option<(u64, u64)>),
+}
+
+fn compare_content(a: &Path, b: &Path) -> ContentCheck {
+    match diff_summary(a, b) {
+        Ok(None) => ContentCheck::Matched,
+        Ok(Some((diff_bytes, _))) if diff_bytes <= TOLERATED_DIFF_BYTES => ContentCheck::Matched,
+        Ok(Some(diff)) => ContentCheck::Differs(Some(diff)),
+        Err(_) => ContentCheck::Differs(None),
+    }
 }
 
 /// How different two same-size files are: total differing bytes and the
@@ -803,6 +828,71 @@ mod tests {
         assert_eq!(nm.candidate, existing.to_string_lossy().to_string());
         assert_eq!(nm.diff_bytes, 4096, "every byte differs (1 vs 2)");
         assert_eq!(nm.first_diff_offset, 0);
+    }
+
+    /// A stray single byte is exactly what an in-place metadata rewrite
+    /// (Shotwell, observed on a real library) looks like -- confirmed a
+    /// duplicate under `--verify-content`, not a near-miss.
+    #[test]
+    fn a_single_byte_difference_is_still_a_duplicate_under_verify_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        let mut data = vec![9u8; 4096];
+        std::fs::write(&existing, &data).unwrap();
+        data[2000] ^= 0xFF; // exactly one byte differs
+        std::fs::write(&incoming, &data).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(dup, Some(existing.to_string_lossy().to_string()));
+        assert!(near_miss.is_none());
+    }
+
+    /// The boundary right past tolerance: two differing bytes must still be
+    /// reported as a near-miss, not silently accepted. Guards against the
+    /// tolerance check drifting from "at most one" to "any small number".
+    #[test]
+    fn two_byte_difference_is_still_a_near_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        let mut data = vec![9u8; 4096];
+        std::fs::write(&existing, &data).unwrap();
+        data[100] ^= 0xFF;
+        data[2000] ^= 0xFF;
+        std::fs::write(&incoming, &data).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(dup, None);
+        assert_eq!(near_miss.unwrap().diff_bytes, 2);
     }
 
     #[test]

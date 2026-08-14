@@ -218,6 +218,22 @@ cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 
 `npc find --help-syntax` documents the query language.
 
+`npc import` with no path detects mounted cards (any mount with a top-level
+`DCIM` folder) and prompts you to pick one or more; `npc import <path>`
+still works directly for scripting. `--library` defaults to the configured
+library like every other subcommand. A file is skipped as "already in the
+library" once its identity (camera serial + shutter count, or capture time
+as a fallback) and size match something already cataloged -- hashing every
+already-imported file on every re-scan was measured too slow to be the
+default. `--verify-content` hash-verifies the full bytes on top of that, for
+when you know a same-size edit is in play; when it finds an identity+size
+match whose content actually differs, it reports a `near-miss` line with the
+byte count and offset of the difference, rather than importing silently. A
+file reprocessed externally (colour, curves) almost always changes size too,
+so it imports alongside the original with a `_1`-style suffix under either
+mode; a same-size, byte-preserving edit is only caught with
+`--verify-content` on.
+
 ## The query language
 
 Barewords are tags; adjacency means AND.

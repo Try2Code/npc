@@ -35,6 +35,20 @@ pub struct PlannedStack {
     pub members: Vec<PlannedFile>,
     /// Set when this shot is already in the library.
     pub duplicate_of: Option<String>,
+    /// Set (only under `--verify-content`) when identity and size matched an
+    /// existing file but the bytes didn't -- so it's importing as new, not
+    /// being silently skipped, but it's worth knowing how close a call it was.
+    pub near_miss: Option<NearMiss>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NearMiss {
+    /// The anchor file actually compared -- not just any member of the
+    /// stack, so this is exactly what to open to look at what differs.
+    pub source: String,
+    pub candidate: String,
+    pub diff_bytes: u64,
+    pub first_diff_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -54,8 +68,16 @@ pub struct ImportStats {
     pub errors: Vec<String>,
 }
 
-/// Build the plan without touching anything.
-pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedStack>> {
+/// Build the plan without touching anything. `verify_content` controls
+/// whether an identity match (serial+shutter) also has to hash-verify before
+/// being trusted as a duplicate -- see `find_duplicate` for why this
+/// defaults to off.
+pub fn plan(
+    cat: &Catalog,
+    source: &Path,
+    library: &Path,
+    verify_content: bool,
+) -> Result<Vec<PlannedStack>> {
     if !source.is_dir() {
         bail!("import source {} is not a directory", source.display());
     }
@@ -80,8 +102,11 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
             .push((entry.path().to_path_buf(), c.role, size));
     }
 
-    // Existing (serial, shutter_count) pairs, for exact duplicate detection.
+    // Existing (serial, shutter_count) pairs and (capture_time, size) pairs,
+    // both just candidates -- neither is trusted as a duplicate until
+    // `find_duplicate` verifies the bytes actually match.
     let known = known_shots(cat)?;
+    let known_content = known_by_content(cat)?;
 
     let mut plans = Vec::new();
     let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -119,7 +144,18 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
             None => library.join("undated"),
         };
 
-        let duplicate_of = ident.as_ref().and_then(|k| known.get(k).cloned());
+        let (duplicate_of, near_miss) = match anchor {
+            Some((path, _, size)) => find_duplicate(
+                path,
+                *size,
+                ident.as_ref(),
+                capture_time,
+                &known,
+                &known_content,
+                verify_content,
+            ),
+            None => (None, None),
+        };
 
         // Resolve one collision suffix for the whole stack, so members keep
         // matching basenames and their shared sidecar still works.
@@ -159,19 +195,49 @@ pub fn plan(cat: &Catalog, source: &Path, library: &Path) -> Result<Vec<PlannedS
             capture_time,
             members: planned,
             duplicate_of,
+            near_miss,
         });
     }
 
     Ok(plans)
 }
 
+/// Reported as `execute` works through a plan, so a caller can drive a
+/// progress display and log what got skipped and why -- `import.rs` stays
+/// free of presentation concerns; `main.rs` owns what these look like on
+/// screen.
+pub enum ImportEvent<'a> {
+    /// A verified duplicate: same identity and same bytes. Not copied.
+    Skipped(&'a PlannedStack),
+    /// One stack finished copying. `index`/`total` count stacks actually
+    /// being copied, not the whole plan (duplicates don't advance it).
+    Copied {
+        index: usize,
+        total: usize,
+        stack: &'a PlannedStack,
+        bytes: u64,
+    },
+    Failed {
+        stack: &'a PlannedStack,
+        error: &'a str,
+    },
+}
+
 /// Execute a plan. Copies only; the source is left exactly as it was.
-pub fn execute(plans: &[PlannedStack], config: &Config, dry_run: bool) -> Result<ImportStats> {
+pub fn execute(
+    plans: &[PlannedStack],
+    config: &Config,
+    dry_run: bool,
+    on_event: &mut dyn FnMut(ImportEvent),
+) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
+    let total = plans.iter().filter(|p| p.duplicate_of.is_none()).count();
+    let mut index = 0;
 
     for stack in plans {
         if stack.duplicate_of.is_some() {
             stats.duplicates_skipped += 1;
+            on_event(ImportEvent::Skipped(stack));
             continue;
         }
 
@@ -180,9 +246,17 @@ pub fn execute(plans: &[PlannedStack], config: &Config, dry_run: bool) -> Result
             .with_context(|| "import destination is protected")?;
 
         if dry_run {
+            let bytes: u64 = stack.members.iter().map(|m| m.size).sum();
             stats.stacks_copied += 1;
             stats.files_copied += stack.members.len();
-            stats.bytes_copied += stack.members.iter().map(|m| m.size).sum::<u64>();
+            stats.bytes_copied += bytes;
+            index += 1;
+            on_event(ImportEvent::Copied {
+                index,
+                total,
+                stack,
+                bytes,
+            });
             continue;
         }
 
@@ -190,6 +264,7 @@ pub fn execute(plans: &[PlannedStack], config: &Config, dry_run: bool) -> Result
             .with_context(|| format!("creating {}", stack.dest_dir.display()))?;
 
         let mut copied_here = Vec::new();
+        let mut stack_bytes = 0u64;
         let mut failed = false;
 
         for m in &stack.members {
@@ -197,10 +272,13 @@ pub fn execute(plans: &[PlannedStack], config: &Config, dry_run: bool) -> Result
                 Ok(bytes) => {
                     stats.files_copied += 1;
                     stats.bytes_copied += bytes;
+                    stack_bytes += bytes;
                     copied_here.push(m.dest.clone());
                 }
                 Err(e) => {
-                    stats.errors.push(format!("{}: {e}", m.src.display()));
+                    let msg = format!("{}: {e}", m.src.display());
+                    on_event(ImportEvent::Failed { stack, error: &msg });
+                    stats.errors.push(msg);
                     failed = true;
                     break;
                 }
@@ -217,6 +295,13 @@ pub fn execute(plans: &[PlannedStack], config: &Config, dry_run: bool) -> Result
         }
 
         stats.stacks_copied += 1;
+        index += 1;
+        on_event(ImportEvent::Copied {
+            index,
+            total,
+            stack,
+            bytes: stack_bytes,
+        });
     }
 
     Ok(stats)
@@ -279,29 +364,197 @@ pub fn hash_file(path: &Path) -> Result<blake3::Hash> {
     Ok(hasher.finalize())
 }
 
-/// `(serial, shutter_count) -> "dir/base"` for everything already cataloged.
-/// Exact for Nikon bodies, which is what makes import dedupe reliable rather
-/// than heuristic.
-fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), String>> {
+/// `(serial, shutter_count) -> (path, size)` for everything already
+/// cataloged. Exact for Nikon bodies, which is what makes the identity half
+/// of dedup reliable rather than heuristic -- but identity is only ever a
+/// candidate here, not a verdict: `find_duplicate` still has to confirm the
+/// size (and, with `--verify-content`, the bytes) at `path` actually match
+/// before trusting it.
+///
+/// A raw and its sibling JPG share the same maker-note serial+shutter (it's
+/// shot-level, not file-level), so more than one row can carry the same key.
+/// Only one survives per stack here -- preferring the raw, exactly like the
+/// anchor choice in `plan()` -- or an incoming raw could get compared against
+/// its own JPG sibling's size and lose a real match, or worse, an incoming
+/// JPG against a raw's size and never match at all.
+fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), (String, i64)>> {
     let mut stmt = cat.conn.prepare(
-        "SELECT f.serial, f.shutter_count, s.dir || '/' || s.base
+        "SELECT f.stack_id, f.role, f.serial, f.shutter_count, s.dir || '/' || f.name, f.size
          FROM file f JOIN stack s ON s.id = f.stack_id
-         WHERE f.serial IS NOT NULL AND f.serial != ''
-           AND f.shutter_count IS NOT NULL AND f.shutter_count != 0",
+         WHERE f.role IN ('raw', 'oocjpg')
+           AND f.serial IS NOT NULL AND f.serial != ''
+           AND f.shutter_count IS NOT NULL AND f.shutter_count != 0
+           AND f.size IS NOT NULL",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            u32::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+
+    let mut by_stack: HashMap<i64, (String, String, u32, String, i64)> = HashMap::new();
+    for row in rows {
+        let (stack_id, role, serial, count, path, size) = row?;
+        let keep_existing = by_stack
+            .get(&stack_id)
+            .is_some_and(|(prev_role, ..)| prev_role == "raw");
+        if !keep_existing {
+            by_stack.insert(stack_id, (role, serial, count, path, size));
+        }
+    }
+
+    let mut map = HashMap::new();
+    for (_role, serial, count, path, size) in by_stack.into_values() {
+        map.insert((serial, count), (path, size));
+    }
+    Ok(map)
+}
+
+/// `(capture_time, size) -> [path]` for everything already cataloged with
+/// both known. Only consulted when an incoming file has no usable
+/// serial+shutter identity at all -- a non-Nikon body, or EXIF stripped by
+/// an export tool -- or when its identity matched but the bytes didn't.
+fn known_by_content(cat: &Catalog) -> Result<HashMap<(i64, i64), Vec<String>>> {
+    let mut stmt = cat.conn.prepare(
+        "SELECT f.capture_time, f.size, s.dir || '/' || f.name
+         FROM file f JOIN stack s ON s.id = f.stack_id
+         WHERE f.role IN ('raw','oocjpg')
+           AND f.capture_time IS NOT NULL AND f.size IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
             r.get::<_, String>(2)?,
         ))
     })?;
-    let mut map = HashMap::new();
+    let mut map: HashMap<(i64, i64), Vec<String>> = HashMap::new();
     for row in rows {
-        let (serial, count, path) = row?;
-        map.insert((serial, count), path);
+        let (t, size, path) = row?;
+        map.entry((t, size)).or_default().push(path);
     }
     Ok(map)
+}
+
+/// Identity (serial+shutter) plus size is trusted as a duplicate by default,
+/// without reading either file: on a real library, hash-verifying every
+/// already-imported stack on every re-scan meant reading its full bytes off
+/// the card *and* its library twin, every time -- measured on a real 1700+
+/// stack card, that didn't finish in two minutes. Re-encoding or reprocessing
+/// a file essentially always changes its size, so size alone already catches
+/// the case that matters: a file reprocessed externally (EXIF and filename
+/// untouched, pixels not) comes in as a new variant instead of being
+/// silently dropped as "already have it". `verify_content` opts into a full
+/// hash check on top, for when you know a same-size, byte-preserving edit is
+/// in play and want certainty over speed.
+///
+/// The content-only fallback (no identity at all -- a non-Nikon body, or
+/// stripped EXIF) has no size-based shortcut to lean on, so it always
+/// hash-verifies; it's also the rare path, not the one that was slow.
+fn find_duplicate(
+    anchor_path: &Path,
+    anchor_size: u64,
+    ident: Option<&(String, u32)>,
+    capture_time: Option<i64>,
+    known_shots: &HashMap<(String, u32), (String, i64)>,
+    known_by_content: &HashMap<(i64, i64), Vec<String>>,
+    verify_content: bool,
+) -> (Option<String>, Option<NearMiss>) {
+    let anchor_size = i64::try_from(anchor_size).unwrap_or(i64::MAX);
+    let mut near_miss = None;
+
+    if let Some(k) = ident {
+        if let Some((path, size)) = known_shots.get(k) {
+            if *size == anchor_size {
+                if !verify_content {
+                    return (Some(path.clone()), None);
+                }
+                match compare_content(anchor_path, Path::new(path)) {
+                    ContentCheck::Matched => return (Some(path.clone()), None),
+                    // Identity and size matched but the bytes didn't, beyond
+                    // tolerance -- explain why, for --verify-content's
+                    // diagnostic output, then fall through: it's not this
+                    // candidate, but another one might still match via
+                    // capture_time.
+                    ContentCheck::Differs(diff) => {
+                        near_miss = diff.map(|(diff_bytes, first_diff_offset)| NearMiss {
+                            source: anchor_path.display().to_string(),
+                            candidate: path.clone(),
+                            diff_bytes,
+                            first_diff_offset,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(t) = capture_time {
+        if let Some(candidates) = known_by_content.get(&(t, anchor_size)) {
+            for path in candidates {
+                if matches!(
+                    compare_content(anchor_path, Path::new(path)),
+                    ContentCheck::Matched
+                ) {
+                    return (Some(path.clone()), None);
+                }
+            }
+        }
+    }
+
+    (None, near_miss)
+}
+
+/// A stray single byte is what an in-place metadata rewrite looks like, not
+/// a real edit -- confirmed on a real library: every near-miss found there
+/// (Shotwell embedding something after import) differed by exactly one byte,
+/// always at the same offset for a given camera's fixed EXIF layout. That
+/// offset is an artifact of one camera/tool combination, not a general fact,
+/// so the tolerance is on *how much* differs, not *where* -- a real edit
+/// (colour, crop, recompression) touches far more than one byte.
+const TOLERATED_DIFF_BYTES: u64 = 1;
+
+enum ContentCheck {
+    Matched,
+    /// Beyond tolerance. Carries the diff, when it could be computed, for
+    /// the near-miss diagnostic -- `None` only if reading either file failed.
+    Differs(Option<(u64, u64)>),
+}
+
+fn compare_content(a: &Path, b: &Path) -> ContentCheck {
+    match diff_summary(a, b) {
+        Ok(None) => ContentCheck::Matched,
+        Ok(Some((diff_bytes, _))) if diff_bytes <= TOLERATED_DIFF_BYTES => ContentCheck::Matched,
+        Ok(Some(diff)) => ContentCheck::Differs(Some(diff)),
+        Err(_) => ContentCheck::Differs(None),
+    }
+}
+
+/// How different two same-size files are: total differing bytes and the
+/// offset of the first one. Only used to explain a `--verify-content`
+/// near-miss -- `Ok(None)` means they turned out identical after all.
+fn diff_summary(a: &Path, b: &Path) -> Result<Option<(u64, u64)>> {
+    let a = std::fs::read(a)?;
+    let b = std::fs::read(b)?;
+    if a == b {
+        return Ok(None);
+    }
+    let mut diff_bytes = 0u64;
+    let mut first_diff_offset = None;
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            diff_bytes += 1;
+            if first_diff_offset.is_none() {
+                first_diff_offset = Some(i as u64);
+            }
+        }
+    }
+    Ok(Some((diff_bytes, first_diff_offset.unwrap_or(0))))
 }
 
 /// `YYYY/MM/DD` from a unix timestamp, using the same as-if-UTC convention the
@@ -439,6 +692,270 @@ mod tests {
             "750_0002"
         );
     }
+
+    /// A raw and its sibling JPG share the same maker-note serial+shutter --
+    /// it's shot-level, not file-level. `known_shots` must not let the JPG
+    /// row silently shadow the raw's under that key, or an incoming raw
+    /// anchor gets compared against the JPG's (much smaller) size and a real
+    /// duplicate is missed entirely.
+    #[test]
+    fn known_shots_prefers_the_raw_member_over_its_jpg_sibling() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES ('/lib/2026/08/09', '750_0001')",
+                [],
+            )
+            .unwrap();
+        let sid = cat
+            .stack_id("/lib/2026/08/09", "750_0001")
+            .unwrap()
+            .unwrap();
+        for (name, role, size) in [
+            ("750_0001.JPG", "oocjpg", 8_000_000i64),
+            ("750_0001.NEF", "raw", 25_000_000i64),
+        ] {
+            cat.conn
+                .execute(
+                    "INSERT INTO file (stack_id, name, role, serial, shutter_count, size, present)
+                     VALUES (?1, ?2, ?3, '6094708', 63987, ?4, 1)",
+                    rusqlite::params![sid, name, role, size],
+                )
+                .unwrap();
+        }
+
+        let known = known_shots(&cat).unwrap();
+        let (path, size) = known.get(&("6094708".to_string(), 63987)).unwrap();
+        assert!(path.ends_with("750_0001.NEF"), "{path}");
+        assert_eq!(*size, 25_000_000);
+    }
+
+    #[test]
+    fn identity_match_with_matching_content_is_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.NEF");
+        let incoming = dir.path().join("incoming.NEF");
+        std::fs::write(&existing, vec![9u8; 4096]).unwrap();
+        std::fs::write(&incoming, vec![9u8; 4096]).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(dup, Some(existing.to_string_lossy().to_string()));
+        assert!(near_miss.is_none());
+    }
+
+    /// The default, fast path: identity + size is trusted without reading
+    /// either file. Hash-verifying every already-imported stack on every
+    /// re-scan was measured too slow on a real card to be the default (see
+    /// `find_duplicate`'s doc comment) -- so a same-size collision here is
+    /// accepted as a duplicate unless `--verify-content` was asked for. In
+    /// practice this only matters for a same-size, byte-preserving edit,
+    /// which no real editing tool produces.
+    #[test]
+    fn same_size_identity_match_is_trusted_without_hashing_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        std::fs::write(&existing, vec![1u8; 4096]).unwrap();
+        std::fs::write(&incoming, vec![2u8; 4096]).unwrap(); // same size, different bytes
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(dup, Some(existing.to_string_lossy().to_string()));
+        assert!(near_miss.is_none());
+    }
+
+    /// A file reprocessed externally (colour, curves) keeps its EXIF and
+    /// filename, so its identity still matches -- but it is a different
+    /// photograph, not the same file twice, and must not be swallowed as
+    /// "already have it" once `--verify-content` is asked for. The near-miss
+    /// diagnostic must explain why, for `--verify-content`'s output.
+    #[test]
+    fn identity_match_with_different_content_is_not_a_duplicate_when_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        std::fs::write(&existing, vec![1u8; 4096]).unwrap();
+        std::fs::write(&incoming, vec![2u8; 4096]).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(
+            dup, None,
+            "identity matched but bytes differ -- must not be treated as a duplicate"
+        );
+        let nm = near_miss.expect("a near-miss should have been recorded");
+        assert_eq!(nm.source, incoming.to_string_lossy().to_string());
+        assert_eq!(nm.candidate, existing.to_string_lossy().to_string());
+        assert_eq!(nm.diff_bytes, 4096, "every byte differs (1 vs 2)");
+        assert_eq!(nm.first_diff_offset, 0);
+    }
+
+    /// A stray single byte is exactly what an in-place metadata rewrite
+    /// (Shotwell, observed on a real library) looks like -- confirmed a
+    /// duplicate under `--verify-content`, not a near-miss.
+    #[test]
+    fn a_single_byte_difference_is_still_a_duplicate_under_verify_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        let mut data = vec![9u8; 4096];
+        std::fs::write(&existing, &data).unwrap();
+        data[2000] ^= 0xFF; // exactly one byte differs
+        std::fs::write(&incoming, &data).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(dup, Some(existing.to_string_lossy().to_string()));
+        assert!(near_miss.is_none());
+    }
+
+    /// The boundary right past tolerance: two differing bytes must still be
+    /// reported as a near-miss, not silently accepted. Guards against the
+    /// tolerance check drifting from "at most one" to "any small number".
+    #[test]
+    fn two_byte_difference_is_still_a_near_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        let mut data = vec![9u8; 4096];
+        std::fs::write(&existing, &data).unwrap();
+        data[100] ^= 0xFF;
+        data[2000] ^= 0xFF;
+        std::fs::write(&incoming, &data).unwrap();
+
+        let mut known = HashMap::new();
+        known.insert(
+            ("6094708".to_string(), 100u32),
+            (existing.to_string_lossy().to_string(), 4096i64),
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            4096,
+            Some(&("6094708".to_string(), 100)),
+            Some(1_700_000_000),
+            &known,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(dup, None);
+        assert_eq!(near_miss.unwrap().diff_bytes, 2);
+    }
+
+    #[test]
+    fn content_fallback_without_identity_still_finds_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        let data = vec![7u8; 5000];
+        std::fs::write(&existing, &data).unwrap();
+        std::fs::write(&incoming, &data).unwrap();
+
+        let mut known_content = HashMap::new();
+        known_content.insert(
+            (1_700_000_000i64, 5000i64),
+            vec![existing.to_string_lossy().to_string()],
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            5000,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_content,
+            false,
+        );
+        assert_eq!(dup, Some(existing.to_string_lossy().to_string()));
+        assert!(near_miss.is_none());
+    }
+
+    /// A burst-mode collision on (capture_time, size) alone is not enough --
+    /// only a real byte match may be trusted. Unlike identity, this path has
+    /// no cheaper signal to fall back to, so it always hashes -- it's also
+    /// the rare path (missing serial+shutter), not the one that was slow.
+    #[test]
+    fn same_capture_time_and_size_but_different_bytes_is_not_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.JPG");
+        let incoming = dir.path().join("incoming.JPG");
+        std::fs::write(&existing, vec![1u8; 5000]).unwrap();
+        std::fs::write(&incoming, vec![2u8; 5000]).unwrap();
+
+        let mut known_content = HashMap::new();
+        known_content.insert(
+            (1_700_000_000i64, 5000i64),
+            vec![existing.to_string_lossy().to_string()],
+        );
+
+        let (dup, near_miss) = find_duplicate(
+            &incoming,
+            5000,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_content,
+            false,
+        );
+        assert_eq!(dup, None);
+        assert!(
+            near_miss.is_none(),
+            "no identity match, so no near-miss to report"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -486,8 +1003,8 @@ mod safety_tests {
         let cat = Catalog::open_memory().unwrap();
 
         let before = fingerprint(card.path());
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
-        execute(&plans, &Config::default(), false).unwrap();
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
 
         assert_eq!(before, fingerprint(card.path()), "import modified the card");
     }
@@ -498,8 +1015,8 @@ mod safety_tests {
         let lib = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
 
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
-        let stats = execute(&plans, &Config::default(), false).unwrap();
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        let stats = execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
         assert_eq!(stats.files_copied, 2, "errors: {:?}", stats.errors);
 
         for p in &plans[0].members {
@@ -520,12 +1037,12 @@ mod safety_tests {
         let lib = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
 
-        let mut plans = plan(&cat, card.path(), lib.path()).unwrap();
+        let mut plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         // Point the second member at a source that does not exist, so its copy
         // fails after the first has already succeeded.
         plans[0].members[1].src = card.path().join("does-not-exist.JPG");
 
-        let stats = execute(&plans, &Config::default(), false).unwrap();
+        let stats = execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
         assert_eq!(stats.stacks_copied, 0);
         assert_eq!(stats.errors.len(), 1);
 
@@ -551,8 +1068,8 @@ mod safety_tests {
         let lib = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
 
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
-        execute(&plans, &Config::default(), false).unwrap();
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
 
         let parts: Vec<_> = walkdir::WalkDir::new(lib.path())
             .into_iter()
@@ -594,8 +1111,8 @@ mod safety_tests {
         let lib = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
 
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
-        let stats = execute(&plans, &Config::default(), true).unwrap();
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        let stats = execute(&plans, &Config::default(), true, &mut |_| {}).unwrap();
 
         assert_eq!(stats.files_copied, 2, "dry run should still report a plan");
         assert!(!lib.path().join("undated").exists());
@@ -617,8 +1134,8 @@ mod safety_tests {
             ..Default::default()
         };
 
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
-        assert!(execute(&plans, &config, false).is_err());
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        assert!(execute(&plans, &config, false, &mut |_| {}).is_err());
     }
 
     /// Undated files must land somewhere obvious rather than being guessed at
@@ -630,7 +1147,7 @@ mod safety_tests {
         let lib = tempfile::tempdir().unwrap();
         let cat = Catalog::open_memory().unwrap();
 
-        let plans = plan(&cat, card.path(), lib.path()).unwrap();
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         assert_eq!(plans.len(), 1);
         assert!(plans[0].capture_time.is_none());
         assert!(
@@ -638,5 +1155,56 @@ mod safety_tests {
             "{:?}",
             plans[0].dest_dir
         );
+    }
+
+    /// A verified duplicate must be reported through the event hook, the same
+    /// mechanism the CLI uses to log what it skipped and why.
+    #[test]
+    fn a_verified_duplicate_fires_a_skipped_event() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let mut plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        plans[0].duplicate_of = Some("/lib/2026/08/09/750_0001".to_string());
+
+        let mut skipped = 0;
+        let mut copied = 0;
+        let stats = execute(&plans, &Config::default(), false, &mut |ev| match ev {
+            ImportEvent::Skipped(_) => skipped += 1,
+            ImportEvent::Copied { .. } => copied += 1,
+            ImportEvent::Failed { .. } => {}
+        })
+        .unwrap();
+
+        assert_eq!(skipped, 1);
+        assert_eq!(copied, 0);
+        assert_eq!(stats.duplicates_skipped, 1);
+    }
+
+    /// A fresh stack fires a `Copied` event carrying real progress info, not
+    /// just a final count -- this is what drives the CLI's progress line.
+    #[test]
+    fn a_fresh_stack_fires_a_copied_event_with_progress_info() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        let mut seen = Vec::new();
+        execute(&plans, &Config::default(), false, &mut |ev| {
+            if let ImportEvent::Copied {
+                index,
+                total,
+                bytes,
+                ..
+            } = ev
+            {
+                seen.push((index, total, bytes));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(seen, vec![(1, 1, 400_000)]);
     }
 }

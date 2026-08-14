@@ -62,26 +62,46 @@ fn mount_for_dev(major: u32, minor: u32) -> Option<(PathBuf, Option<String>)> {
     let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     let want = format!("{major}:{minor}");
 
-    let mut best: Option<(PathBuf, Option<String>)> = None;
+    // Later entries shadow earlier ones for the same device; keep the last.
+    parse_mountinfo(&text)
+        .into_iter()
+        .rfind(|(_, devno, _, _)| *devno == want)
+        .map(|(mount, _, _, source)| (mount, source))
+}
+
+/// Every mount in /proc/self/mountinfo: (mountpoint, "major:minor", fstype, source device).
+/// Shared by `mount_for_dev` (looks up one device) and `cards::detect` (wants
+/// every mount, to find the ones with a `DCIM` folder).
+pub(crate) fn parse_mountinfo(text: &str) -> Vec<(PathBuf, String, String, Option<String>)> {
+    let mut out = Vec::new();
     for line in text.lines() {
         let mut parts = line.split(' ');
-        let _id = parts.next()?;
-        let _parent = parts.next()?;
-        let devno = parts.next()?;
-        let _root = parts.next()?;
-        let mountpoint = parts.next()?;
-        if devno != want {
+        let Some(_id) = parts.next() else { continue };
+        let Some(_parent) = parts.next() else {
             continue;
-        }
-        let source = line
-            .split(" - ")
-            .nth(1)
-            .and_then(|tail| tail.split(' ').nth(1))
-            .map(unescape);
-        // Later entries shadow earlier ones for the same device; keep the last.
-        best = Some((PathBuf::from(unescape(mountpoint)), source));
+        };
+        let Some(devno) = parts.next() else { continue };
+        let Some(_root) = parts.next() else { continue };
+        let Some(mountpoint) = parts.next() else {
+            continue;
+        };
+        let mut tail = line.split(" - ");
+        let Some(fstype_and_source) = tail.nth(1) else {
+            continue;
+        };
+        let mut fs_parts = fstype_and_source.split(' ');
+        let Some(fstype) = fs_parts.next() else {
+            continue;
+        };
+        let source = fs_parts.next().map(unescape);
+        out.push((
+            PathBuf::from(unescape(mountpoint)),
+            devno.to_string(),
+            fstype.to_string(),
+            source,
+        ));
     }
-    best
+    out
 }
 
 fn mount_point_by_walking(path: &Path) -> PathBuf {

@@ -6,6 +6,7 @@
 //! without losing anything.
 
 pub mod action;
+pub mod cards;
 pub mod config;
 pub mod db;
 pub mod doctor;

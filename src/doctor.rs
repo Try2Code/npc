@@ -353,10 +353,20 @@ mod tests {
     fn a_clean_library_reports_nothing_to_do() {
         let (dir, cat) = library();
         let findings = run(&cat, dir.path(), &Config::default()).unwrap();
+        // "no actions available" is a fact about the machine running the
+        // test (which editors happen to be on PATH), not about the library
+        // -- excluded here so this test asserts library cleanliness only,
+        // not incidental host state. A minimal CI container has none of
+        // RawTherapee/darktable/GIMP/xdg-open installed and would otherwise
+        // fail this exact assertion regardless of the library being clean.
+        let relevant: Vec<_> = findings
+            .iter()
+            .filter(|f| f.title != "no actions available")
+            .collect();
         assert!(
-            findings.iter().all(|f| f.severity != Severity::Warn),
+            relevant.iter().all(|f| f.severity != Severity::Warn),
             "clean library produced warnings: {:#?}",
-            findings
+            relevant
                 .iter()
                 .filter(|f| f.severity == Severity::Warn)
                 .collect::<Vec<_>>()

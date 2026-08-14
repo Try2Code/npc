@@ -829,7 +829,19 @@ fn main() -> Result<()> {
             // first run, and must not fail on volume resolution.
             std::fs::create_dir_all(&root)
                 .with_context(|| format!("creating library {}", root.display()))?;
-            let cat = open_for(&root)?;
+
+            // Dedup only ever sees what the catalog knows. Planning against a
+            // stale one (a file added by hand, or just time since the last
+            // scan) can silently miss a real duplicate and create an unwanted
+            // copy -- confirmed live: a file already in the library was
+            // planned as new because its directory had never been scanned in
+            // at all. Incremental, so this is cheap once nothing outside
+            // npc's own writes has changed.
+            let (scan_stats, cat) = scan::scan_root(&root, false)?;
+            println!(
+                "catalog: {} stacks ({} new/changed)",
+                scan_stats.stacks, scan_stats.parsed
+            );
 
             let sources = match source {
                 Some(p) => vec![p],

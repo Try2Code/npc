@@ -907,21 +907,35 @@ fn main() -> Result<()> {
                             .members
                             .first()
                             .map_or_else(|| stack.base.clone(), |m| m.src.display().to_string());
-                        println!("skip (already in library, unchanged): {name}");
+                        let existing = stack.duplicate_of.as_deref().unwrap_or("?");
+                        println!("skip (already in library, unchanged): {name} -> {existing}");
                     }
                     npc::import::ImportEvent::Copied {
                         index,
                         total,
+                        stack,
                         bytes,
-                        ..
                     } => {
-                        bytes_so_far += bytes;
-                        print!(
-                            "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
-                            bytes_so_far as f64 / 1e9,
-                            total_bytes as f64 / 1e9
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        if dry_run {
+                            // Nothing is actually copied yet -- show exactly
+                            // where each member would land, so the plan is
+                            // inspectable before committing to it.
+                            for m in &stack.members {
+                                println!(
+                                    "  would copy: {} -> {}",
+                                    m.src.display(),
+                                    m.dest.display()
+                                );
+                            }
+                        } else {
+                            bytes_so_far += bytes;
+                            print!(
+                                "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
+                                bytes_so_far as f64 / 1e9,
+                                total_bytes as f64 / 1e9
+                            );
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
                     }
                     npc::import::ImportEvent::Failed { error, .. } => {
                         eprintln!("\nerror: {error}");

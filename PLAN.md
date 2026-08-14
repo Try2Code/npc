@@ -668,10 +668,10 @@ the suite passes here.
     volume-UUID detection, the offline path, and library-scale performance. Non-mutating, run
     only once everything above passes, with the hash manifest checked afterwards.
 
-### Running them: local, no CI
+### Running them: local, plus a fixture-only CI job
 
 `git init` in `npc` for history and bisectability, plus a `check` script running fmt, clippy,
-the suite, and the hash tripwire. No pipeline, for two reasons:
+the suite, and the hash tripwire. Originally no pipeline at all, for two reasons:
 
 - The tests that matter most — the tripwire, the read-only invariant, the real-data stacking
   assertion — depend on 41 GB of your photographs. Making CI green would mean uploading them.
@@ -679,9 +679,14 @@ the suite, and the hash tripwire. No pipeline, for two reasons:
   different library than the one you run, so a green pipeline could coexist with a broken
   local build.
 
-The split for adding CI later is already in place: the small synthetic fixtures are checked in
-and shareable, so a pipeline can run build + clippy + fixture-only tests while the real-data
-tests stay local. Worth doing when a second machine or person is involved, not before.
+`.gitlab-ci.yml` now exists, running exactly the split described above: `./check quick` --
+fmt, clippy, and the unit + invariant tests, all of which run against synthetic fixtures and
+`tempfile` dirs rather than real photographs. It needed one real fix to make `./check quick`
+usable standalone: the "test photographs" pre-check used to `bad`-report whenever `testdata/`
+was absent regardless of mode, which would have made every CI run (and a fresh clone before
+`./fetch-test-data`) fail on a check that mode never even runs. `./check` (full mode) still
+fails loudly when the data is missing, exactly as before -- that sentinel is the point, and
+stays local-only along with everything that needs the real library.
 
 ## Milestones
 

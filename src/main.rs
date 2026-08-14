@@ -204,14 +204,23 @@ enum Cmd {
     },
     /// Copy photos from a card into a dated library. The source is never modified.
     Import {
-        /// Where the photos are now (a card, an inbox directory)
-        source: PathBuf,
-        /// Library root; files land in <library>/YYYY/MM/DD/
+        /// Where the photos are now (a card, an inbox directory). If
+        /// omitted, mounted cards are detected and you're prompted to pick.
+        source: Option<PathBuf>,
+        /// Library root; files land in <library>/YYYY/MM/DD/. Defaults to
+        /// the configured library, like every other subcommand.
         #[arg(long)]
-        library: PathBuf,
+        library: Option<PathBuf>,
         /// Show the plan without copying anything
         #[arg(long)]
         dry_run: bool,
+        /// Hash-verify an identity match before trusting it as a duplicate,
+        /// not just its size. Slower -- reads both files fully -- but catches
+        /// a same-size, byte-preserving edit that a size check alone would
+        /// miss. Off by default: measured too slow to hash every
+        /// already-imported stack on every re-scan.
+        #[arg(long)]
+        verify_content: bool,
     },
     /// List shooting days, and give them names.
     Events {
@@ -344,6 +353,41 @@ fn library(explicit: Option<&Path>) -> Result<PathBuf> {
 
 fn open_for(root: &Path) -> Result<Catalog> {
     Ok(open_checked(root)?.0)
+}
+
+/// Detect mounted cards and prompt for one or more to import. `Ok(None)`
+/// means the user cancelled (blank input) -- not an error, just nothing to do.
+fn pick_cards() -> Result<Option<Vec<PathBuf>>> {
+    let cards = npc::cards::detect()?;
+    if cards.is_empty() {
+        anyhow::bail!(
+            "no mounted card with a DCIM folder was found. \
+             Pass a path explicitly: npc import <path> --library <path>"
+        );
+    }
+
+    println!("mounted cards:");
+    for (i, c) in cards.iter().enumerate() {
+        match &c.label {
+            Some(label) => println!("  {}) {} ({label})", i + 1, c.mount.display()),
+            None => println!("  {}) {}", i + 1, c.mount.display()),
+        }
+    }
+    print!("import which? (e.g. \"1,3\", \"all\", enter to cancel): ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+
+    let picked = npc::cards::parse_selection(&line, cards.len())?;
+    if picked.is_empty() {
+        println!("nothing selected");
+        return Ok(None);
+    }
+
+    Ok(Some(
+        picked.into_iter().map(|i| cards[i].mount.clone()).collect(),
+    ))
 }
 
 /// Open a catalog and say whether the library itself is reachable. Read-only
@@ -774,65 +818,143 @@ fn main() -> Result<()> {
 
         Cmd::Import {
             source,
-            library,
+            library: library_arg,
             dry_run,
+            verify_content,
         } => {
+            let root = library(library_arg.as_deref())?;
             let config = npc::config::Config::load()?;
-            config.ensure_mutable(&library)?;
+            config.ensure_mutable(&root)?;
             // Importing into a library that does not exist yet is the normal
             // first run, and must not fail on volume resolution.
-            std::fs::create_dir_all(&library)
-                .with_context(|| format!("creating library {}", library.display()))?;
-            let cat = open_for(&library)?;
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating library {}", root.display()))?;
+            let cat = open_for(&root)?;
 
-            let plans = npc::import::plan(&cat, &source, &library)?;
-            let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
-            let fresh = plans.len() - dupes;
+            let sources = match source {
+                Some(p) => vec![p],
+                None => match pick_cards()? {
+                    Some(picked) => picked,
+                    None => return Ok(()),
+                },
+            };
 
-            println!("import {} -> {}", source.display(), library.display());
-            println!("  stacks found      {}", plans.len());
-            println!("  already in library {dupes}");
-            println!("  to copy           {fresh}");
+            let mut totals = npc::import::ImportStats::default();
+            for source in &sources {
+                let plans = npc::import::plan(&cat, source, &root, verify_content)?;
+                let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
+                let fresh = plans.len() - dupes;
 
-            let mut by_day: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::default();
-            for p in plans.iter().filter(|p| p.duplicate_of.is_none()) {
-                *by_day
-                    .entry(
-                        p.dest_dir
-                            .strip_prefix(&library)
-                            .unwrap_or(&p.dest_dir)
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                    .or_default() += 1;
-            }
-            for (day, n) in &by_day {
-                println!("    {day:<14} {n} stack(s)");
-            }
+                println!("import {} -> {}", source.display(), root.display());
+                println!("  stacks found      {}", plans.len());
+                println!("  already in library {dupes}");
+                println!("  to copy           {fresh}");
 
-            let stats = npc::import::execute(&plans, &config, dry_run)?;
-            if dry_run {
-                println!(
-                    "\ndry run: would copy {} files, {:.1} GB",
-                    stats.files_copied,
-                    stats.bytes_copied as f64 / 1e9
-                );
-            } else {
-                println!(
-                    "\ncopied {} stacks, {} files, {:.1} GB (source untouched)",
-                    stats.stacks_copied,
-                    stats.files_copied,
-                    stats.bytes_copied as f64 / 1e9
-                );
-                if stats.duplicates_skipped > 0 {
-                    println!("skipped {} duplicate(s)", stats.duplicates_skipped);
+                let mut by_day: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::default();
+                for p in plans.iter().filter(|p| p.duplicate_of.is_none()) {
+                    *by_day
+                        .entry(
+                            p.dest_dir
+                                .strip_prefix(&root)
+                                .unwrap_or(&p.dest_dir)
+                                .to_string_lossy()
+                                .to_string(),
+                        )
+                        .or_default() += 1;
                 }
-                for e in &stats.errors {
-                    eprintln!("error: {e}");
+                for (day, n) in &by_day {
+                    println!("    {day:<14} {n} stack(s)");
                 }
-                let (s, _) = scan::scan_root(&library, false)?;
+
+                if verify_content {
+                    for p in &plans {
+                        let Some(nm) = &p.near_miss else { continue };
+                        println!(
+                            "near-miss (identity+size matched, content didn't -- importing as new)\n  \
+                             card:    {}\n  \
+                             library: {}\n  \
+                             {} byte(s) differ, first at offset {}",
+                            nm.source, nm.candidate, nm.diff_bytes, nm.first_diff_offset
+                        );
+                    }
+                }
+
+                let total_bytes: u64 = plans
+                    .iter()
+                    .filter(|p| p.duplicate_of.is_none())
+                    .flat_map(|p| p.members.iter())
+                    .map(|m| m.size)
+                    .sum();
+
+                println!();
+                let mut bytes_so_far = 0u64;
+                let stats = npc::import::execute(&plans, &config, dry_run, &mut |ev| match ev {
+                    npc::import::ImportEvent::Skipped(stack) => {
+                        let name = stack
+                            .members
+                            .first()
+                            .map_or_else(|| stack.base.clone(), |m| m.src.display().to_string());
+                        println!("skip (already in library, unchanged): {name}");
+                    }
+                    npc::import::ImportEvent::Copied {
+                        index,
+                        total,
+                        bytes,
+                        ..
+                    } => {
+                        bytes_so_far += bytes;
+                        print!(
+                            "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
+                            bytes_so_far as f64 / 1e9,
+                            total_bytes as f64 / 1e9
+                        );
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    npc::import::ImportEvent::Failed { error, .. } => {
+                        eprintln!("\nerror: {error}");
+                    }
+                })?;
+                println!();
+
+                if dry_run {
+                    println!(
+                        "would copy {} files, {:.1} GB",
+                        stats.files_copied,
+                        stats.bytes_copied as f64 / 1e9
+                    );
+                } else {
+                    println!(
+                        "copied {} stacks, {} files, {:.1} GB (source untouched)",
+                        stats.stacks_copied,
+                        stats.files_copied,
+                        stats.bytes_copied as f64 / 1e9
+                    );
+                    if stats.duplicates_skipped > 0 {
+                        println!("skipped {} duplicate(s)", stats.duplicates_skipped);
+                    }
+                }
+                println!();
+
+                totals.stacks_copied += stats.stacks_copied;
+                totals.files_copied += stats.files_copied;
+                totals.bytes_copied += stats.bytes_copied;
+                totals.duplicates_skipped += stats.duplicates_skipped;
+                totals.errors.extend(stats.errors);
+            }
+
+            if !dry_run {
+                let (s, _) = scan::scan_root(&root, false)?;
                 println!("catalog now holds {} stacks", s.stacks);
+            }
+            if sources.len() > 1 {
+                println!(
+                    "\ntotals: {} stacks, {} files, {:.1} GB, {} duplicate(s) skipped",
+                    totals.stacks_copied,
+                    totals.files_copied,
+                    totals.bytes_copied as f64 / 1e9,
+                    totals.duplicates_skipped
+                );
             }
         }
 

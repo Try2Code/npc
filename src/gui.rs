@@ -99,8 +99,15 @@ impl GuiApp {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("query:");
-                let resp = ui.text_edit_singleline(&mut self.query);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                ui.text_edit_singleline(&mut self.query);
+                // Deliberately not gated on the text field's own focus state
+                // (`response.lost_focus()`) -- that's the documented egui
+                // idiom, but it didn't fire reliably here. There is exactly
+                // one text field in this app, so an unconditional check on
+                // Enter being pressed anywhere this frame is just as
+                // correct and doesn't depend on focus-tracking behaving as
+                // expected in this (very recent) egui release.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     match run_query(&self.cat, &self.query) {
                         Ok(rows) => {
                             self.rows = rows;
@@ -120,6 +127,11 @@ impl GuiApp {
 
     fn handle_nav_keys(&mut self, ui: &egui::Ui) {
         let cols = self.cols.max(1);
+        // ScrollArea only answers to the wheel/drag by default -- Page
+        // Up/Down need an explicit scroll request. Sign is a guess (egui's
+        // convention wasn't verified against a live window this session);
+        // flip if it turns out inverted.
+        let mut scroll_by = 0.0f32;
         ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
                 self.selected += 1;
@@ -133,33 +145,63 @@ impl GuiApp {
             if i.key_pressed(egui::Key::ArrowUp) {
                 self.selected = self.selected.saturating_sub(cols);
             }
+            if i.key_pressed(egui::Key::PageDown) {
+                scroll_by -= 3.0 * (TILE_PX + 8.0);
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                scroll_by += 3.0 * (TILE_PX + 8.0);
+            }
         });
+        if scroll_by != 0.0 {
+            ui.scroll_with_delta(egui::Vec2::new(0.0, scroll_by));
+        }
     }
 
     fn draw_grid(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             self.cols = ((ui.available_width() / (TILE_PX + 8.0)).floor() as usize).max(1);
+            let cols = self.cols;
             let ctx = ui.ctx().clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for idx in 0..self.rows.len() {
-                        let id = self.rows[idx].id;
-                        let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
-                            continue;
-                        };
-                        let Ok(path) = self.cache.make_now(&src, thumbs::Size::Grid) else {
-                            continue;
-                        };
-                        let Some(tex) = self.texture_for(&ctx, &path) else {
-                            continue;
-                        };
-                        let btn = egui::Button::image(&tex).selected(idx == self.selected);
-                        if ui.add_sized([TILE_PX, TILE_PX], btn).clicked() {
-                            self.selected = idx;
-                        }
-                    }
+            // `ScrollArea` auto-shrinks to fit its content by default, and
+            // `egui::Grid` sizes itself tightly to its tiles rather than the
+            // full panel width -- so the scroll area's hit-test rect shrank
+            // to match, and the wheel stopped registering over the margin
+            // outside the tiles. Force it to fill the panel instead.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // `horizontal_wrapped` is a flow layout (built for wrapping
+                    // text and mixed-size content); it does not guarantee a
+                    // shared row baseline for uniformly-sized items, and tiles
+                    // came out vertically offset within a row. `egui::Grid`
+                    // is an actual table layout -- every cell in a row shares
+                    // the row's height by construction.
+                    egui::Grid::new("thumbnail-grid")
+                        .min_col_width(TILE_PX)
+                        .min_row_height(TILE_PX)
+                        .spacing([8.0, 8.0])
+                        .show(ui, |ui| {
+                            for idx in 0..self.rows.len() {
+                                let id = self.rows[idx].id;
+                                if idx > 0 && idx % cols == 0 {
+                                    ui.end_row();
+                                }
+                                let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
+                                    continue;
+                                };
+                                let Ok(path) = self.cache.make_now(&src, thumbs::Size::Grid) else {
+                                    continue;
+                                };
+                                let Some(tex) = self.texture_for(&ctx, &path) else {
+                                    continue;
+                                };
+                                let btn = egui::Button::image(&tex).selected(idx == self.selected);
+                                if ui.add_sized([TILE_PX, TILE_PX], btn).clicked() {
+                                    self.selected = idx;
+                                }
+                            }
+                        });
                 });
-            });
         });
     }
 }

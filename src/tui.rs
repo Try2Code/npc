@@ -165,6 +165,13 @@ pub struct App {
     sidebar_cursor: usize,
     sidebar_focus: bool,
 
+    /// The exact fragment last spliced into `query` by picking a timeline
+    /// bucket or a sidebar entry -- so the next pick can replace just that
+    /// fragment instead of overwriting anything typed alongside it via `/`.
+    /// `None` once the fragment no longer appears verbatim (the user edited
+    /// or cleared it by hand), which falls back to a plain splice-in.
+    applied_filter: Option<String>,
+
     /// Whole-library bucket counts over time, independent of `query` -- a
     /// navigation aid, like the sidebar's dates list, not a view of the
     /// current filter.
@@ -250,6 +257,7 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_cursor: 0,
             sidebar_focus: false,
+            applied_filter: None,
             timeline: Vec::new(),
             timeline_cursor: 0,
             timeline_offset: 0,
@@ -281,6 +289,26 @@ impl App {
     }
 
     // --- data ------------------------------------------------------------
+
+    /// Bring a structural pick (a timeline bucket, a sidebar entry) into
+    /// `query` without discarding anything the user typed alongside it via
+    /// `/`. If the fragment from the *previous* pick is still present
+    /// verbatim, it is replaced in place; otherwise the new fragment is
+    /// anded onto whatever is there (or becomes the whole query, if it was
+    /// empty). Either way `applied_filter` is updated so the next pick can
+    /// find this one.
+    fn splice_filter(&mut self, fragment: &str) {
+        self.query = match self
+            .applied_filter
+            .as_deref()
+            .filter(|prior| self.query.contains(prior))
+        {
+            Some(prior) => self.query.replacen(prior, fragment, 1),
+            None if self.query.trim().is_empty() => fragment.to_string(),
+            None => format!("{fragment} and {}", self.query),
+        };
+        self.applied_filter = Some(fragment.to_string());
+    }
 
     fn reload(&mut self) -> Result<()> {
         let compiled = query::compile(&self.query)?;
@@ -985,7 +1013,7 @@ impl App {
             }
             KeyCode::Enter if self.timeline_focus => {
                 if let Some(b) = self.timeline.get(self.timeline_cursor) {
-                    self.query = b.filter.clone();
+                    self.splice_filter(&b.filter.clone());
                     self.offset = 0;
                     self.cursor = 0;
                     self.reload()?;
@@ -1000,10 +1028,11 @@ impl App {
             }
             KeyCode::Enter if self.sidebar_focus => {
                 if let Some((name, _)) = self.sidebar_items.get(self.sidebar_cursor) {
-                    self.query = match self.sidebar {
+                    let fragment = match self.sidebar {
                         Sidebar::Tags => format!("tag:\"{name}\""),
                         Sidebar::Dates => format!("event=\"{name}\""),
                     };
+                    self.splice_filter(&fragment);
                     self.offset = 0;
                     self.cursor = 0;
                     self.reload()?;
@@ -2529,6 +2558,34 @@ mod tests {
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.query, "date:2026-08");
         assert_eq!(app.total, 3);
+    }
+
+    /// Regression: picking a bucket used to overwrite `query` outright, so a
+    /// filter added afterwards via `/` (e.g. `rating>=4`) vanished the moment
+    /// a second bucket was picked. `splice_filter` must replace only the
+    /// fragment it inserted last time.
+    #[test]
+    fn a_manually_added_filter_survives_picking_a_second_bucket() {
+        let (_d, mut app) = app_multi_month();
+        press(&mut app, 'p');
+        press_code(&mut app, KeyCode::Enter); // pick the newest bucket
+        let first_filter = app.query.clone();
+
+        press(&mut app, '/');
+        type_str(&mut app, " and rating>=4");
+        assert_eq!(app.query, format!("{first_filter} and rating>=4"));
+
+        press_code(&mut app, KeyCode::Left); // still timeline-focused: move to another bucket
+        press_code(&mut app, KeyCode::Enter); // pick it
+        assert!(
+            app.query.contains("rating>=4"),
+            "manually added filter should survive picking a different bucket: {}",
+            app.query
+        );
+        assert_ne!(
+            app.query, first_filter,
+            "the date fragment should have moved to the newly picked bucket"
+        );
     }
 
     #[test]

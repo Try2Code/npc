@@ -198,6 +198,12 @@ pub struct App {
 
     view: View,
     cache: Option<thumbs::Cache>,
+    /// Raw decoded pixels, keyed by cache-file path -- content only, no
+    /// screen position or protocol state. Reading and JPEG-decoding a
+    /// thumbnail is the expensive part of showing one; nothing about *where*
+    /// it is drawn invalidates the pixels, so this survives rect changes,
+    /// resizes and the manual `r` re-send. Bounded the same way as `images`.
+    decoded: HashMap<PathBuf, image::DynamicImage>,
     /// Decoded images ready to draw, keyed by cache-file path. Bounded so a
     /// long scroll cannot grow without limit.
     images: HashMap<PathBuf, ratatui_image::protocol::StatefulProtocol>,
@@ -206,7 +212,8 @@ pub struct App {
     /// after its path moved to a new rect without telling the terminal is
     /// what produced black tiles (confirmed: `r`, which force-clears
     /// `images`, always fixed it). Comparing against this on every draw is
-    /// what lets that clearing happen automatically instead.
+    /// what lets that clearing happen automatically instead -- by rebuilding
+    /// a fresh `StatefulProtocol` from `decoded`, not by re-reading the file.
     last_rect: HashMap<PathBuf, Rect>,
     picker: Option<Picker>,
     /// Which member of the stack the single view is showing.
@@ -274,6 +281,7 @@ impl App {
             quit: false,
             view: View::List,
             cache: None,
+            decoded: HashMap::new(),
             images: HashMap::new(),
             last_rect: HashMap::new(),
             picker: None,
@@ -595,17 +603,28 @@ impl App {
         let Some(picker) = self.picker.as_mut() else {
             return false;
         };
-        let Ok(img) = image::open(path) else {
-            return false;
+        let img = if let Some(img) = self.decoded.get(path) {
+            img.clone()
+        } else {
+            let Ok(img) = image::open(path) else {
+                return false;
+            };
+            self.decoded.insert(path.clone(), img.clone());
+            img
         };
         let protocol = picker.new_resize_protocol(img);
         self.images.insert(path.clone(), protocol);
         true
     }
 
-    /// Like `ensure_decoded`, but also forces a fresh decode-and-transmit
-    /// whenever `path` is about to be drawn at a different rect than it was
-    /// last frame -- the moment a stale kitty-protocol placement can occur.
+    /// Like `ensure_decoded`, but also forces a fresh protocol -- a new
+    /// `StatefulProtocol`, hence a full retransmit -- whenever `path` is
+    /// about to be drawn at a different rect than it was last frame, the
+    /// moment a stale kitty-protocol placement can occur. This still costs a
+    /// re-encode and re-send, which is unavoidable since the tile genuinely
+    /// moved, but not a re-read and re-decode of the source file: `decoded`
+    /// keeps the pixels around independent of screen position, so only
+    /// `images` (the placement-bound state) gets dropped here.
     /// Every call site that draws an image should go through this, not
     /// `ensure_decoded` directly.
     fn ensure_decoded_at(&mut self, path: &PathBuf, rect: Rect) -> bool {
@@ -616,9 +635,11 @@ impl App {
         self.ensure_decoded(path)
     }
 
-    /// Drop every decoded image, forcing a fresh decode-and-transmit for
-    /// whatever is drawn next frame. Shared by the manual `r` key and by
-    /// `on_resize`. Returns how many were dropped, for the status line.
+    /// Drop every built protocol, forcing a fresh one -- and so a fresh
+    /// transmit -- for whatever is drawn next frame. Shared by the manual `r`
+    /// key and by `on_resize`. Deliberately leaves `decoded` alone: the pixel
+    /// content a resize or a stale placement invalidates is `images`, not
+    /// the source bytes. Returns how many were dropped, for the status line.
     fn clear_images(&mut self) -> usize {
         let dropped = self.images.len();
         self.images.clear();
@@ -1492,6 +1513,7 @@ impl App {
         let used = std::mem::take(&mut self.frame_used);
         self.images.retain(|k, _| used.contains(k));
         self.last_rect.retain(|k, _| used.contains(k));
+        self.decoded.retain(|k, _| used.contains(k));
         self.frame_used = used;
 
         if self.show_help {
@@ -2807,10 +2829,13 @@ mod tests {
 
     /// The black-frame bug: a cached protocol was reused even after its path
     /// moved to a new screen rect, which is what leaves a stale kitty
-    /// placement behind. `Picker::from_fontsize` builds a real picker without
-    /// a terminal, so this exercises the real decode path, not a stub.
+    /// placement behind. The fix rebuilds the protocol on a rect change, but
+    /// must not need the source file again to do it -- `decoded` carries the
+    /// pixels across that rebuild. `Picker::from_fontsize` builds a real
+    /// picker without a terminal, so this exercises the real decode path,
+    /// not a stub.
     #[test]
-    fn ensure_decoded_at_reuses_the_cache_only_when_the_rect_is_unchanged() {
+    fn a_rect_change_rebuilds_the_protocol_without_touching_disk_again() {
         let (_d, mut app) = app();
         let src_dir = tempfile::tempdir().unwrap();
         let path = src_dir.path().join("thumb.png");
@@ -2823,20 +2848,43 @@ mod tests {
             "first decode of a real file must succeed"
         );
 
-        // Delete the source: from here on, any FRESH decode attempt fails.
-        // If a later call still succeeds, that proves it reused the cache
-        // rather than re-opening the file -- the thing under test.
+        // Delete the source: from here on, any read from disk fails. If
+        // every call below still succeeds, none of them touched the file.
         std::fs::remove_file(&path).unwrap();
 
         assert!(
             app.ensure_decoded_at(&path, rect_a),
-            "same rect must reuse the cached protocol, not re-decode"
+            "same rect must reuse the cached protocol outright"
         );
 
         let rect_b = Rect::new(0, 0, 20, 20);
         assert!(
-            !app.ensure_decoded_at(&path, rect_b),
-            "a different rect must force a fresh decode, which fails now the file is gone"
+            app.ensure_decoded_at(&path, rect_b),
+            "a different rect must rebuild the protocol from the decoded-pixel \
+             cache, not by re-reading the now-deleted file"
+        );
+    }
+
+    /// The other half of the split: once the decoded pixels themselves are
+    /// gone (evicted because the tile scrolled off screen, say), a rect
+    /// change has nothing to rebuild from and must fall back to disk --
+    /// proving `decoded`, not wishful thinking, is what made the case above
+    /// work.
+    #[test]
+    fn a_rect_change_falls_back_to_disk_once_the_decoded_pixels_are_gone() {
+        let (_d, mut app) = app();
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = src_dir.path().join("thumb.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        app.picker = Some(Picker::from_fontsize((8, 16)));
+
+        assert!(app.ensure_decoded_at(&path, Rect::new(0, 0, 10, 10)));
+        app.decoded.remove(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            !app.ensure_decoded_at(&path, Rect::new(0, 0, 20, 20)),
+            "with neither the decoded cache nor the file available, this must fail"
         );
     }
 
@@ -2855,6 +2903,11 @@ mod tests {
         app.on_resize();
         assert!(app.images.is_empty(), "resize must drop every cached image");
         assert!(app.last_rect.is_empty());
+        assert_eq!(
+            app.decoded.len(),
+            1,
+            "a resize invalidates screen placement, not the decoded pixels"
+        );
     }
 
     #[test]

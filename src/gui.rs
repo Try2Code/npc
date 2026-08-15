@@ -4,9 +4,9 @@
 //! is `ratatui-image`'s Kitty encoder writing raw, uncompressed RGBA pixel
 //! data to the terminal -- not npc's own decode or resize work.)
 //!
-//! Deliberately minimal: a query box and a thumbnail grid, nothing else.
-//! Editing, the timeline, the sidebar and the single-image view all stay in
-//! `tui.rs` for now. This is one slice, not a port.
+//! Deliberately minimal: a query box, a thumbnail grid, and rating. Tagging,
+//! the timeline, the sidebar and the single-image view all stay in `tui.rs`
+//! for now. This is one slice, not a port.
 
 // Tile-columns-per-row is a UI layout count derived from a pixel width; an
 // available width beyond `usize::MAX` tiles, or negative, is not a case this
@@ -14,6 +14,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use crate::db::Catalog;
+use crate::edit::{self, Change};
 use crate::{config::Config, query, thumbs, vol};
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -25,6 +26,7 @@ const TILE_PX: f32 = 160.0;
 
 struct Row {
     id: i64,
+    rating: Option<i64>,
 }
 
 fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
@@ -37,7 +39,12 @@ fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
         .map(|p| p as &dyn rusqlite::ToSql)
         .collect();
     let rows = stmt
-        .query_map(params.as_slice(), |r| Ok(Row { id: r.get(0)? }))?
+        .query_map(params.as_slice(), |r| {
+            Ok(Row {
+                id: r.get(0)?,
+                rating: r.get(3)?,
+            })
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -45,8 +52,12 @@ fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
 struct GuiApp {
     cat: Catalog,
     cache: thumbs::Cache,
+    config: Config,
     query: String,
     query_error: Option<String>,
+    /// Feedback from the last rating edit -- separate from `query_error`,
+    /// which is specifically about the query box.
+    status: Option<String>,
     rows: Vec<Row>,
     selected: usize,
     /// Cache-file path -> uploaded GPU texture. Unlike the TUI's
@@ -64,17 +75,45 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(cat: Catalog, cache: thumbs::Cache) -> Self {
+    fn new(cat: Catalog, cache: thumbs::Cache, config: Config) -> Self {
         let rows = run_query(&cat, "").unwrap_or_default();
         Self {
             cat,
             cache,
+            config,
             query: String::new(),
             query_error: None,
+            status: None,
             rows,
             selected: 0,
             textures: HashMap::new(),
             cols: 1,
+        }
+    }
+
+    /// Set (or clear, for `None`) the star rating of the selected stack.
+    /// Mirrors `tui.rs`'s rating keys: same `edit::apply` + `edit::flush`
+    /// pair, then a full reload from the catalog rather than an optimistic
+    /// local update, so the grid never shows a rating that failed to write.
+    /// No undo stack here yet -- `tui.rs` has one; out of scope for this
+    /// first cut.
+    fn rate_selected(&mut self, n: Option<i64>) {
+        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
+            return;
+        };
+        if let Err(e) = edit::apply(&mut self.cat, &[id], &[Change::SetRating(n)], &self.config) {
+            self.status = Some(format!("rate failed: {e}"));
+            return;
+        }
+        self.status = match edit::flush(&mut self.cat, &self.config) {
+            Ok(stats) => Some(format!(
+                "rated: {} sidecar(s) written",
+                stats.sidecars_written
+            )),
+            Err(e) => Some(format!("rate failed: {e}")),
+        };
+        if let Ok(rows) = run_query(&self.cat, &self.query) {
+            self.rows = rows;
         }
     }
 
@@ -122,15 +161,50 @@ impl GuiApp {
             if let Some(err) = &self.query_error {
                 ui.colored_label(egui::Color32::RED, err);
             }
+            if let Some(s) = &self.status {
+                ui.label(s);
+            }
         });
     }
 
+    /// `0`-`5` rate the selected tile (`0` clears), matching `tui.rs`. Same
+    /// keyboard-focus guard as `handle_nav_keys`, and for the same reason:
+    /// digits are how you type a query like `rating>=3`.
+    fn handle_rating_keys(&mut self, ui: &egui::Ui) {
+        const KEYS: [(egui::Key, Option<i64>); 6] = [
+            (egui::Key::Num0, None),
+            (egui::Key::Num1, Some(1)),
+            (egui::Key::Num2, Some(2)),
+            (egui::Key::Num3, Some(3)),
+            (egui::Key::Num4, Some(4)),
+            (egui::Key::Num5, Some(5)),
+        ];
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        let action = ui
+            .ctx()
+            .input(|i| KEYS.into_iter().find(|(k, _)| i.key_pressed(*k)))
+            .map(|(_, n)| n);
+        if let Some(n) = action {
+            self.rate_selected(n);
+        }
+    }
+
+    /// Arrow/Page keys move the grid selection or scroll -- but the query
+    /// box is a text field, and Left/Right/digits are how you edit text in
+    /// it. Without this guard, typing e.g. `rating>=3` into the query would
+    /// also move the selection and rate the current tile. Checked once per
+    /// frame and threaded through rather than re-checked per key, since it
+    /// answers one question ("does some widget want the keyboard right
+    /// now") that does not change mid-frame.
     fn handle_nav_keys(&mut self, ui: &egui::Ui) {
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
         let cols = self.cols.max(1);
         // ScrollArea only answers to the wheel/drag by default -- Page
-        // Up/Down need an explicit scroll request. Sign is a guess (egui's
-        // convention wasn't verified against a live window this session);
-        // flip if it turns out inverted.
+        // Up/Down need an explicit scroll request.
         let mut scroll_by = 0.0f32;
         ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
@@ -183,6 +257,7 @@ impl GuiApp {
                         .show(ui, |ui| {
                             for idx in 0..self.rows.len() {
                                 let id = self.rows[idx].id;
+                                let rating = self.rows[idx].rating;
                                 if idx > 0 && idx % cols == 0 {
                                     ui.end_row();
                                 }
@@ -195,10 +270,16 @@ impl GuiApp {
                                 let Some(tex) = self.texture_for(&ctx, &path) else {
                                     continue;
                                 };
-                                let btn = egui::Button::image(&tex).selected(idx == self.selected);
-                                if ui.add_sized([TILE_PX, TILE_PX], btn).clicked() {
-                                    self.selected = idx;
-                                }
+                                ui.vertical(|ui| {
+                                    let btn =
+                                        egui::Button::image(&tex).selected(idx == self.selected);
+                                    if ui.add_sized([TILE_PX, TILE_PX], btn).clicked() {
+                                        self.selected = idx;
+                                    }
+                                    let stars =
+                                        "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
+                                    ui.label(stars);
+                                });
                             }
                         });
                 });
@@ -210,6 +291,7 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw_query_bar(ui);
         self.handle_nav_keys(ui);
+        self.handle_rating_keys(ui);
         self.draw_grid(ui);
     }
 }
@@ -236,7 +318,7 @@ pub fn run(root: &Path) -> Result<()> {
     eframe::run_native(
         "npcg",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(GuiApp::new(cat, cache)))),
+        Box::new(|_cc| Ok(Box::new(GuiApp::new(cat, cache, config)))),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
 }

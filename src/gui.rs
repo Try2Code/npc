@@ -264,16 +264,40 @@ impl GuiApp {
                                 let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
                                     continue;
                                 };
-                                let Ok(path) = self.cache.make_now(&src, thumbs::Size::Grid) else {
-                                    continue;
-                                };
-                                let Some(tex) = self.texture_for(&ctx, &path) else {
-                                    continue;
-                                };
+                                // Non-blocking: `None` means generation was
+                                // just queued on Cache's background worker
+                                // thread. The blocking form (`make_now`) is
+                                // what froze the window on a query that
+                                // matched hundreds of stacks never before
+                                // cached at this size -- generating a whole
+                                // page's worth of thumbnails serially,
+                                // synchronously, inside the UI thread's own
+                                // frame.
+                                let tex = self
+                                    .cache
+                                    .get(&src, thumbs::Size::Grid)
+                                    .and_then(|path| self.texture_for(&ctx, &path));
                                 ui.vertical(|ui| {
-                                    let btn =
-                                        egui::Button::image(&tex).selected(idx == self.selected);
-                                    if ui.add_sized([TILE_PX, TILE_PX], btn).clicked() {
+                                    // `vertical()` otherwise claims the
+                                    // full remaining width of the row as
+                                    // this cell's width (it has no content
+                                    // yet to size itself by), and Grid
+                                    // measures column width from that --
+                                    // not from the 160px button inside it.
+                                    // That's the huge dead gap after the
+                                    // first tile: column 0 was recorded as
+                                    // almost the whole window's width.
+                                    ui.set_width(TILE_PX);
+                                    let resp = if let Some(tex) = tex {
+                                        let btn = egui::Button::image(&tex)
+                                            .selected(idx == self.selected);
+                                        ui.add_sized([TILE_PX, TILE_PX], btn)
+                                    } else {
+                                        let btn =
+                                            egui::Button::new("...").selected(idx == self.selected);
+                                        ui.add_sized([TILE_PX, TILE_PX], btn)
+                                    };
+                                    if resp.clicked() {
                                         self.selected = idx;
                                     }
                                     let stars =
@@ -285,6 +309,19 @@ impl GuiApp {
                 });
         });
     }
+
+    /// `Cache::get` queues generation on a background thread and returns
+    /// immediately; a tile that was `None` this frame needs a later repaint
+    /// to pick up the finished thumbnail. eframe is reactive by default (it
+    /// does not redraw on a timer the way the TUI's 120ms event-poll does),
+    /// so without this, thumbnails would only ever appear on the next frame
+    /// triggered by some other input -- a mouse move, a keypress. Draining
+    /// `done` mirrors `tui.rs`'s run loop: each completion is a reason to
+    /// repaint, and draining keeps the channel from growing unbounded.
+    fn poll_thumbnail_generation(&self, ctx: &egui::Context) {
+        while self.cache.done.try_recv().is_ok() {}
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -293,6 +330,7 @@ impl eframe::App for GuiApp {
         self.handle_nav_keys(ui);
         self.handle_rating_keys(ui);
         self.draw_grid(ui);
+        self.poll_thumbnail_generation(ui.ctx());
     }
 }
 

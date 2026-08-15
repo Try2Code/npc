@@ -25,6 +25,8 @@ ratatui = { version = "0.29", features = ["serde"] }
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ratatui-image = "4"
+eframe = "0.36.1"
+egui = "0.36.1"
 
 [build-dependencies]
 cxx-build = "1.0"

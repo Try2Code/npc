@@ -14,6 +14,7 @@ pub mod dupes;
 pub mod edit;
 pub mod exif;
 pub mod export;
+pub mod gui;
 pub mod import;
 pub mod meta;
 pub mod metadata_merge;

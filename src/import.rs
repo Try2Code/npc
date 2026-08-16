@@ -83,6 +83,28 @@ pub fn plan(
         bail!("import source {} is not a directory", source.display());
     }
 
+    // A source that is the library, inside it, or containing it is never a
+    // real card -- and without this check `plan()` would silently walk the
+    // whole library as if it were one, calling `read_meta` once per stack
+    // with no incremental skip (unlike `scan()`, which has one). On a real
+    // library that's tens of thousands of mutex-serialised Exiv2 calls,
+    // which looks exactly like a hang. Canonicalize so a relative path or a
+    // symlink can't sneak past a naive string comparison.
+    let source_canon = source
+        .canonicalize()
+        .with_context(|| format!("resolving import source {}", source.display()))?;
+    let library_canon = library
+        .canonicalize()
+        .with_context(|| format!("resolving library {}", library.display()))?;
+    if source_canon.starts_with(&library_canon) || library_canon.starts_with(&source_canon) {
+        bail!(
+            "import source {} overlaps the library {} -- import needs a card or \
+             inbox directory outside the library, not the library itself",
+            source.display(),
+            library.display()
+        );
+    }
+
     // Group source files into stacks, exactly as the scanner does.
     // Pass 1: walk and classify only -- no stat() yet.
     let mut walked: Vec<(PathBuf, PathBuf, String, Role)> = Vec::new();
@@ -1191,6 +1213,45 @@ mod safety_tests {
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         assert!(execute(&plans, &config, false, &mut |_| {}).is_err());
+    }
+
+    /// Without this, a source that is the library itself gets walked as if
+    /// it were a card: `plan()` has no incremental skip the way `scan()`
+    /// does, so every stack's anchor gets a mutex-serialised `read_meta`
+    /// call -- on a real library, tens of thousands of them, which looks
+    /// exactly like a hang. Confirmed live: this is what actually happened.
+    #[test]
+    fn importing_from_the_library_itself_is_refused() {
+        let lib = tempfile::tempdir().unwrap();
+        std::fs::write(lib.path().join("750_0001.NEF"), b"x").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let err = plan(&cat, lib.path(), lib.path(), false).unwrap_err();
+        assert!(err.to_string().contains("overlaps the library"), "{err}");
+    }
+
+    #[test]
+    fn importing_from_a_subdirectory_of_the_library_is_refused() {
+        let lib = tempfile::tempdir().unwrap();
+        let sub = lib.path().join("2026/08/16");
+        std::fs::create_dir_all(&sub).unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let err = plan(&cat, &sub, lib.path(), false).unwrap_err();
+        assert!(err.to_string().contains("overlaps the library"), "{err}");
+    }
+
+    /// The reverse overlap: a library that sits inside the source directory
+    /// is just as nonsensical -- the "card" would contain the whole library.
+    #[test]
+    fn importing_into_a_directory_inside_the_source_is_refused() {
+        let outer = tempfile::tempdir().unwrap();
+        let lib = outer.path().join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let err = plan(&cat, outer.path(), &lib, false).unwrap_err();
+        assert!(err.to_string().contains("overlaps the library"), "{err}");
     }
 
     /// Undated files must land somewhere obvious rather than being guessed at

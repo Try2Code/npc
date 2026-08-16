@@ -221,6 +221,13 @@ enum Cmd {
         /// already-imported stack on every re-scan.
         #[arg(long)]
         verify_content: bool,
+        /// Rescan the whole library for freshness before planning, like every
+        /// import used to. Off by default: trusts the existing catalog, which
+        /// is much faster but can miss a duplicate if something outside npc
+        /// touched the library since the last scan (a file dropped in by
+        /// hand, or another tool's output).
+        #[arg(long)]
+        rescan: bool,
     },
     /// List shooting days, and give them names.
     Events {
@@ -821,6 +828,7 @@ fn main() -> Result<()> {
             library: library_arg,
             dry_run,
             verify_content,
+            rescan,
         } => {
             let root = library(library_arg.as_deref())?;
             let config = npc::config::Config::load()?;
@@ -835,13 +843,25 @@ fn main() -> Result<()> {
             // scan) can silently miss a real duplicate and create an unwanted
             // copy -- confirmed live: a file already in the library was
             // planned as new because its directory had never been scanned in
-            // at all. Incremental, so this is cheap once nothing outside
-            // npc's own writes has changed.
-            let (scan_stats, cat) = scan::scan_root(&root, false)?;
-            println!(
-                "catalog: {} stacks ({} new/changed)",
-                scan_stats.stacks, scan_stats.parsed
-            );
+            // at all. `--rescan` re-establishes that freshness guarantee by
+            // walking the whole library first; by default the catalog is
+            // trusted as-is, which is far faster but carries that same risk
+            // if something outside npc touched the library meanwhile.
+            let cat = if rescan {
+                let (scan_stats, cat) = scan::scan_root(&root, false)?;
+                println!(
+                    "catalog: {} stacks ({} new/changed)",
+                    scan_stats.stacks, scan_stats.parsed
+                );
+                cat
+            } else {
+                let cat = require_online(&root)?;
+                println!(
+                    "catalog: {} stacks (not rescanned; pass --rescan to verify first)",
+                    cat.stack_count()?
+                );
+                cat
+            };
 
             let sources = match source {
                 Some(p) => vec![p],

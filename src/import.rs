@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::db::Catalog;
 use crate::stack::{classify, Role};
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -83,7 +84,8 @@ pub fn plan(
     }
 
     // Group source files into stacks, exactly as the scanner does.
-    let mut groups: HashMap<(PathBuf, String), Vec<SourceFile>> = HashMap::new();
+    // Pass 1: walk and classify only -- no stat() yet.
+    let mut walked: Vec<(PathBuf, PathBuf, String, Role)> = Vec::new();
     for entry in walkdir::WalkDir::new(source)
         .follow_links(false)
         .into_iter()
@@ -95,11 +97,26 @@ pub fn plan(
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(c) = classify(&name) else { continue };
         let dir = entry.path().parent().unwrap_or(source).to_path_buf();
-        let size = entry.metadata().map_or(0, |m| m.len());
+        walked.push((entry.path().to_path_buf(), dir, c.base, c.role));
+    }
+
+    // Pass 2: stat every card file in parallel. This is the slow part on a
+    // real card reader, and it's not behind the Exiv2 mutex, so threads here
+    // genuinely overlap I/O rather than just queueing. `map_or(0, ...)`
+    // matches the old inline behaviour: a failed stat yields size 0, not a
+    // hard error.
+    let sizes: Vec<u64> = walked
+        .par_iter()
+        .map(|(path, ..)| std::fs::metadata(path).map_or(0, |m| m.len()))
+        .collect();
+
+    // Pass 3: sequential, same shape as the old single-pass loop.
+    let mut groups: HashMap<(PathBuf, String), Vec<SourceFile>> = HashMap::new();
+    for ((path, dir, base, role), size) in walked.into_iter().zip(sizes) {
         groups
-            .entry((dir, c.base))
+            .entry((dir, base))
             .or_default()
-            .push((entry.path().to_path_buf(), c.role, size));
+            .push((path, role, size));
     }
 
     // Existing (serial, shutter_count) pairs and (capture_time, size) pairs,
@@ -676,6 +693,44 @@ mod tests {
             &std::collections::HashSet::default(),
         );
         assert_eq!(chosen, "750_0001_1");
+    }
+
+    /// The parallel stat pass (pass 2) must not scramble which source file
+    /// ends up in which group. Two card subdirectories sharing a base with
+    /// no EXIF (fabricated bytes) both land in `undated` and must collide
+    /// deterministically, in walk order, exactly as the old single-threaded
+    /// walk did -- this is what a mis-zip between the parallel stat results
+    /// and their source paths would break.
+    #[test]
+    fn plan_assigns_collision_suffixes_in_order_across_card_subdirectories() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        for sub in ["a", "b"] {
+            let dir = card.path().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("750_0001.NEF"), vec![0xA5u8; 4096]).unwrap();
+            std::fs::write(dir.join("750_0001.JPG"), vec![0x5Au8; 4096]).unwrap();
+        }
+
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        assert_eq!(plans.len(), 2, "{plans:?}");
+
+        let mut dest_bases: Vec<&str> = plans.iter().map(|p| p.dest_base.as_str()).collect();
+        dest_bases.sort_unstable();
+        assert_eq!(dest_bases, ["750_0001", "750_0001_1"]);
+
+        for p in &plans {
+            for m in &p.members {
+                let name = m.dest.file_name().unwrap().to_string_lossy().to_string();
+                assert!(
+                    name.starts_with(&p.dest_base),
+                    "member {name} does not belong to its own stack's dest_base {}",
+                    p.dest_base
+                );
+            }
+        }
     }
 
     #[test]

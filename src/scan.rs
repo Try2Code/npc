@@ -72,6 +72,15 @@ struct Member {
     needs_parse: bool,
 }
 
+/// One classified file from pass 1 of the walk, before its `stat()` (pass 2).
+struct Walked {
+    dir: String,
+    name: String,
+    full_path: String,
+    base: String,
+    role: Role,
+}
+
 /// Scan `root` into the catalog. Originals are only ever opened read-only, so
 /// this cannot alter the drive even if it panics mid-walk.
 pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
@@ -88,6 +97,11 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
     let mut groups: HashMap<(String, String), Vec<Member>> = HashMap::new();
     let mut seen_paths: Vec<String> = Vec::new();
 
+    // Pass 1: walk and classify only -- no stat() yet. `file_type()` costs
+    // nothing extra on filesystems that supply `d_type` in the dirent
+    // (ext4/exFAT/vfat all do); only `entry.metadata()` below forces a real
+    // syscall, which is what gets parallelised in pass 2.
+    let mut walked: Vec<Walked> = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -120,36 +134,64 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         let full_path = format!("{dir}/{name}");
         seen_paths.push(full_path.clone());
 
-        let md = match entry.metadata() {
-            Ok(m) => m,
+        walked.push(Walked {
+            dir,
+            name,
+            full_path,
+            base: c.base,
+            role: c.role,
+        });
+    }
+
+    // Pass 2: stat every file in parallel. Not behind the Exiv2 mutex, so
+    // this is a genuine win on a large tree, especially over a slow
+    // removable drive. `symlink_metadata` matches what `DirEntry::metadata()`
+    // does under `follow_links(false)`. `par_iter().map().collect::<Vec<_>>()`
+    // on an indexed iterator preserves order, so pass 3 can zip results back
+    // to `walked` positionally with no extra bookkeeping.
+    let stats_results: Vec<Result<(i64, i64), String>> = walked
+        .par_iter()
+        .map(|w| {
+            std::fs::symlink_metadata(&w.full_path)
+                .map(|m| {
+                    let size = i64::try_from(m.size()).unwrap_or(i64::MAX);
+                    let mtime_ns = m.mtime() * 1_000_000_000 + m.mtime_nsec();
+                    (size, mtime_ns)
+                })
+                .map_err(|e| format!("{}: {e}", w.full_path))
+        })
+        .collect();
+
+    // Pass 3: sequential, same shape as the old single-pass loop.
+    for (w, result) in walked.into_iter().zip(stats_results) {
+        let (size, mtime_ns) = match result {
+            Ok(v) => v,
             Err(e) => {
-                stats.errors.push(format!("{full_path}: {e}"));
+                stats.errors.push(e);
                 continue;
             }
         };
-        let size = i64::try_from(md.size()).unwrap_or(i64::MAX);
-        let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
 
         let unchanged = known
-            .get(&full_path)
+            .get(&w.full_path)
             .is_some_and(|&(s, m)| s == size && m == mtime_ns);
         if unchanged {
             stats.unchanged += 1;
         }
 
-        let ext = Path::new(&name)
+        let ext = Path::new(&w.name)
             .extension()
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        groups.entry((dir, c.base)).or_default().push(Member {
-            name,
+        groups.entry((w.dir, w.base)).or_default().push(Member {
+            name: w.name,
             ext,
-            role: c.role,
+            role: w.role,
             size,
             mtime_ns,
             // Only image members carry EXIF worth parsing.
-            needs_parse: !unchanged && c.role.is_image(),
+            needs_parse: !unchanged && w.role.is_image(),
         });
     }
 

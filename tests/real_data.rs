@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 18;
+const REAL_DATA_TEST_COUNT: usize = 19;
 
 macro_rules! require_ground_truth {
     () => {
@@ -334,6 +334,52 @@ fn rescanning_changes_nothing() {
     assert_eq!(
         stats.unchanged as i64, f1,
         "a rescan should see every file as unchanged"
+    );
+}
+
+/// `npc import` without `--rescan` trusts the catalog as-is: a library file
+/// the catalog has never seen (planted directly on disk, never scanned in)
+/// is invisible to dedup, so its byte-identical twin on a card is planned as
+/// new, not recognized as a duplicate. Rescanning first (what `--rescan`
+/// does) closes that gap. Uses the real `750_5744`/`750_5744_1` twin pair,
+/// which is byte-identical (and therefore identity+size identical) by
+/// construction -- see the module doc comment.
+#[test]
+fn import_dedup_needs_a_rescan_to_see_a_hand_added_file() {
+    let root = require_library!();
+
+    let lib = tempfile::tempdir().unwrap();
+    let lib_dir = lib.path().join("2026/08/01");
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    std::fs::copy(
+        root.join("08/01/750_5744.NEF"),
+        lib_dir.join("750_5744.NEF"),
+    )
+    .unwrap();
+
+    let card = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        root.join("08/01/750_5744_1.NEF"),
+        card.path().join("750_5744_1.NEF"),
+    )
+    .unwrap();
+
+    let mut cat = Catalog::open_memory().unwrap();
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(
+        plans[0].duplicate_of.is_none(),
+        "an unscanned catalog should not see the library's hand-added twin"
+    );
+
+    scan::scan(&mut cat, lib.path(), true).unwrap();
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(
+        plans[0].duplicate_of.is_some(),
+        "a rescanned catalog should recognize the byte-identical twin"
     );
 }
 

@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 23;
+const REAL_DATA_TEST_COUNT: usize = 24;
 
 macro_rules! require_ground_truth {
     () => {
@@ -1170,4 +1170,92 @@ fn import_merges_metadata_from_a_re_embedded_card_copy_instead_of_duplicating() 
         card_before.get(&card_path),
         "the card copy must never be written to"
     );
+}
+
+/// The regression this feature shipped with: a RAW shares maker-note
+/// identity with its JPG sibling (same shot, always a different size), but
+/// that is never license to treat the RAW as "the JPG, just re-embedded."
+/// Importing a RAW for a shot whose JPG is already in the library must add
+/// the RAW, not silently skip it as a duplicate of the JPG.
+#[test]
+fn import_adds_a_raw_whose_jpg_sibling_is_already_in_the_library() {
+    require_ground_truth!();
+    let root = require_library!();
+    let lib = tempfile::tempdir().unwrap();
+
+    // Only the JPG is in the library, in the same dated directory a real
+    // import would place it -- the RAW has never been imported.
+    let src_jpg = root.join("08/01/750_6278.JPG");
+    let fm = npc::meta::read_meta(src_jpg.to_str().unwrap()).unwrap();
+    let date_dir = lib.path().join(npc::import::date_path(fm.capture_time));
+    std::fs::create_dir_all(&date_dir).unwrap();
+    let jpg = copy_into(&date_dir, "750_6278.JPG");
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, lib.path(), false).unwrap();
+
+    // The RAW sibling, on a separate "card".
+    let card = tempfile::tempdir().unwrap();
+    let card_nef = copy_into(card.path(), "750_6278.NEF");
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    assert_eq!(plans.len(), 1);
+    let stack = &plans[0];
+    assert_eq!(
+        stack.duplicate_of, None,
+        "a RAW must never be matched against its JPG sibling's identity"
+    );
+    assert!(
+        stack.metadata_merge.is_none(),
+        "there is nothing to merge -- this is a new member, not a re-embed"
+    );
+
+    let dest_nef = stack.dest_dir.join("750_6278.NEF");
+    let jpg_before = fingerprint_tree(lib.path());
+
+    let stats = npc::import::execute(
+        &plans,
+        &mut cat,
+        &npc::config::Config::default(),
+        false,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(stats.stacks_copied, 1, "errors: {:?}", stats.errors);
+    assert_eq!(stats.duplicates_skipped, 0);
+
+    assert!(
+        dest_nef.exists(),
+        "the RAW was never copied in: {dest_nef:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dest_nef).unwrap(),
+        std::fs::read(&card_nef).unwrap(),
+        "the copy must be byte-identical to the card"
+    );
+
+    let jpg_path = jpg.to_string_lossy().to_string();
+    let jpg_after = fingerprint_tree(lib.path());
+    assert_eq!(
+        jpg_after.get(&jpg_path),
+        jpg_before.get(&jpg_path),
+        "importing the RAW must not disturb the JPG already in the library"
+    );
+
+    // A rescan must now find one complete stack, not two.
+    scan::scan(&mut cat, lib.path(), true).unwrap();
+    let sid = cat
+        .stack_id(&date_dir.to_string_lossy(), "750_6278")
+        .unwrap()
+        .unwrap();
+    let mut roles: Vec<String> = cat
+        .conn
+        .prepare("SELECT role FROM file WHERE stack_id = ?1")
+        .unwrap()
+        .query_map([sid], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    roles.sort();
+    assert_eq!(roles, vec!["oocjpg".to_string(), "raw".to_string()]);
 }

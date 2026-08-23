@@ -25,6 +25,13 @@ use std::path::{Path, PathBuf};
 /// A file on the card: path, role, size.
 type SourceFile = (PathBuf, Role, u64);
 
+/// A maker-note identity, scoped to one role: serial, shutter count, role.
+type ShotIdentity = (String, u32, Role);
+/// An already-cataloged file matching some identity: path, size.
+type ExistingFile = (String, i64);
+/// A same-`capture_time` candidate for the metadata-merge lookup: path, size, role.
+type TimeCandidate = (String, i64, Role);
+
 #[derive(Debug, Clone)]
 pub struct PlannedStack {
     pub base: String,
@@ -155,6 +162,7 @@ pub fn plan(
     // `find_duplicate` verifies the bytes actually match.
     let known = known_shots(cat)?;
     let known_content = known_by_content(cat)?;
+    let known_by_role = known_shots_by_role(cat)?;
     let known_time = known_by_time(cat)?;
 
     let mut plans = Vec::new();
@@ -221,7 +229,7 @@ pub fn plan(
                     *role,
                     ident.as_ref(),
                     capture_time,
-                    &known,
+                    &known_by_role,
                     &known_time,
                 ) {
                     metadata_merge =
@@ -516,6 +524,44 @@ fn known_shots(cat: &Catalog) -> Result<HashMap<(String, u32), (String, i64)>> {
     Ok(map)
 }
 
+/// `(serial, shutter_count, role) -> (path, size)`, one row per role --
+/// unlike `known_shots`, which collapses a stack's RAW and JPG (same
+/// maker-note identity, always different size) down to one representative
+/// path. A metadata-merge target must be the SAME kind of file: matching
+/// identity across roles means "sibling of this shot," never "this file,
+/// just re-embedded" -- conflating the two silently drops a RAW that should
+/// have been imported to complete the stack.
+fn known_shots_by_role(cat: &Catalog) -> Result<HashMap<ShotIdentity, ExistingFile>> {
+    let mut stmt = cat.conn.prepare(
+        "SELECT f.role, f.serial, f.shutter_count, s.dir || '/' || f.name, f.size
+         FROM file f JOIN stack s ON s.id = f.stack_id
+         WHERE f.role IN ('raw', 'oocjpg')
+           AND f.serial IS NOT NULL AND f.serial != ''
+           AND f.shutter_count IS NOT NULL AND f.shutter_count != 0
+           AND f.size IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            u32::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (role_str, serial, count, path, size) = row?;
+        let role = if role_str == "raw" {
+            Role::Raw
+        } else {
+            Role::OocJpg
+        };
+        map.insert((serial, count, role), (path, size));
+    }
+    Ok(map)
+}
+
 /// `(capture_time, size) -> [path]` for everything already cataloged with
 /// both known. Only consulted when an incoming file has no usable
 /// serial+shutter identity at all -- a non-Nikon body, or EXIF stripped by
@@ -547,9 +593,9 @@ fn known_by_content(cat: &Catalog) -> Result<HashMap<(i64, i64), Vec<String>>> {
 /// is keyed on `(capture_time, size)` and so cannot find a candidate whose
 /// size has since changed. Only consulted by `find_metadata_merge_target`,
 /// after `find_duplicate` has already failed to find a byte-identical match.
-fn known_by_time(cat: &Catalog) -> Result<HashMap<i64, Vec<(String, i64)>>> {
+fn known_by_time(cat: &Catalog) -> Result<HashMap<i64, Vec<TimeCandidate>>> {
     let mut stmt = cat.conn.prepare(
-        "SELECT f.capture_time, s.dir || '/' || f.name, f.size
+        "SELECT f.capture_time, s.dir || '/' || f.name, f.size, f.role
          FROM file f JOIN stack s ON s.id = f.stack_id
          WHERE f.role IN ('raw','oocjpg')
            AND f.capture_time IS NOT NULL AND f.size IS NOT NULL",
@@ -559,12 +605,18 @@ fn known_by_time(cat: &Catalog) -> Result<HashMap<i64, Vec<(String, i64)>>> {
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
         ))
     })?;
-    let mut map: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
+    let mut map: HashMap<i64, Vec<TimeCandidate>> = HashMap::new();
     for row in rows {
-        let (t, path, size) = row?;
-        map.entry(t).or_default().push((path, size));
+        let (t, path, size, role_str) = row?;
+        let role = if role_str == "raw" {
+            Role::Raw
+        } else {
+            Role::OocJpg
+        };
+        map.entry(t).or_default().push((path, size, role));
     }
     Ok(map)
 }
@@ -587,13 +639,14 @@ fn find_metadata_merge_target(
     anchor_role: Role,
     ident: Option<&(String, u32)>,
     capture_time: Option<i64>,
-    known_shots: &HashMap<(String, u32), (String, i64)>,
-    known_by_time: &HashMap<i64, Vec<(String, i64)>>,
+    known_shots_by_role: &HashMap<ShotIdentity, ExistingFile>,
+    known_by_time: &HashMap<i64, Vec<TimeCandidate>>,
 ) -> Option<String> {
     let anchor_size = i64::try_from(anchor_size).unwrap_or(i64::MAX);
 
-    if let Some(k) = ident {
-        if let Some((path, size)) = known_shots.get(k) {
+    if let Some((serial, count)) = ident {
+        let key = (serial.clone(), *count, anchor_role);
+        if let Some((path, size)) = known_shots_by_role.get(&key) {
             if *size != anchor_size {
                 return Some(path.clone());
             }
@@ -603,8 +656,11 @@ fn find_metadata_merge_target(
     if ident.is_none() && anchor_role != Role::Raw {
         if let Some(t) = capture_time {
             if let Some(candidates) = known_by_time.get(&t) {
-                for (path, size) in candidates {
-                    if *size != anchor_size && pixels_match(anchor_path, Path::new(path)) {
+                for (path, size, role) in candidates {
+                    if *role == anchor_role
+                        && *size != anchor_size
+                        && pixels_match(anchor_path, Path::new(path))
+                    {
                         return Some(path.clone());
                     }
                 }
@@ -1273,9 +1329,9 @@ mod tests {
     /// on its own (same precedent as `dupes.rs`).
     #[test]
     fn tier_a_merge_target_is_found_despite_a_size_mismatch() {
-        let mut known_shots = HashMap::new();
-        known_shots.insert(
-            ("6094708".to_string(), 63987),
+        let mut known_shots_by_role = HashMap::new();
+        known_shots_by_role.insert(
+            ("6094708".to_string(), 63987, Role::Raw),
             ("/lib/2026/08/09/750_0001.NEF".to_string(), 25_000_000i64),
         );
 
@@ -1285,10 +1341,60 @@ mod tests {
             Role::Raw,
             Some(&("6094708".to_string(), 63987)),
             None,
-            &known_shots,
+            &known_shots_by_role,
             &HashMap::new(),
         );
         assert_eq!(target, Some("/lib/2026/08/09/750_0001.NEF".to_string()));
+    }
+
+    /// The exact reported regression: a RAW anchor shares maker-note identity
+    /// with the JPG already in the library (same shot, same actuation), but
+    /// that JPG is not the same *file* -- it must not be treated as "this
+    /// file, just re-embedded." The RAW has to be imported to complete the
+    /// stack, not skipped as a duplicate of its sibling.
+    #[test]
+    fn tier_a_never_merges_a_raw_with_its_library_jpg_sibling() {
+        let mut known_shots_by_role = HashMap::new();
+        known_shots_by_role.insert(
+            ("6094708".to_string(), 64652, Role::OocJpg),
+            ("/lib/2026/08/23/750_7517.JPG".to_string(), 9_865_934i64),
+        );
+
+        let target = find_metadata_merge_target(
+            Path::new("/card/750_7517.NEF"),
+            25_000_000, // a RAW is never anywhere near its sibling JPG's size
+            Role::Raw,
+            Some(&("6094708".to_string(), 64652)),
+            None,
+            &known_shots_by_role,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            target, None,
+            "a RAW must not be matched against its JPG sibling's identity"
+        );
+    }
+
+    /// The symmetric case: a JPG anchor must not be matched against a RAW
+    /// cataloged under the same identity either.
+    #[test]
+    fn tier_a_never_merges_a_jpg_with_a_cataloged_raw_sibling() {
+        let mut known_shots_by_role = HashMap::new();
+        known_shots_by_role.insert(
+            ("6094708".to_string(), 64652, Role::Raw),
+            ("/lib/2026/08/23/750_7517.NEF".to_string(), 25_000_000i64),
+        );
+
+        let target = find_metadata_merge_target(
+            Path::new("/card/750_7517.JPG"),
+            9_865_934,
+            Role::OocJpg,
+            Some(&("6094708".to_string(), 64652)),
+            None,
+            &known_shots_by_role,
+            &HashMap::new(),
+        );
+        assert_eq!(target, None);
     }
 
     /// Tier B: no maker-note identity at all (a JPG-only shot), same
@@ -1309,6 +1415,7 @@ mod tests {
             vec![(
                 existing.to_string_lossy().to_string(),
                 i64::try_from(std::fs::metadata(&existing).unwrap().len()).unwrap(),
+                Role::OocJpg,
             )],
         );
 
@@ -1340,6 +1447,7 @@ mod tests {
             vec![(
                 existing.to_string_lossy().to_string(),
                 i64::try_from(std::fs::metadata(&existing).unwrap().len()).unwrap(),
+                Role::OocJpg,
             )],
         );
 
@@ -1355,6 +1463,43 @@ mod tests {
         assert_eq!(target, None);
     }
 
+    /// The role filter, not merely a decode failure, is what must prevent a
+    /// cross-role Tier B match: a `Role::Raw` candidate whose bytes happen to
+    /// be a valid, pixel-identical JPEG would otherwise wrongly match.
+    #[test]
+    fn tier_b_never_matches_a_candidate_of_a_different_role_even_if_its_pixels_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("incoming.JPG");
+        let mislabeled = dir.path().join("existing.NEF");
+        let base = jpeg_bytes(7);
+        std::fs::write(&anchor, &base).unwrap();
+        std::fs::write(&mislabeled, splice_comment(&base)).unwrap();
+
+        let mut known_time = HashMap::new();
+        known_time.insert(
+            1_700_000_000i64,
+            vec![(
+                mislabeled.to_string_lossy().to_string(),
+                i64::try_from(std::fs::metadata(&mislabeled).unwrap().len()).unwrap(),
+                Role::Raw,
+            )],
+        );
+
+        let target = find_metadata_merge_target(
+            &anchor,
+            std::fs::metadata(&anchor).unwrap().len(),
+            Role::OocJpg,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_time,
+        );
+        assert_eq!(
+            target, None,
+            "a Role::Raw candidate must never be matched against a JPG anchor"
+        );
+    }
+
     /// A RAW anchor never falls into Tier B, even with no maker-note
     /// identity: there is no RAW-decoding capability, so this tier's pixel
     /// check would silently never engage. Confirm it does not try.
@@ -1363,7 +1508,7 @@ mod tests {
         let mut known_time = HashMap::new();
         known_time.insert(
             1_700_000_000i64,
-            vec![("/lib/existing.NEF".to_string(), 999i64)],
+            vec![("/lib/existing.NEF".to_string(), 999i64, Role::Raw)],
         );
 
         let target = find_metadata_merge_target(

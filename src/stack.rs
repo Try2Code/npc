@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     /// The original: `750_6926.NEF`
     Raw,

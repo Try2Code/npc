@@ -1,70 +1,182 @@
-# Session summary — npc production scan, TUI improvements, rating-mismatch backfill
+# Session summary — TUI timeline bugfixes, grid perf, and an egui GUI spike
 
-_Written 2026-08-14, covering the conversation up to the `/compact` point._
+_Written 2026-08-15, covering the conversation up to the end-of-day stop._
 
 ## 1. Primary Request and Intent
 
-The user worked through several major, sequential goals:
+Continuing from a prior compacted session (see the previous summary content
+this file replaces, which covered the production scan, rating-mismatch
+backfill, and the TUI timeline panel's initial implementation). This session:
 
-1. **Scan a production Nikon photo library** with npc — library path `/media/ram/MyPics` (821GB, 121,725 files).
-2. **Add linting as a standing/automatic check** to the npc codebase (not just on-demand via `./check`).
-3. **Fix CLI defects** discovered while preparing for the scan (`--root` inconsistency, dead `--read-only` flag).
-4. **Fix a tag/rating gap**: this library had been actively used by Shotwell, which embeds tags/ratings directly into JPG/NEF files; npc's scanner never read or seeded these into its catalog. Rating tie-break rule given verbatim: "when only nef xor jpg has a rating, use it. if both have a rating, tag this higher one." Explicitly rejected a separate migration subcommand — wanted it folded directly into scan/sync.
-5. **TUI improvements**: pagination past 500 rows, readline support for query editing in TUI mode, and in-place query editing. Also: "make sure there is a guard to ensure the thumbs are there" (the black-frame bug).
-6. **Git workflow**: stage and commit all fixes (organized logically), then push everything to origin.
-7. **RawTherapee configuration question** (external tool, not npc code): how to make RawTherapee always copy the input's rating to exported files.
-8. **Find and fix rating inconsistencies between exported JPGs and their true source stacks**: scan for cases where exports don't carry the rating of the original JPG/NEF, then backfill the sidecars.
-9. **Generate a reusable script** to scan and fix this rating mismatch again later; moved into `scripts/` in the repo per direct instruction.
-10. Ran the script with `--apply` after explicit authorization.
-11. Follow-up questions on shutter_count query syntax, meaning of `*` in output, and a specific real-world example (`750_3311_modified.jpg` in `export/4gg/`) where the user visually confirmed a rating mismatch still exists.
+1. Confirmed the export-rating manual fix (`export/4gg/750_3311_modified.jpg`)
+   had already been applied in a prior, uncaptured session — verified via its
+   `.xmp` sidecar (naming caveat: npc strips only the last extension, so the
+   sidecar is `750_3311_modified.xmp`, not `.jpg.xmp`).
+2. Fixed a real bug in the new TUI timeline panel: picking a second bucket
+   (or a sidebar tag/date) overwrote the whole query, discarding any filter
+   manually added via `/`.
+3. Installed `npc` globally via `cargo install --path . --bin npc` (later
+   just `cargo install --path .` since `npcg` didn't exist yet), so the user
+   runs `npc` directly rather than `target/release/npc`.
+4. Diagnosed and fixed slow TUI grid navigation, in three real, separate
+   contributing causes, each found by direct measurement/instrumentation
+   rather than guessing (per project practice):
+   - `grid_px` in the user's own config was tuned from 1280 → 500 (the
+     user's own screen-based math in the config comment didn't account for
+     the sidebar/borders eating into actual tile width).
+   - The TUI's `ensure_decoded_at` was re-reading and re-decoding the source
+     JPEG from disk on every scroll step (rect-based cache invalidation,
+     originally added to fix a black-frame kitty-placement bug), even though
+     nothing about a rect change invalidates the *pixels* — only the
+     placement-bound protocol. Split into a `decoded` (pixel) cache and an
+     `images` (placement) cache; rect changes now only rebuild the latter.
+   - Remaining ~780ms of a ~950ms 27-tile page-turn is `ratatui-image`'s
+     Kitty encoder transmitting raw, uncompressed RGBA pixel data
+     (`f=32`, not PNG) — a third-party crate limitation, confirmed via
+     targeted timing instrumentation (added, used, then reverted).
+5. Merged `feature/tui-timeline` into `master` (fast-forward, pushed).
+6. At the user's request, explored whether the TUI's layout could live in a
+   native ("Qt-style") window instead — recommended `egui`/`eframe` — then
+   built it as a real, separate branch (`feature/gui`, **not** pushed),
+   producing a new binary `npcg` (`src/gui.rs` + `src/bin/npcg.rs`) that
+   reuses all of npc's existing non-UI backend (`db`, `query`, `thumbs`,
+   `edit`, `config`, `vol`) and installs independently
+   (`cargo install --path . --bin npcg`) so it runs side by side with the
+   master-built `npc` for comparison.
+7. Iterated live on `npcg` against the user's real library
+   (`/media/ram/MyPics`), fixing four real bugs found only by the user
+   running it (this environment has no display): grid row misalignment,
+   the query box not submitting on Enter, Page Up/Down and mouse-wheel
+   scrolling, a synchronous-thumbnail-generation freeze on a query that hit
+   many uncached stacks, and a grid-cell width bug (confirmed via a
+   screenshot the user provided) that left a large dead gap and clipped the
+   second column. Also added star-rating support (`0`-`5` keys), confirmed
+   working live.
+8. **Decision: `feature/gui` is parked, not deleted.** The original question
+   — does native GPU-texture rendering avoid the kitty-protocol
+   transmission cost — is answered yes, confirmed live. The user does not
+   want to keep fighting egui's layout model; `tui.rs` remains the primary
+   interface. Both `feature/gui` (local only) and `feature/tui-timeline`
+   (local + remote, now fully merged into `master`) still exist as branches;
+   neither was deleted.
 
 ## 2. Key Technical Concepts
 
-- **npc's write invariant**: exactly two `writeMetadata()` calls exist in the C++ shim (`write_sidecar`, `stamp_export`), enforced by `tests/invariant.rs::writemetadata_appears_only_inside_the_guarded_writers`. Sidecars (`.xmp`) are the only write target; originals are never touched.
-- **Stack/role model**: `stack(dir, base)` unique key; `file` table with `role` (raw/oocjpg/derived/sidecar), `serial`, `shutter_count`, `capture_time`, etc.
-- **Exiv2 C++ shim** (`src/meta/shim.cc`) bridged via `cxx` crate; `FileMeta` struct crosses the FFI boundary.
-- **Tiered matching for cross-derivative identity**: exact `serial`+`shutter_count` (tier 1, same evidence as npc's own `dupes.rs`), falling back to `capture_time` ONLY when unique among candidates (tier 2) — never guessing on ambiguous timestamps, since 18,937 distinct capture_times were found to be shared across multiple stacks (burst-mode collisions) in this real library.
-- **A third, unhandled failure mode**: an export matching NEITHER tier (no serial/shutter AND no unique/any capture_time) is absent from the report entirely — not even flagged as ambiguous. This was explicitly identified as a known gap and confirmed live via `export/4gg/750_3311_modified.jpg` (see below).
-- **npc query language**: `key op value` predicates compiled to SQL; e.g. `shutter` maps to `shutter_count` column via `EXISTS (SELECT 1 FROM file f WHERE f.stack_id = s.id AND f.shutter_count {op} {value})`.
-- **`Target.paths` CLI resolution bug**: uses `path.file_stem()` which strips only the LAST extension — breaks for filenames with multiple dots (e.g. `X.tif.out.jpg`). Worked around by always passing full on-disk filenames rather than bare catalog `base` values.
-- **Rust SIGPIPE handling**: Rust CLIs panic on broken pipe rather than exiting quietly like C programs — fixed in the script by capturing full output before parsing.
-- **ratatui-image / kitty graphics protocol**: `StatefulProtocol` caching; stale placements occur when a cached protocol is reused at a new screen position or after a terminal resize without forcing retransmission.
-- **Readline-style line editing**: char-indexed cursor (not byte-indexed, for UTF-8 safety), standard Ctrl-key bindings, explicit avoidance of Alt-based bindings for terminal portability.
+- **`ratatui-image`'s Kitty protocol sends raw, uncompressed RGBA**
+  (`transmit_virtual` in its `kitty.rs`, format `f=32`), not PNG. This is
+  the structural reason the TUI's grid page-turn is slow on a kitty-protocol
+  terminal (confirmed: Ghostty) and is not fixable in npc's own code without
+  patching that dependency.
+- **egui's `ScrollArea` auto-shrinks to fit content by default**
+  (`auto_shrink: Vec2b::TRUE`); `egui::Grid` sizes itself tightly to its
+  cells rather than filling the panel, so the two combined shrink the
+  scroll area's mouse-hit region to the tile block, breaking wheel-scroll
+  over the leftover margin. Fixed with `.auto_shrink([false, false])`.
+- **`ui.vertical(|ui| {...})` with no prior content claims the full
+  remaining row width** as its own size when used inside a `Grid` cell, and
+  `Grid` measures column width from that claimed width, not from a
+  fixed-size widget drawn inside it. Fixed with `ui.set_width(TILE_PX)` as
+  the closure's first statement. Confirmed via a user-provided screenshot,
+  not guessed.
+- **`egui::Panel`/`CentralPanel::show` take `&mut Ui`, not `&egui::Context`**,
+  and `eframe::App` requires `fn ui(&mut self, ui: &mut egui::Ui, frame)`,
+  not `fn update(&mut self, ctx, frame)` — this particular egui/eframe
+  version (0.36.1, resolved fresh via `cargo add` this session) has a
+  meaningfully different panel/App API than older egui docs/memory suggest;
+  verified directly against the locally-fetched crate source throughout
+  rather than assumed.
+- **`Cache::get` (async, background worker thread) vs `Cache::make_now`
+  (synchronous)**: the TUI always used the former; `npcg` initially used the
+  latter for simplicity and froze the whole window on a query that matched
+  many stacks never before thumbnailed at the current `grid_px`. Fixed by
+  switching to `Cache::get` plus a `...` placeholder for pending tiles and
+  `ctx.request_repaint_after(...)` each frame (eframe doesn't redraw on a
+  timer the way the TUI's 120ms terminal-event-poll loop does, so a
+  background-thread completion needs an explicit repaint request to ever be
+  shown).
+- **`ctx.egui_wants_keyboard_input()`**: needed to gate npcg's global
+  arrow/digit key handlers, since without it, typing a query like
+  `rating>=3` into the one text field also moved the grid selection and
+  rated the current tile.
+- **npc's sidecar naming strips only the last extension**: a `.jpg` file's
+  sidecar is `<name>.xmp`, not `<name>.jpg.xmp` — caused a false "not fixed
+  yet" read early this session before the correct path was checked.
 
 ## 3. Files Changed
 
-- `src/main.rs` — removed `--read-only`; added unified `RootArg` (positional or `--root`) for `Scan`/`Status`/`Tui`; scan summary line for seeded stacks.
-- `src/scan.rs` — `combine_rating`/`union_embedded_tags` pure functions; seeding wired into stack-write loop, gated on `!has_sidecar` (critical guard — prevents resurrecting user-cleared tags/ratings by blocking the later unconditional sidecar-ingestion pass).
-- `src/meta/mod.rs` — added `pub tags: Vec<String>` to `FileMeta`.
-- `src/meta/shim.cc` — reads `Xmp.dc.subject` / `Iptc.Application2.Keywords`; fixed a dangling-temporary bug in tag dedup (`std::equal` over two separately-constructed temporaries); added XMP rating fallback (`Xmp.xmp.Rating`) when `Exif.Image.Rating` is absent.
-- `src/edit.rs` — `normalise_tag` made `pub(crate)` for reuse; pedantic-lint cast fixes.
-- `src/tui.rs` — pagination (`move_cursor` turns pages at boundaries; `jump_to_first`/`jump_to_last` for `g`/`G`/`Home`/`End`); full readline editing (`input_cursor` field, Ctrl-a/e/b/f/k/u/w/d, Left/Right/Home/End/Delete/Backspace) replacing append/backspace-only editing; black-frame fix (`last_rect: HashMap<PathBuf, Rect>`, `ensure_decoded_at`, `clear_images`, `on_resize` wired to `Event::Resize`); ~10 new tests; `HELP` const updated.
-- `tests/invariant.rs` — added `every_declared_cli_flag_is_actually_read`.
-- `tests/real_data.rs` — count bumped 12 → 18; added tests for embedded rating/tag round-trip, seeding-then-sync, the sidecar-resurrection guard (initially failed, proving the guard necessary), XMP-only rating, and tag dedup across sources.
-- `Cargo.toml` — added `[lints.clippy]` with `pedantic = warn` plus targeted allows.
-- `.githooks/pre-commit` (new) — runs `./check quick`; enabled via `git config core.hooksPath .githooks`.
-- `scripts/fix-export-ratings` (new) — reusable dry-run-by-default script implementing the tiered matching + backfill; requires `--apply` to write; uses real on-disk filenames throughout to avoid the `file_stem()` bug; avoids the SIGPIPE panic.
-- `CLAUDE.md`, `README.md`, `PLAN.md` — updated for `--root` uniformity, `--read-only` removal, pre-commit hook, new TUI keybindings, black-frame bug status.
+- `src/tui.rs` — `splice_filter` (timeline/sidebar Enter handlers no longer
+  clobber a manually-added query fragment); `decoded: HashMap<PathBuf,
+  DynamicImage>` field split out from `images`/`last_rect`, with matching
+  changes to `ensure_decoded`, `ensure_decoded_at`, `clear_images`, and the
+  per-frame `frame_used` retain block; several new/rewritten tests for both.
+- `~/.config/npc/config.toml` (outside the repo) — `grid_px` 1280 → 500,
+  comment rewritten to explain why (sidebar/borders eat into the naive
+  screen-width math).
+- `Cargo.toml`, `Cargo.lock` — `eframe`, `egui` added (branch `feature/gui`
+  only; not present on `master`).
+- `src/lib.rs` — `pub mod gui;` (branch `feature/gui` only).
+- `src/gui.rs` (new, `feature/gui` only) — the `npcg` app: query box,
+  `egui::Grid` thumbnail grid, click/arrow/Page Up-Down selection and
+  scrolling, `0`-`5` star ratings via `edit::apply`/`edit::flush`, async
+  thumbnail loading via `thumbs::Cache::get`.
+- `src/bin/npcg.rs` (new, `feature/gui` only) — thin entry point, resolves
+  the library root the same way `main.rs::library()` does, calls
+  `npc::gui::run`.
 
 ## 4. Notable Bugs Found and Fixed
 
-1. `move_cursor` didn't reset cursor to 0 when there was no previous page (caught by `page_keys_move_by_a_real_screen`).
-2. `move_cursor` offset arithmetic used `self.rows.len()` (current page's count) instead of the `PAGE` constant — wrong on a partial last page (caught by `moving_before_the_first_row_of_a_page_turns_back`).
-3. Missing `!has_sidecar` guard in scan.rs seeding — caused `a_full_rescan_does_not_resurrect_a_tag_cleared_via_the_sidecar` to fail; root cause was marking a stack dirty during seeding blocking the later unconditional sidecar-ingestion pass.
-4. C++ dedup bug: `std::equal` called on two separately-constructed `std::string(existing)` temporaries never matched — found via direct instrumentation, fixed by binding to one named local.
-5. Missing XMP rating fallback in `read_meta` — some tools only write `Xmp.xmp.Rating`, not `Exif.Image.Rating`.
-6. Git mis-staging during `git add -p` hunk-splitting — caught via `git show --stat HEAD`; fixed with `git reset --soft HEAD~1` (safe, unpushed) and redone as two correct commits.
-7. `npc rate` path parsing: `Target.paths` resolution strips only the last extension via `file_stem()`, mangling filenames with multiple dots (e.g. `750_4333_modified.tif.out.jpg`). Worked around using real on-disk filenames; the reusable script was designed from the start to avoid this.
-8. Capture-time matching was unreliable at full scale: 18,937 distinct capture_times shared across multiple stacks (burst shooting) — tier 2 restricted to only unique timestamps.
-9. Broken pipe panic in the reusable script (`npc status | head -1`) — fixed by capturing full output before parsing.
-10. **Open at time of writing**: exports matching neither tier (no serial/shutter, no capture_time at all) are silently absent from every report — confirmed as a live instance via `/media/ram/MyPics/export/4gg/750_3311_modified.jpg`, which has no serial, no shutter_count, and no capture_time whatsoever. True source confirmed as `/media/ram/MyPics/2025/12/11/750_3311.JPG` (serial=6094708, shutter_count=28841, capture_time=1765479452, rating=1) via matching capture_time against the sibling export `export/bw/750_3311_modified.jpg` (capture_time=1765479452, rating=0 in catalog, `.xmp` sidecar shows `xmp:Rating="1"` was already written for the `bw` one — so `bw` was already fixed by a prior backfill round; `4gg` was not, and cannot be, by tier-based matching alone).
+1. Timeline/sidebar `Enter` overwrote the whole query, discarding a `/`-added
+   filter — root cause and fix in `splice_filter` (§2/§3 above).
+2. `ensure_decoded_at`'s rect-based cache invalidation re-read the source
+   file from disk on every scroll step even when only the screen position
+   changed — split `decoded` from `images`/`last_rect`.
+3. `grid_px` was 2.5x oversized relative to what a grid tile actually
+   displays on this user's screen once the sidebar/borders are accounted
+   for — confirmed by direct measurement of real cached thumbnail files
+   (853×1280px, 32KB), not assumed.
+4. **`npcg`, all found live by the user, none reproducible in this
+   environment (no display)**:
+   - Grid tiles vertically offset within a row (`horizontal_wrapped` is a
+     flow layout with no shared row baseline; switched to `egui::Grid`).
+   - Query box never submitted on Enter (the documented egui idiom,
+     `response.lost_focus() && Enter`, didn't fire reliably in this egui
+     version; replaced with an unconditional Enter-pressed-anywhere check).
+   - Fixing the grid layout broke mouse-wheel scrolling (`ScrollArea`
+     auto-shrink interacting with `Grid`'s tight content width — see §2).
+   - `rating=1` (a query matching many never-before-cached-at-500px stacks)
+     froze the whole window — synchronous `Cache::make_now` on the UI
+     thread; switched to async `Cache::get` + placeholder + periodic
+     repaint.
+   - Large dead gap after the first grid tile, second tile's sliver pinned
+     against the window edge — `ui.vertical()`'s width-claiming inside a
+     `Grid` cell (see §2); confirmed via a user-provided screenshot after
+     several purely-verbal-description-based fixes failed to converge.
 
-## 5. Pending / Next Steps (as of the compaction point)
+## 5. Pending / Next Steps
 
-- **Add a third reporting category to `scripts/fix-export-ratings`**: "no reliable signal, can't verify" — offered to the user, not yet actioned. This should report a count of unmatched exports instead of staying silent, so a clean report doesn't imply "all exports are fine."
-- **Fix `export/4gg/750_3311_modified.jpg` by hand**: confirmed true source is `2025/12/11/750_3311.JPG` (rating=1). Since it has zero identifying metadata (no serial, no shutter_count, no capture_time), no automated tier can safely match it — this one needs a direct, manually-specified fix (e.g. `npc rate 1 --root /media/ram/MyPics -- export/4gg/750_3311_modified.jpg`), not a script run.
-- Both of these were proposed to the user; awaiting confirmation/instruction to proceed.
+- Nothing pending from this session's own scope — all of it was resolved,
+  confirmed live, or explicitly parked at the user's request.
+- `feature/gui` (local only, not pushed) is parked at commit `809c1de`
+  (`npcg: fix grid cell width claiming the full row`). Contains a working
+  minimal `npcg`: query, grid, ratings, paging, scrolling — no tagging, no
+  timeline/sidebar, no single-image view. If ever revisited, those would be
+  natural next slices, but the user does not currently want to continue
+  down this path.
+- `feature/tui-timeline` still exists as a branch (local + remote) even
+  though it's fully merged into `master` — never deleted, harmless to leave.
+- The still-open items from the *previous* summary (a third
+  "no reliable signal" reporting category for `scripts/fix-export-ratings`)
+  were not revisited this session and remain open if still wanted.
+- `CLAUDE.md`'s "Known gaps" section (Miri/ASan never run on the FFI
+  boundary; black-frame fix not confirmed on a real kitty terminal — though
+  this session did confirm live on Ghostty that black frames do not
+  reproduce there) has not been updated to reflect this session's findings;
+  worth a pass if picked back up.
 
 ## 6. Design Note Still Live
 
-There is an approved plan on disk at `/home/ram/.claude/plans/i-want-to-scan-jazzy-goose.md` covering TUI pagination, readline editing, and the black-frame fix — all three parts of that plan were implemented and tested during this session (see `src/tui.rs` changes above). If anything in that plan's verification checklist (particularly the manual real-kitty-terminal checks in Part 3, item 7) hasn't yet been confirmed by the user, that confirmation is still outstanding.
+Two prior design artifacts from earlier sessions
+(`/home/ram/.claude/plans/i-want-to-scan-jazzy-goose.md`,
+`/home/ram/.claude/plans/greedy-yawning-cloud.md` for the `npcg` spike) are
+both fully implemented; the latter's branch is parked per §1/§5 above rather
+than merged.

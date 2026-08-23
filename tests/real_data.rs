@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 24;
+const REAL_DATA_TEST_COUNT: usize = 26;
 
 macro_rules! require_ground_truth {
     () => {
@@ -846,7 +846,7 @@ fn rate_sync_noop_when_raw_and_jpg_agree() {
     let mut cat = Catalog::open_memory().unwrap();
     scan::scan(&mut cat, dir.path(), false).unwrap();
 
-    let conflicts = npc::rating_sync::scan(&cat).unwrap();
+    let conflicts = npc::metadata_sync::scan(&cat).unwrap();
     assert!(
         conflicts.iter().all(|c| !c.needs_write()),
         "agreeing ratings must not be reported as needing a resync: {conflicts:?}"
@@ -916,14 +916,14 @@ fn rate_sync_resolves_diverging_ratings_and_flushes() {
     let before = fingerprint_tree(dir.path());
 
     // The same sequence `Cmd::RateSync`'s handler runs.
-    let candidates: Vec<_> = npc::rating_sync::scan(&cat)
+    let candidates: Vec<_> = npc::metadata_sync::scan(&cat)
         .unwrap()
         .into_iter()
-        .filter(npc::rating_sync::Conflict::needs_write)
+        .filter(npc::metadata_sync::Comparison::needs_write)
         .collect();
     assert_eq!(candidates.len(), 1);
     assert_eq!(
-        candidates[0].resolved,
+        candidates[0].resolved_rating,
         Some(5),
         "the higher rating must win"
     );
@@ -957,7 +957,7 @@ fn rate_sync_resolves_diverging_ratings_and_flushes() {
     );
 
     assert!(
-        npc::rating_sync::scan(&cat)
+        npc::metadata_sync::scan(&cat)
             .unwrap()
             .into_iter()
             .all(|c| !c.needs_write()),
@@ -1013,13 +1013,13 @@ fn rate_sync_dry_run_changes_nothing() {
 
     // Dry run: compute candidates, print nothing but the finding -- never
     // call apply/flush.
-    let candidates: Vec<_> = npc::rating_sync::scan(&cat)
+    let candidates: Vec<_> = npc::metadata_sync::scan(&cat)
         .unwrap()
         .into_iter()
-        .filter(npc::rating_sync::Conflict::needs_write)
+        .filter(npc::metadata_sync::Comparison::needs_write)
         .collect();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].resolved, Some(5));
+    assert_eq!(candidates[0].resolved_rating, Some(5));
 
     let (rating, dirty): (Option<i64>, i64) = cat
         .conn
@@ -1048,6 +1048,117 @@ fn rate_sync_dry_run_changes_nothing() {
         sidecar.rating, 3,
         "dry run must not touch the sidecar on disk"
     );
+}
+
+/// The exact reported scenario: a JPG already carries an embedded rating,
+/// its RAW sibling has just been imported and carries none at all. That is
+/// not a disagreement -- there's nothing to resolve, the catalog already
+/// holds the JPG's rating -- but it must not be silently indistinguishable
+/// from "everything agrees," which is what prompted this check.
+#[test]
+fn metadata_sync_reports_one_sided_as_a_note_not_a_conflict() {
+    require_ground_truth!();
+    require_library!();
+    let dir = tempfile::tempdir().unwrap();
+    let _nef = copy_into(dir.path(), "750_6278.NEF"); // never touched by exiftool
+    let jpg = copy_into(dir.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=1",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, dir.path(), false).unwrap();
+
+    let comparisons = npc::metadata_sync::scan(&cat).unwrap();
+    assert_eq!(comparisons.len(), 1);
+    let c = &comparisons[0];
+    assert!(c.one_sided(), "{c:?}");
+    assert!(c.rating_one_sided());
+    assert!(
+        !c.rating_disagrees(),
+        "one side unset is not a disagreement"
+    );
+
+    let findings = npc::doctor::run(&cat, dir.path(), &npc::config::Config::default()).unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .find(|f| f.title.contains("ratings agree"))
+            .unwrap()
+            .severity,
+        npc::doctor::Severity::Fine,
+        "one side being unset must not read as a rating conflict"
+    );
+    let one_sided_finding = findings
+        .iter()
+        .find(|f| f.title.contains("only one side"))
+        .expect("doctor must report the one-sided case");
+    assert_eq!(one_sided_finding.severity, npc::doctor::Severity::Note);
+    assert!(one_sided_finding
+        .detail
+        .iter()
+        .any(|d| d.contains("750_6278")));
+}
+
+/// Tags are folded into the same sync as rating: differing embedded tags on
+/// the RAW and JPG must union, not just the rating.
+#[test]
+fn rate_sync_also_syncs_tags() {
+    require_ground_truth!();
+    require_library!();
+    let dir = tempfile::tempdir().unwrap();
+    let nef = copy_into(dir.path(), "750_6278.NEF");
+    let jpg = copy_into(dir.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-XMP-dc:Subject=sailing",
+        nef.to_str().unwrap(),
+    ]);
+
+    // Seed and flush first -- scan's own one-shot seed already unions
+    // embedded tags for a brand-new stack, exactly like it does for rating.
+    // The gap this feature closes is what happens *after* that: an external
+    // tool tags the JPG later, which nothing re-reads on its own.
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, dir.path(), false).unwrap();
+    npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+
+    exiftool(&[
+        "-overwrite_original",
+        "-XMP-dc:Subject=family",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let candidates: Vec<_> = npc::metadata_sync::scan(&cat)
+        .unwrap()
+        .into_iter()
+        .filter(npc::metadata_sync::Comparison::needs_write)
+        .collect();
+    assert_eq!(candidates.len(), 1);
+    let added = candidates[0].added_tags();
+    assert_eq!(
+        added,
+        vec!["family".to_string()],
+        "sailing was already seeded at first scan; only family is new"
+    );
+
+    let sid = candidates[0].stack_id;
+    npc::edit::apply(
+        &mut cat,
+        &[sid],
+        &[npc::edit::Change::AddTags(added)],
+        &npc::config::Config::default(),
+    )
+    .unwrap();
+    npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+
+    let sidecar =
+        npc::meta::read_sidecar(dir.path().join("750_6278.xmp").to_str().unwrap()).unwrap();
+    let mut tags = sidecar.tags.clone();
+    tags.sort();
+    assert_eq!(tags, vec!["family".to_string(), "sailing".to_string()]);
 }
 
 /// The end-to-end scenario this feature exists for: a JPG already in the

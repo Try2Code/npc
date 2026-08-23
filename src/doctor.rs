@@ -81,6 +81,11 @@ impl Finding {
 }
 
 pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> {
+    // Computed once and shared: metadata_sync::scan re-reads embedded EXIF
+    // off every stack with both a RAW and a JPG, which is expensive at real
+    // library scale -- doubling it across two separate checks would double
+    // that cost for nothing.
+    let comparisons = crate::metadata_sync::scan(cat)?;
     Ok(vec![
         check_modified_originals(cat)?,
         check_missing(cat)?,
@@ -88,7 +93,8 @@ pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> 
         check_pending(cat)?,
         check_undated(cat)?,
         check_duplicates(cat)?,
-        check_rating_conflicts(cat)?,
+        check_metadata_conflicts(&comparisons),
+        check_metadata_one_sided(&comparisons),
         check_actions(),
         check_cache(root),
         check_protection(root, config),
@@ -265,42 +271,82 @@ fn check_duplicates(cat: &Catalog) -> Result<Finding> {
 /// something else entirely, or because two different external tools rated
 /// them separately. This reads both live, off the files, not off the
 /// catalog's already-merged `rating`.
-fn check_rating_conflicts(cat: &Catalog) -> Result<Finding> {
-    let mut conflicts: Vec<_> = crate::rating_sync::scan(cat)?
-        .into_iter()
-        .filter(crate::rating_sync::Conflict::disagrees)
+fn check_metadata_conflicts(comparisons: &[crate::metadata_sync::Comparison]) -> Finding {
+    let mut disagreeing: Vec<_> = comparisons
+        .iter()
+        .filter(|c| c.rating_disagrees())
         .collect();
-    if conflicts.is_empty() {
-        return Ok(Finding::fine(
-            "RAW and JPG ratings agree everywhere both are present",
-        ));
+    if disagreeing.is_empty() {
+        return Finding::fine("RAW and JPG ratings agree everywhere both are present");
     }
-    conflicts.sort_by(|a, b| (&a.dir, &a.base).cmp(&(&b.dir, &b.base)));
-    let n = conflicts.len();
-    conflicts.truncate(10);
-    let detail: Vec<String> = conflicts
+    disagreeing.sort_by(|a, b| (&a.dir, &a.base).cmp(&(&b.dir, &b.base)));
+    let n = disagreeing.len();
+    disagreeing.truncate(10);
+    let detail: Vec<String> = disagreeing
         .iter()
         .map(|c| {
             format!(
                 "{}/{}  raw={} jpg={} -> {} would win",
                 c.dir,
                 c.base,
-                c.raw.map_or("-".to_string(), |v| v.to_string()),
-                c.jpg.map_or("-".to_string(), |v| v.to_string()),
-                c.resolved.map_or("-".to_string(), |v| v.to_string()),
+                c.raw_rating.map_or("-".to_string(), |v| v.to_string()),
+                c.jpg_rating.map_or("-".to_string(), |v| v.to_string()),
+                c.resolved_rating.map_or("-".to_string(), |v| v.to_string()),
             )
         })
         .collect();
-    Ok(
-        Finding::warn(format!("{n} stack(s) have disagreeing RAW/JPG ratings"))
-            .with(detail)
-            .fix(
-                "Something rated the RAW and the JPG separately -- possibly you, \
-                 in two different tools. Run `npc rate-sync -q <query>` (or with \
-                 explicit paths) to resolve them: the higher rating wins, written \
-                 through the sidecar as usual. `--dry-run` shows what would change \
-                 first.",
-            ),
+    Finding::warn(format!("{n} stack(s) have disagreeing RAW/JPG ratings"))
+        .with(detail)
+        .fix(
+            "Something rated the RAW and the JPG separately -- possibly you, \
+             in two different tools. Run `npc rate-sync -q <query>` (or with \
+             explicit paths) to resolve them: the higher rating wins, written \
+             through the sidecar as usual. `--dry-run` shows what would change \
+             first.",
+        )
+}
+
+/// A stack where only one of the RAW/JPG carries an embedded rating or tags
+/// is not a conflict -- there's nothing to disagree about, and the catalog
+/// already holds the correct resolved value -- but it looked identical to
+/// "everything agrees" until this existed, which is exactly what prompted
+/// this check: a freshly-imported RAW naturally has no embedded rating yet,
+/// and that's worth being visible rather than silent.
+fn check_metadata_one_sided(comparisons: &[crate::metadata_sync::Comparison]) -> Finding {
+    let mut one_sided: Vec<_> = comparisons.iter().filter(|c| c.one_sided()).collect();
+    if one_sided.is_empty() {
+        return Finding::fine(
+            "embedded rating/tags are symmetric wherever both RAW and JPG are present",
+        );
+    }
+    one_sided.sort_by(|a, b| (&a.dir, &a.base).cmp(&(&b.dir, &b.base)));
+    let n = one_sided.len();
+    one_sided.truncate(10);
+    let detail: Vec<String> = one_sided
+        .iter()
+        .map(|c| {
+            let mut parts = Vec::new();
+            if c.rating_one_sided() {
+                let side = if c.raw_rating.is_some() { "RAW" } else { "JPG" };
+                parts.push(format!("rating only on {side}"));
+            }
+            if c.tags_one_sided() {
+                let side = if c.raw_tags.is_empty() { "JPG" } else { "RAW" };
+                parts.push(format!("tags only on {side}"));
+            }
+            format!("{}/{}  {}", c.dir, c.base, parts.join(", "))
+        })
+        .collect();
+    Finding::note(format!(
+        "{n} stack(s) carry embedded rating/tags on only one side"
+    ))
+    .with(detail)
+    .fix(
+        "Not a conflict -- the catalog's resolved value is already correct. \
+         Shown so an asymmetric import (e.g. a RAW added after its JPG was \
+         already rated/tagged) isn't silently indistinguishable from \
+         everything agreeing. `npc rate-sync` picks up anything the catalog \
+         doesn't have yet.",
     )
 }
 
@@ -500,8 +546,8 @@ mod tests {
     fn only_one_role_present_is_no_conflict() {
         let (dir, cat) = library();
         let findings = run(&cat, dir.path(), &Config::default()).unwrap();
-        let f = find(&findings, "ratings agree");
-        assert_eq!(f.severity, Severity::Fine);
+        assert_eq!(find(&findings, "ratings agree").severity, Severity::Fine);
+        assert_eq!(find(&findings, "symmetric").severity, Severity::Fine);
     }
 
     /// Fabricated bytes aren't a real image, so `meta::read_meta` fails on
@@ -520,5 +566,6 @@ mod tests {
 
         let findings = run(&cat, dir.path(), &Config::default()).unwrap();
         assert_eq!(find(&findings, "ratings agree").severity, Severity::Fine);
+        assert_eq!(find(&findings, "symmetric").severity, Severity::Fine);
     }
 }

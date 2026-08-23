@@ -100,11 +100,12 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
-    /// Re-resolve a stack's rating from its RAW's and JPG's own embedded
-    /// ratings, read live off the files -- not the catalog's merged value.
-    /// The higher of the two wins, the same rule `scan` applies once when a
-    /// stack is first seen. `npc doctor` reports which stacks currently
-    /// disagree.
+    /// Re-resolve a stack's rating and tags from its RAW's and JPG's own
+    /// embedded metadata, read live off the files -- not the catalog's
+    /// merged value. The higher rating wins and tags are unioned, the same
+    /// rules `scan` applies once when a stack is first seen. `npc doctor`
+    /// reports stacks whose ratings disagree, or whose embedded metadata is
+    /// present on only one side.
     RateSync {
         #[command(flatten)]
         target: Target,
@@ -706,7 +707,7 @@ fn main() -> Result<()> {
             }
 
             let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
-            let candidates: Vec<_> = npc::rating_sync::scan(&cat)?
+            let candidates: Vec<_> = npc::metadata_sync::scan(&cat)?
                 .into_iter()
                 .filter(|c| id_set.contains(&c.stack_id) && c.needs_write())
                 .collect();
@@ -717,19 +718,28 @@ fn main() -> Result<()> {
             }
 
             for c in &candidates {
+                let mut parts = Vec::new();
+                if c.needs_rating_write() {
+                    parts.push(format!(
+                        "rating {}->{}",
+                        c.catalog_rating.map_or("-".to_string(), |v| v.to_string()),
+                        c.resolved_rating
+                            .expect("needs_rating_write implies resolved_rating is Some")
+                    ));
+                }
+                for t in c.added_tags() {
+                    parts.push(format!("+tag {t}"));
+                }
                 println!(
-                    "{}{}/{}  raw={} jpg={} catalog={} -> {}",
+                    "{}{}/{}  {}",
                     if target.dry_run {
-                        "would rate  "
+                        "would sync  "
                     } else {
-                        "rating      "
+                        "syncing     "
                     },
                     c.dir,
                     c.base,
-                    c.raw.map_or("-".to_string(), |v| v.to_string()),
-                    c.jpg.map_or("-".to_string(), |v| v.to_string()),
-                    c.catalog.map_or("-".to_string(), |v| v.to_string()),
-                    c.resolved.expect("needs_write implies resolved is Some"),
+                    parts.join(", "),
                 );
             }
 
@@ -738,23 +748,18 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut by_value: std::collections::HashMap<i64, Vec<i64>> =
-                std::collections::HashMap::new();
             for c in &candidates {
-                by_value
-                    .entry(i64::from(
-                        c.resolved.expect("needs_write implies resolved is Some"),
-                    ))
-                    .or_default()
-                    .push(c.stack_id);
-            }
-            for (rating, ids) in &by_value {
-                npc::edit::apply(
-                    &mut cat,
-                    ids,
-                    &[npc::edit::Change::SetRating(Some(*rating))],
-                    &config,
-                )?;
+                let mut changes = Vec::new();
+                if c.needs_rating_write() {
+                    changes.push(npc::edit::Change::SetRating(
+                        c.resolved_rating.map(i64::from),
+                    ));
+                }
+                let added = c.added_tags();
+                if !added.is_empty() {
+                    changes.push(npc::edit::Change::AddTags(added));
+                }
+                npc::edit::apply(&mut cat, &[c.stack_id], &changes, &config)?;
             }
             let stats = npc::edit::flush(&mut cat, &config)?;
 

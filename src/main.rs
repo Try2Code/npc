@@ -929,7 +929,7 @@ fn main() -> Result<()> {
             // walking the whole library first; by default the catalog is
             // trusted as-is, which is far faster but carries that same risk
             // if something outside npc touched the library meanwhile.
-            let cat = if rescan {
+            let mut cat = if rescan {
                 let (scan_stats, cat) = scan::scan_root(&root, false)?;
                 println!(
                     "catalog: {} stacks ({} new/changed)",
@@ -1003,44 +1003,70 @@ fn main() -> Result<()> {
 
                 println!();
                 let mut bytes_so_far = 0u64;
-                let stats = npc::import::execute(&plans, &config, dry_run, &mut |ev| match ev {
-                    npc::import::ImportEvent::Skipped(stack) => {
-                        let name = stack
-                            .members
-                            .first()
-                            .map_or_else(|| stack.base.clone(), |m| m.src.display().to_string());
-                        let existing = stack.duplicate_of.as_deref().unwrap_or("?");
-                        println!("skip (already in library, unchanged): {name} -> {existing}");
-                    }
-                    npc::import::ImportEvent::Copied {
-                        index,
-                        total,
-                        stack,
-                        bytes,
-                    } => {
-                        if dry_run {
-                            // Nothing is actually copied yet -- show exactly
-                            // where each member would land, so the plan is
-                            // inspectable before committing to it.
-                            for m in &stack.members {
-                                println!(
-                                    "  would copy: {} -> {}",
-                                    m.src.display(),
-                                    m.dest.display()
-                                );
-                            }
-                        } else {
-                            bytes_so_far += bytes;
-                            print!(
-                                "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
-                                bytes_so_far as f64 / 1e9,
-                                total_bytes as f64 / 1e9
+                let stats = npc::import::execute(&plans, &mut cat, &config, dry_run, &mut |ev| {
+                    match ev {
+                        npc::import::ImportEvent::Skipped(stack) => {
+                            let name = stack.members.first().map_or_else(
+                                || stack.base.clone(),
+                                |m| m.src.display().to_string(),
                             );
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            let existing = stack.duplicate_of.as_deref().unwrap_or("?");
+                            match stack.metadata_merge.as_ref().filter(|m| m.needs_write()) {
+                                Some(m) => {
+                                    let verb = if dry_run {
+                                        "would merge metadata"
+                                    } else {
+                                        "merged metadata"
+                                    };
+                                    let mut parts = Vec::new();
+                                    if m.changes_rating() {
+                                        parts.push(format!(
+                                            "rating {}->{}",
+                                            m.rating_before
+                                                .map_or("-".to_string(), |v| v.to_string()),
+                                            m.rating_after.unwrap()
+                                        ));
+                                    }
+                                    for t in m.added_tags() {
+                                        parts.push(format!("+tag {t}"));
+                                    }
+                                    println!("{verb}: {name} -> {existing}  {}", parts.join(", "));
+                                }
+                                None => {
+                                    println!("skip (already in library, unchanged): {name} -> {existing}");
+                                }
+                            }
                         }
-                    }
-                    npc::import::ImportEvent::Failed { error, .. } => {
-                        eprintln!("\nerror: {error}");
+                        npc::import::ImportEvent::Copied {
+                            index,
+                            total,
+                            stack,
+                            bytes,
+                        } => {
+                            if dry_run {
+                                // Nothing is actually copied yet -- show exactly
+                                // where each member would land, so the plan is
+                                // inspectable before committing to it.
+                                for m in &stack.members {
+                                    println!(
+                                        "  would copy: {} -> {}",
+                                        m.src.display(),
+                                        m.dest.display()
+                                    );
+                                }
+                            } else {
+                                bytes_so_far += bytes;
+                                print!(
+                                    "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
+                                    bytes_so_far as f64 / 1e9,
+                                    total_bytes as f64 / 1e9
+                                );
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                        }
+                        npc::import::ImportEvent::Failed { error, .. } => {
+                            eprintln!("\nerror: {error}");
+                        }
                     }
                 })?;
                 println!();
@@ -1061,6 +1087,9 @@ fn main() -> Result<()> {
                     if stats.duplicates_skipped > 0 {
                         println!("skipped {} duplicate(s)", stats.duplicates_skipped);
                     }
+                    if stats.merges_applied > 0 {
+                        println!("merged metadata into {} stack(s)", stats.merges_applied);
+                    }
                 }
                 println!();
 
@@ -1068,6 +1097,7 @@ fn main() -> Result<()> {
                 totals.files_copied += stats.files_copied;
                 totals.bytes_copied += stats.bytes_copied;
                 totals.duplicates_skipped += stats.duplicates_skipped;
+                totals.merges_applied += stats.merges_applied;
                 totals.errors.extend(stats.errors);
             }
 

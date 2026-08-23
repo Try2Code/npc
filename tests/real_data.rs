@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 22;
+const REAL_DATA_TEST_COUNT: usize = 23;
 
 macro_rules! require_ground_truth {
     () => {
@@ -1047,5 +1047,127 @@ fn rate_sync_dry_run_changes_nothing() {
     assert_eq!(
         sidecar.rating, 3,
         "dry run must not touch the sidecar on disk"
+    );
+}
+
+/// The end-to-end scenario this feature exists for: a JPG already in the
+/// library gets rated/tagged by an external tool (Shotwell) on a separate
+/// copy -- e.g. reimported from the same SD card later -- which changes its
+/// size without touching a single pixel. `import::plan` must recognise this
+/// as the same shot and merge, not plan a `_1`-suffixed duplicate; the merge
+/// must never regress the rating already set in the library, and neither
+/// original's bytes or mtime may move.
+#[test]
+fn import_merges_metadata_from_a_re_embedded_card_copy_instead_of_duplicating() {
+    require_ground_truth!();
+    require_library!();
+    let lib = tempfile::tempdir().unwrap();
+    let nef = copy_into(lib.path(), "750_6278.NEF");
+    let jpg = copy_into(lib.path(), "750_6278.JPG");
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, lib.path(), false).unwrap();
+    let sid = cat
+        .stack_id(&lib.path().to_string_lossy(), "750_6278")
+        .unwrap()
+        .unwrap();
+
+    // A rating and tag already set through npc itself, before the SD-card
+    // copy ever enters the picture -- the merge must not lose either.
+    npc::edit::apply(
+        &mut cat,
+        &[sid],
+        &[
+            npc::edit::Change::SetRating(Some(3)),
+            npc::edit::Change::AddTags(vec!["existing".to_string()]),
+        ],
+        &npc::config::Config::default(),
+    )
+    .unwrap();
+    npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+
+    // A separate "card" copy of just the JPG, re-embedded with a higher
+    // rating and a new tag -- same pixels, different size.
+    let card = tempfile::tempdir().unwrap();
+    let card_jpg = copy_into(card.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=5",
+        "-XMP-dc:Subject=india",
+        card_jpg.to_str().unwrap(),
+    ]);
+
+    let before = fingerprint_tree(lib.path());
+    let card_before = fingerprint_tree(card.path());
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    assert_eq!(plans.len(), 1);
+    let stack = &plans[0];
+    assert!(stack.duplicate_of.is_some(), "must not plan a fresh import");
+    let merge = stack
+        .metadata_merge
+        .as_ref()
+        .expect("a size-shifted same-shot copy must produce a metadata merge");
+    assert!(merge.needs_write());
+    assert_eq!(
+        merge.rating_after,
+        Some(5),
+        "the higher rating must win, not regress the existing 3"
+    );
+    let mut tags_after = merge.tags_after.clone();
+    tags_after.sort();
+    assert_eq!(
+        tags_after,
+        vec!["existing".to_string(), "india".to_string()]
+    );
+
+    let stats = npc::import::execute(
+        &plans,
+        &mut cat,
+        &npc::config::Config::default(),
+        false,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(stats.stacks_copied, 0, "must not copy a duplicate");
+    assert_eq!(stats.merges_applied, 1);
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+
+    let (rating, tag_count): (Option<i64>, i64) = cat
+        .conn
+        .query_row(
+            "SELECT rating, (SELECT COUNT(*) FROM stack_tag WHERE stack_id = s.id)
+             FROM stack s WHERE id = ?1",
+            [sid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rating, Some(5));
+    assert_eq!(tag_count, 2);
+
+    let sidecar =
+        npc::meta::read_sidecar(lib.path().join("750_6278.xmp").to_str().unwrap()).unwrap();
+    assert_eq!(
+        sidecar.rating, 5,
+        "the sidecar must carry the merged rating"
+    );
+
+    // Neither original -- not the library's NEF/JPG, not the card's JPG --
+    // may have moved a single byte or its mtime.
+    let after = fingerprint_tree(lib.path());
+    for original in [&nef, &jpg] {
+        let path = original.to_string_lossy().to_string();
+        assert_eq!(
+            after.get(&path),
+            before.get(&path),
+            "{path} changed during the merge"
+        );
+    }
+    let card_after = fingerprint_tree(card.path());
+    let card_path = card_jpg.to_string_lossy().to_string();
+    assert_eq!(
+        card_after.get(&card_path),
+        card_before.get(&card_path),
+        "the card copy must never be written to"
     );
 }

@@ -40,6 +40,11 @@ pub struct PlannedStack {
     /// existing file but the bytes didn't -- so it's importing as new, not
     /// being silently skipped, but it's worth knowing how close a call it was.
     pub near_miss: Option<NearMiss>,
+    /// Set when `duplicate_of` was confirmed the same shot despite a size
+    /// difference -- typically an external tool (Shotwell) embedding a
+    /// rating or tags after the file was first imported. Carries what the
+    /// library's catalog entry would gain if merged.
+    pub metadata_merge: Option<crate::metadata_merge::MetadataMerge>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,10 @@ pub struct ImportStats {
     pub files_copied: usize,
     pub bytes_copied: u64,
     pub duplicates_skipped: usize,
+    /// Of `duplicates_skipped`, how many carried a metadata merge that was
+    /// actually applied to the library's catalog entry. Zero under
+    /// `--dry-run`, since nothing is written then.
+    pub merges_applied: usize,
     pub errors: Vec<String>,
 }
 
@@ -146,6 +155,7 @@ pub fn plan(
     // `find_duplicate` verifies the bytes actually match.
     let known = known_shots(cat)?;
     let known_content = known_by_content(cat)?;
+    let known_time = known_by_time(cat)?;
 
     let mut plans = Vec::new();
     let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -164,17 +174,20 @@ pub fn plan(
             .iter()
             .find(|(_, r, _)| *r == Role::Raw)
             .or_else(|| members.iter().find(|(_, r, _)| r.is_image()));
-        let (capture_time, ident) = match anchor {
-            Some((path, _, _)) => match crate::meta::read_meta(&path.to_string_lossy()) {
-                Ok(m) => (
-                    (m.capture_time != 0).then_some(m.capture_time),
-                    (!m.serial.is_empty() && m.shutter_count != 0)
-                        .then(|| (m.serial.clone(), m.shutter_count)),
-                ),
-                Err(_) => (None, None),
-            },
-            None => (None, None),
+        // Kept rather than discarded after capture_time/ident: a
+        // metadata-merge target (below) needs this same read's embedded
+        // rating/tags, and re-reading would cost a second Exiv2 call.
+        let anchor_meta = match anchor {
+            Some((path, _, _)) => crate::meta::read_meta(&path.to_string_lossy()).ok(),
+            None => None,
         };
+        let capture_time = anchor_meta
+            .as_ref()
+            .and_then(|m| (m.capture_time != 0).then_some(m.capture_time));
+        let ident = anchor_meta.as_ref().and_then(|m| {
+            (!m.serial.is_empty() && m.shutter_count != 0)
+                .then(|| (m.serial.clone(), m.shutter_count))
+        });
 
         let dest_dir = match capture_time {
             Some(t) => library.join(date_path(t)),
@@ -183,7 +196,7 @@ pub fn plan(
             None => library.join("undated"),
         };
 
-        let (duplicate_of, near_miss) = match anchor {
+        let (mut duplicate_of, near_miss) = match anchor {
             Some((path, _, size)) => find_duplicate(
                 path,
                 *size,
@@ -195,6 +208,28 @@ pub fn plan(
             ),
             None => (None, None),
         };
+
+        // Not a byte-for-byte duplicate, but possibly the same shot with
+        // richer embedded metadata than what's cataloged -- e.g. Shotwell
+        // rated or tagged this file directly, after it was already imported.
+        let mut metadata_merge = None;
+        if duplicate_of.is_none() {
+            if let Some((path, role, size)) = anchor {
+                if let Some(existing_path) = find_metadata_merge_target(
+                    path,
+                    *size,
+                    *role,
+                    ident.as_ref(),
+                    capture_time,
+                    &known,
+                    &known_time,
+                ) {
+                    metadata_merge =
+                        build_metadata_merge(cat, &existing_path, anchor_meta.as_ref());
+                    duplicate_of = Some(existing_path);
+                }
+            }
+        }
 
         // Resolve one collision suffix for the whole stack, so members keep
         // matching basenames and their shared sidecar still works.
@@ -235,6 +270,7 @@ pub fn plan(
             members: planned,
             duplicate_of,
             near_miss,
+            metadata_merge,
         });
     }
 
@@ -262,9 +298,14 @@ pub enum ImportEvent<'a> {
     },
 }
 
-/// Execute a plan. Copies only; the source is left exactly as it was.
+/// Execute a plan. Copies only; the source is left exactly as it was. A
+/// metadata merge (see `PlannedStack::metadata_merge`) is the one exception:
+/// on a real (non-dry-run) run it writes the resolved rating/tags for a
+/// matched stack, through the same `edit::apply`/`edit::flush` path every
+/// other metadata edit in this program uses -- never a new writer.
 pub fn execute(
     plans: &[PlannedStack],
+    cat: &mut Catalog,
     config: &Config,
     dry_run: bool,
     on_event: &mut dyn FnMut(ImportEvent),
@@ -276,6 +317,22 @@ pub fn execute(
     for stack in plans {
         if stack.duplicate_of.is_some() {
             stats.duplicates_skipped += 1;
+            if !dry_run {
+                if let Some(m) = stack.metadata_merge.as_ref().filter(|m| m.needs_write()) {
+                    let mut changes = Vec::new();
+                    if m.changes_rating() {
+                        changes.push(crate::edit::Change::SetRating(
+                            m.rating_after.map(i64::from),
+                        ));
+                    }
+                    let added = m.added_tags();
+                    if !added.is_empty() {
+                        changes.push(crate::edit::Change::AddTags(added));
+                    }
+                    crate::edit::apply(cat, &[m.stack_id], &changes, config)?;
+                    stats.merges_applied += 1;
+                }
+            }
             on_event(ImportEvent::Skipped(stack));
             continue;
         }
@@ -341,6 +398,11 @@ pub fn execute(
             stack,
             bytes: stack_bytes,
         });
+    }
+
+    if !dry_run && stats.merges_applied > 0 {
+        let flush_stats = crate::edit::flush(cat, config)?;
+        stats.errors.extend(flush_stats.errors);
     }
 
     Ok(stats)
@@ -478,6 +540,144 @@ fn known_by_content(cat: &Catalog) -> Result<HashMap<(i64, i64), Vec<String>>> {
         map.entry((t, size)).or_default().push(path);
     }
     Ok(map)
+}
+
+/// `capture_time -> [(path, size)]` for everything already cataloged with a
+/// known capture time, regardless of size -- unlike `known_by_content`, which
+/// is keyed on `(capture_time, size)` and so cannot find a candidate whose
+/// size has since changed. Only consulted by `find_metadata_merge_target`,
+/// after `find_duplicate` has already failed to find a byte-identical match.
+fn known_by_time(cat: &Catalog) -> Result<HashMap<i64, Vec<(String, i64)>>> {
+    let mut stmt = cat.conn.prepare(
+        "SELECT f.capture_time, s.dir || '/' || f.name, f.size
+         FROM file f JOIN stack s ON s.id = f.stack_id
+         WHERE f.role IN ('raw','oocjpg')
+           AND f.capture_time IS NOT NULL AND f.size IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut map: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
+    for row in rows {
+        let (t, path, size) = row?;
+        map.entry(t).or_default().push((path, size));
+    }
+    Ok(map)
+}
+
+/// Not a byte-for-byte duplicate (`find_duplicate` already came back empty),
+/// but possibly the same shot with different embedded metadata:
+///
+/// - **Maker-note identity** (serial+shutter_count): trusted alone, no pixel
+///   check, the same way `dupes.rs` already treats this pair as certain
+///   proof of one actuation of one camera -- "the same photograph, whatever
+///   it is named."
+/// - **No maker-note evidence** (a non-RAW anchor, since a RAW's own EXIF
+///   always carries it when present): the only tier with no identity
+///   evidence at all, so a same-`capture_time`, different-size candidate is
+///   only accepted after its pixels are confirmed identical -- a real edit
+///   (crop, colour, recompression) must never be treated as the same shot.
+fn find_metadata_merge_target(
+    anchor_path: &Path,
+    anchor_size: u64,
+    anchor_role: Role,
+    ident: Option<&(String, u32)>,
+    capture_time: Option<i64>,
+    known_shots: &HashMap<(String, u32), (String, i64)>,
+    known_by_time: &HashMap<i64, Vec<(String, i64)>>,
+) -> Option<String> {
+    let anchor_size = i64::try_from(anchor_size).unwrap_or(i64::MAX);
+
+    if let Some(k) = ident {
+        if let Some((path, size)) = known_shots.get(k) {
+            if *size != anchor_size {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    if ident.is_none() && anchor_role != Role::Raw {
+        if let Some(t) = capture_time {
+            if let Some(candidates) = known_by_time.get(&t) {
+                for (path, size) in candidates {
+                    if *size != anchor_size && pixels_match(anchor_path, Path::new(path)) {
+                        return Some(path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Decode both files and compare pixels exactly. A decode failure on either
+/// side must never be treated as a match -- that would risk merging metadata
+/// from an unrelated file into the library's catalog entry.
+fn pixels_match(a: &Path, b: &Path) -> bool {
+    match (
+        crate::thumbs::decode_to_rgb8(a),
+        crate::thumbs::decode_to_rgb8(b),
+    ) {
+        (Ok(ra), Ok(rb)) => ra.dimensions() == rb.dimensions() && ra.as_raw() == rb.as_raw(),
+        _ => false,
+    }
+}
+
+/// Read the library's current catalog state for `existing_path` and combine
+/// it with the anchor's embedded metadata, monotonically: never regress a
+/// rating, never drop a tag. Returns `None` if the stack can no longer be
+/// resolved (row vanished under us) -- fail toward re-importing as new,
+/// never toward silently dropping something.
+fn build_metadata_merge(
+    cat: &Catalog,
+    existing_path: &str,
+    anchor_meta: Option<&crate::meta::FileMeta>,
+) -> Option<crate::metadata_merge::MetadataMerge> {
+    let existing = Path::new(existing_path);
+    let dir = existing.parent()?.to_string_lossy().to_string();
+    let name = existing.file_name()?.to_string_lossy().to_string();
+    let base = classify(&name)?.base;
+    let stack_id = cat.stack_id(&dir, &base).ok()??;
+
+    let (rating_before,): (Option<i64>,) = cat
+        .conn
+        .query_row(
+            "SELECT rating FROM stack WHERE id = ?1",
+            rusqlite::params![stack_id],
+            |r| Ok((r.get(0)?,)),
+        )
+        .ok()?;
+    let tags_before: Vec<String> = cat
+        .conn
+        .prepare(
+            "SELECT t.name FROM tag t JOIN stack_tag st ON st.tag_id = t.id
+             WHERE st.stack_id = ?1 ORDER BY t.name",
+        )
+        .ok()?
+        .query_map(rusqlite::params![stack_id], |r| r.get(0))
+        .ok()?
+        .collect::<std::result::Result<_, _>>()
+        .ok()?;
+
+    let embedded_rating = anchor_meta.and_then(|m| (m.rating >= 0).then_some(m.rating));
+    let embedded_tags = anchor_meta.map_or(&[][..], |m| m.tags.as_slice());
+
+    let (rating_after, tags_after) =
+        crate::metadata_merge::resolve(rating_before, &tags_before, embedded_rating, embedded_tags);
+
+    Some(crate::metadata_merge::MetadataMerge {
+        stack_id,
+        existing_path: existing_path.to_string(),
+        rating_before,
+        rating_after,
+        tags_before,
+        tags_after,
+    })
 }
 
 /// Identity (serial+shutter) plus size is trusted as a duplicate by default,
@@ -1033,6 +1233,150 @@ mod tests {
             "no identity match, so no near-miss to report"
         );
     }
+
+    /// A small in-memory JPEG, distinct pixels per `seed` so two calls with
+    /// different seeds are never accidentally identical.
+    fn jpeg_bytes(seed: u8) -> Vec<u8> {
+        let mut img = image::RgbImage::new(4, 4);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([
+                seed,
+                u8::try_from(x * 16).unwrap(),
+                u8::try_from(y * 16).unwrap(),
+            ]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// Insert a JPEG comment marker right after the SOI (`0xFFD8`) -- changes
+    /// the file's size without touching a single compressed pixel byte,
+    /// exactly what an embedded-metadata rewrite (Shotwell) looks like.
+    fn splice_comment(jpeg: &[u8]) -> Vec<u8> {
+        let payload = b"pretend this is an embedded XMP rating";
+        let len = u16::try_from(payload.len() + 2).unwrap();
+        let mut out = jpeg[..2].to_vec(); // SOI
+        out.push(0xFF);
+        out.push(0xFE); // COM marker
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// Tier A: identity (serial+shutter) matches, but size differs -- the
+    /// exact case `find_duplicate` deliberately leaves unhandled. Trusted
+    /// with no pixel check, per the maker-note identity being certain proof
+    /// on its own (same precedent as `dupes.rs`).
+    #[test]
+    fn tier_a_merge_target_is_found_despite_a_size_mismatch() {
+        let mut known_shots = HashMap::new();
+        known_shots.insert(
+            ("6094708".to_string(), 63987),
+            ("/lib/2026/08/09/750_0001.NEF".to_string(), 25_000_000i64),
+        );
+
+        let target = find_metadata_merge_target(
+            Path::new("/card/750_0001.NEF"),
+            25_004_000, // a few embedded-metadata bytes larger
+            Role::Raw,
+            Some(&("6094708".to_string(), 63987)),
+            None,
+            &known_shots,
+            &HashMap::new(),
+        );
+        assert_eq!(target, Some("/lib/2026/08/09/750_0001.NEF".to_string()));
+    }
+
+    /// Tier B: no maker-note identity at all (a JPG-only shot), same
+    /// capture_time, different size -- only accepted once pixels are
+    /// confirmed identical.
+    #[test]
+    fn tier_b_merge_target_is_found_when_pixels_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("incoming.JPG");
+        let existing = dir.path().join("existing.JPG");
+        let base = jpeg_bytes(7);
+        std::fs::write(&anchor, &base).unwrap();
+        std::fs::write(&existing, splice_comment(&base)).unwrap();
+
+        let mut known_time = HashMap::new();
+        known_time.insert(
+            1_700_000_000i64,
+            vec![(
+                existing.to_string_lossy().to_string(),
+                i64::try_from(std::fs::metadata(&existing).unwrap().len()).unwrap(),
+            )],
+        );
+
+        let target = find_metadata_merge_target(
+            &anchor,
+            std::fs::metadata(&anchor).unwrap().len(),
+            Role::OocJpg,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_time,
+        );
+        assert_eq!(target, Some(existing.to_string_lossy().to_string()));
+    }
+
+    /// The critical negative case: a real pixel edit must never be treated as
+    /// the same shot just because the identity/time evidence lines up.
+    #[test]
+    fn tier_b_merge_target_is_none_when_pixels_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("incoming.JPG");
+        let existing = dir.path().join("existing.JPG");
+        std::fs::write(&anchor, jpeg_bytes(7)).unwrap();
+        std::fs::write(&existing, jpeg_bytes(200)).unwrap();
+
+        let mut known_time = HashMap::new();
+        known_time.insert(
+            1_700_000_000i64,
+            vec![(
+                existing.to_string_lossy().to_string(),
+                i64::try_from(std::fs::metadata(&existing).unwrap().len()).unwrap(),
+            )],
+        );
+
+        let target = find_metadata_merge_target(
+            &anchor,
+            std::fs::metadata(&anchor).unwrap().len(),
+            Role::OocJpg,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_time,
+        );
+        assert_eq!(target, None);
+    }
+
+    /// A RAW anchor never falls into Tier B, even with no maker-note
+    /// identity: there is no RAW-decoding capability, so this tier's pixel
+    /// check would silently never engage. Confirm it does not try.
+    #[test]
+    fn tier_b_never_applies_to_a_raw_anchor() {
+        let mut known_time = HashMap::new();
+        known_time.insert(
+            1_700_000_000i64,
+            vec![("/lib/existing.NEF".to_string(), 999i64)],
+        );
+
+        let target = find_metadata_merge_target(
+            Path::new("/card/incoming.NEF"),
+            1000,
+            Role::Raw,
+            None,
+            Some(1_700_000_000),
+            &HashMap::new(),
+            &known_time,
+        );
+        assert_eq!(target, None);
+    }
 }
 
 #[cfg(test)]
@@ -1077,11 +1421,11 @@ mod safety_tests {
     fn the_source_is_byte_identical_after_import() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let before = fingerprint(card.path());
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
-        execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
+        execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
 
         assert_eq!(before, fingerprint(card.path()), "import modified the card");
     }
@@ -1090,10 +1434,10 @@ mod safety_tests {
     fn copies_arrive_byte_identical() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
-        let stats = execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
+        let stats = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
         assert_eq!(stats.files_copied, 2, "errors: {:?}", stats.errors);
 
         for p in &plans[0].members {
@@ -1112,14 +1456,14 @@ mod safety_tests {
     fn a_failed_member_rolls_back_the_whole_stack() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let mut plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         // Point the second member at a source that does not exist, so its copy
         // fails after the first has already succeeded.
         plans[0].members[1].src = card.path().join("does-not-exist.JPG");
 
-        let stats = execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
+        let stats = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
         assert_eq!(stats.stacks_copied, 0);
         assert_eq!(stats.errors.len(), 1);
 
@@ -1143,10 +1487,10 @@ mod safety_tests {
     fn no_part_files_survive_a_successful_import() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
-        execute(&plans, &Config::default(), false, &mut |_| {}).unwrap();
+        execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
 
         let parts: Vec<_> = walkdir::WalkDir::new(lib.path())
             .into_iter()
@@ -1186,10 +1530,10 @@ mod safety_tests {
     fn a_dry_run_writes_nothing() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
-        let stats = execute(&plans, &Config::default(), true, &mut |_| {}).unwrap();
+        let stats = execute(&plans, &mut cat, &Config::default(), true, &mut |_| {}).unwrap();
 
         assert_eq!(stats.files_copied, 2, "dry run should still report a plan");
         assert!(!lib.path().join("undated").exists());
@@ -1205,14 +1549,14 @@ mod safety_tests {
     fn importing_into_a_protected_root_is_refused() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
         let config = Config {
             protected_roots: vec![lib.path().to_path_buf()],
             ..Default::default()
         };
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
-        assert!(execute(&plans, &config, false, &mut |_| {}).is_err());
+        assert!(execute(&plans, &mut cat, &config, false, &mut |_| {}).is_err());
     }
 
     /// Without this, a source that is the library itself gets walked as if
@@ -1279,18 +1623,24 @@ mod safety_tests {
     fn a_verified_duplicate_fires_a_skipped_event() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let mut plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         plans[0].duplicate_of = Some("/lib/2026/08/09/750_0001".to_string());
 
         let mut skipped = 0;
         let mut copied = 0;
-        let stats = execute(&plans, &Config::default(), false, &mut |ev| match ev {
-            ImportEvent::Skipped(_) => skipped += 1,
-            ImportEvent::Copied { .. } => copied += 1,
-            ImportEvent::Failed { .. } => {}
-        })
+        let stats = execute(
+            &plans,
+            &mut cat,
+            &Config::default(),
+            false,
+            &mut |ev| match ev {
+                ImportEvent::Skipped(_) => skipped += 1,
+                ImportEvent::Copied { .. } => copied += 1,
+                ImportEvent::Failed { .. } => {}
+            },
+        )
         .unwrap();
 
         assert_eq!(skipped, 1);
@@ -1304,11 +1654,11 @@ mod safety_tests {
     fn a_fresh_stack_fires_a_copied_event_with_progress_info() {
         let card = card();
         let lib = tempfile::tempdir().unwrap();
-        let cat = Catalog::open_memory().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
 
         let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
         let mut seen = Vec::new();
-        execute(&plans, &Config::default(), false, &mut |ev| {
+        execute(&plans, &mut cat, &Config::default(), false, &mut |ev| {
             if let ImportEvent::Copied {
                 index,
                 total,

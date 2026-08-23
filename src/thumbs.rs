@@ -276,6 +276,16 @@ impl Cache {
     }
 }
 
+/// Decode a JPEG or PNG file to its raw pixels. Used to prove two files are
+/// pixel-identical (e.g. an SD-card copy re-embedded with a rating, versus
+/// the library's original) when their bytes and size no longer match.
+pub(crate) fn decode_to_rgb8(path: &Path) -> Result<image::RgbImage> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(image::load_from_memory(&bytes)
+        .with_context(|| format!("decoding {}", path.display()))?
+        .to_rgb8())
+}
+
 /// Read pixels, downscale, apply orientation, write JPEG.
 fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
     let bytes = if src.embedded {

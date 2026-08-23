@@ -15,6 +15,7 @@ pub mod edit;
 pub mod export;
 pub mod import;
 pub mod meta;
+pub mod metadata_merge;
 pub mod query;
 pub mod rating_sync;
 pub mod scan;

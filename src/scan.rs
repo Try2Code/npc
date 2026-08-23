@@ -46,7 +46,7 @@ pub(crate) fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> 
 /// Union embedded tags across every member that had one, case-insensitively,
 /// through the same normalisation `npc tag add` applies so casing and
 /// whitespace match what a real tagging session would have produced.
-fn union_embedded_tags<'a>(sources: impl Iterator<Item = &'a [String]>) -> Vec<String> {
+pub(crate) fn union_embedded_tags<'a>(sources: impl Iterator<Item = &'a [String]>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for tags in sources {

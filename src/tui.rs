@@ -861,8 +861,8 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('a') => self.show_actions = true,
 
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1)?,
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1)?,
+            KeyCode::Char('j') | KeyCode::Down if !self.sidebar_focus => self.move_cursor(1)?,
+            KeyCode::Char('k') | KeyCode::Up if !self.sidebar_focus => self.move_cursor(-1)?,
             KeyCode::PageDown => self.move_cursor(self.page_size as isize)?,
             KeyCode::PageUp => self.move_cursor(-(self.page_size as isize))?,
             // Half a screen, the vi convention.
@@ -2485,6 +2485,33 @@ mod tests {
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.query, "event=\"2026-08-09\"");
         assert_eq!(app.total, 3);
+    }
+
+    /// Down/Up used to move the main cursor unconditionally, then move
+    /// `sidebar_cursor` too in the sidebar-focused block below it -- so
+    /// browsing the sidebar silently changed the grid selection underneath.
+    #[test]
+    fn arrows_move_only_the_sidebar_while_it_has_focus() {
+        let (_d, mut app) = app_multi_month();
+        press(&mut app, 's'); // dates sidebar, which has three entries here
+        assert!(
+            app.sidebar_items.len() > 1,
+            "need more than one entry to see the cursor move: {:?}",
+            app.sidebar_items
+        );
+        press_code(&mut app, KeyCode::Left); // focus sidebar
+        let cursor_before = app.cursor;
+        let sidebar_cursor_before = app.sidebar_cursor;
+
+        press_code(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.cursor, cursor_before,
+            "main selection moved while the sidebar had focus"
+        );
+        assert_ne!(
+            app.sidebar_cursor, sidebar_cursor_before,
+            "sidebar cursor should advance on Down"
+        );
     }
 
     /// Same 3-stack fixture as `app()`, but spread across three different

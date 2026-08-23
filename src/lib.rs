@@ -16,6 +16,7 @@ pub mod export;
 pub mod import;
 pub mod meta;
 pub mod query;
+pub mod rating_sync;
 pub mod scan;
 pub mod stack;
 pub mod thumbs;

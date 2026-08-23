@@ -88,6 +88,7 @@ pub fn run(cat: &Catalog, root: &Path, config: &Config) -> Result<Vec<Finding>> 
         check_pending(cat)?,
         check_undated(cat)?,
         check_duplicates(cat)?,
+        check_rating_conflicts(cat)?,
         check_actions(),
         check_cache(root),
         check_protection(root, config),
@@ -254,6 +255,52 @@ fn check_duplicates(cat: &Catalog) -> Result<Finding> {
         Finding::note(format!("{} duplicate group(s)", groups.len()))
             .with(detail)
             .fix("See `npc dupes` for the full list."),
+    )
+}
+
+/// A stack's RAW and JPG each carry their own embedded rating. `scan`
+/// reconciles the two only once, when a stack is first cataloged; nothing
+/// after that notices if they drift apart, e.g. because one was rated
+/// through this tool's own sidecar-writing `rate` and the other through
+/// something else entirely, or because two different external tools rated
+/// them separately. This reads both live, off the files, not off the
+/// catalog's already-merged `rating`.
+fn check_rating_conflicts(cat: &Catalog) -> Result<Finding> {
+    let mut conflicts: Vec<_> = crate::rating_sync::scan(cat)?
+        .into_iter()
+        .filter(crate::rating_sync::Conflict::disagrees)
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(Finding::fine(
+            "RAW and JPG ratings agree everywhere both are present",
+        ));
+    }
+    conflicts.sort_by(|a, b| (&a.dir, &a.base).cmp(&(&b.dir, &b.base)));
+    let n = conflicts.len();
+    conflicts.truncate(10);
+    let detail: Vec<String> = conflicts
+        .iter()
+        .map(|c| {
+            format!(
+                "{}/{}  raw={} jpg={} -> {} would win",
+                c.dir,
+                c.base,
+                c.raw.map_or("-".to_string(), |v| v.to_string()),
+                c.jpg.map_or("-".to_string(), |v| v.to_string()),
+                c.resolved.map_or("-".to_string(), |v| v.to_string()),
+            )
+        })
+        .collect();
+    Ok(
+        Finding::warn(format!("{n} stack(s) have disagreeing RAW/JPG ratings"))
+            .with(detail)
+            .fix(
+                "Something rated the RAW and the JPG separately -- possibly you, \
+                 in two different tools. Run `npc rate-sync -q <query>` (or with \
+                 explicit paths) to resolve them: the higher rating wins, written \
+                 through the sidecar as usual. `--dry-run` shows what would change \
+                 first.",
+            ),
     )
 }
 
@@ -445,5 +492,33 @@ mod tests {
         };
         let locked = run(&cat, dir.path(), &guarded).unwrap();
         assert!(find(&locked, "protected root").title.contains("READ-ONLY"));
+    }
+
+    /// `library()` has only a `.NEF` -- no JPG to disagree with, so the check
+    /// must not even consider the stack, not merely find it agreeable.
+    #[test]
+    fn only_one_role_present_is_no_conflict() {
+        let (dir, cat) = library();
+        let findings = run(&cat, dir.path(), &Config::default()).unwrap();
+        let f = find(&findings, "ratings agree");
+        assert_eq!(f.severity, Severity::Fine);
+    }
+
+    /// Fabricated bytes aren't a real image, so `meta::read_meta` fails on
+    /// both roles and each reads back as "no embedded rating" -- not an
+    /// error, and not a conflict, even though both roles are present.
+    #[test]
+    fn corrupt_originals_with_both_roles_report_no_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026/08/09");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("750_0001.NEF"), b"not a real raw file").unwrap();
+        std::fs::write(day.join("750_0001.JPG"), b"not a real jpeg either").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        crate::scan::scan(&mut cat, dir.path(), true).unwrap();
+
+        let findings = run(&cat, dir.path(), &Config::default()).unwrap();
+        assert_eq!(find(&findings, "ratings agree").severity, Severity::Fine);
     }
 }

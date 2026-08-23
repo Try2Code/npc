@@ -100,6 +100,15 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Re-resolve a stack's rating from its RAW's and JPG's own embedded
+    /// ratings, read live off the files -- not the catalog's merged value.
+    /// The higher of the two wins, the same rule `scan` applies once when a
+    /// stack is first seen. `npc doctor` reports which stacks currently
+    /// disagree.
+    RateSync {
+        #[command(flatten)]
+        target: Target,
+    },
     /// Mark stacks flagged (pick) or rejected. These are mutually exclusive.
     Mark {
         /// `flag`, `reject`, or `clear`
@@ -684,6 +693,79 @@ fn main() -> Result<()> {
                 Some(n)
             };
             edit_and_flush(&target, &[npc::edit::Change::SetRating(rating)], "rated")?;
+        }
+
+        Cmd::RateSync { target } => {
+            let config = npc::config::Config::load()?;
+            let root = library(target.root.as_deref())?;
+            let mut cat = open_for(&root)?;
+            let ids = resolve(&cat, &target)?;
+            if ids.is_empty() {
+                println!("nothing matched");
+                return Ok(());
+            }
+
+            let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
+            let candidates: Vec<_> = npc::rating_sync::scan(&cat)?
+                .into_iter()
+                .filter(|c| id_set.contains(&c.stack_id) && c.needs_write())
+                .collect();
+
+            if candidates.is_empty() {
+                println!("{} stack(s) checked, all already resolved", ids.len());
+                return Ok(());
+            }
+
+            for c in &candidates {
+                println!(
+                    "{}{}/{}  raw={} jpg={} catalog={} -> {}",
+                    if target.dry_run {
+                        "would rate  "
+                    } else {
+                        "rating      "
+                    },
+                    c.dir,
+                    c.base,
+                    c.raw.map_or("-".to_string(), |v| v.to_string()),
+                    c.jpg.map_or("-".to_string(), |v| v.to_string()),
+                    c.catalog.map_or("-".to_string(), |v| v.to_string()),
+                    c.resolved.expect("needs_write implies resolved is Some"),
+                );
+            }
+
+            if target.dry_run {
+                println!("would resync {} stack(s)", candidates.len());
+                return Ok(());
+            }
+
+            let mut by_value: std::collections::HashMap<i64, Vec<i64>> =
+                std::collections::HashMap::new();
+            for c in &candidates {
+                by_value
+                    .entry(i64::from(
+                        c.resolved.expect("needs_write implies resolved is Some"),
+                    ))
+                    .or_default()
+                    .push(c.stack_id);
+            }
+            for (rating, ids) in &by_value {
+                npc::edit::apply(
+                    &mut cat,
+                    ids,
+                    &[npc::edit::Change::SetRating(Some(*rating))],
+                    &config,
+                )?;
+            }
+            let stats = npc::edit::flush(&mut cat, &config)?;
+
+            println!("resynced {} stack(s)", candidates.len());
+            println!("  sidecars written  {}", stats.sidecars_written);
+            if stats.queued_offline > 0 {
+                println!("  queued (offline)  {}", stats.queued_offline);
+            }
+            for e in &stats.errors {
+                eprintln!("  error: {e}");
+            }
         }
 
         Cmd::Mark { state, target } => {

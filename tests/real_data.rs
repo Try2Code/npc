@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 19;
+const REAL_DATA_TEST_COUNT: usize = 22;
 
 macro_rules! require_ground_truth {
     () => {
@@ -820,4 +820,232 @@ fn a_full_rescan_does_not_resurrect_a_tag_cleared_via_the_sidecar() {
         .unwrap();
     assert_eq!(rating, None, "a --full rescan resurrected a cleared rating");
     assert_eq!(tag_count, 0, "a --full rescan resurrected a cleared tag");
+}
+
+/// When the RAW's and JPG's own embedded ratings already agree, resync must
+/// find nothing to do -- through both entry points: the pure finder and the
+/// `doctor` check built on it.
+#[test]
+fn rate_sync_noop_when_raw_and_jpg_agree() {
+    require_ground_truth!();
+    require_library!();
+    let dir = tempfile::tempdir().unwrap();
+    let nef = copy_into(dir.path(), "750_6278.NEF");
+    let jpg = copy_into(dir.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=4",
+        nef.to_str().unwrap(),
+    ]);
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=4",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, dir.path(), false).unwrap();
+
+    let conflicts = npc::rating_sync::scan(&cat).unwrap();
+    assert!(
+        conflicts.iter().all(|c| !c.needs_write()),
+        "agreeing ratings must not be reported as needing a resync: {conflicts:?}"
+    );
+
+    let findings = npc::doctor::run(&cat, dir.path(), &npc::config::Config::default()).unwrap();
+    let f = findings
+        .iter()
+        .find(|f| f.title.contains("RAW and JPG ratings agree"))
+        .expect("doctor must report the agree finding");
+    assert_eq!(f.severity, npc::doctor::Severity::Fine);
+}
+
+/// The gap this feature closes: `scan` seeds and syncs a stack once, then an
+/// external tool rates the JPG differently afterward. Nothing re-reads
+/// embedded metadata after that point except this resync. Running the same
+/// sequence `npc rate-sync` runs must resolve to the higher rating, write it
+/// through the ordinary sidecar path, and leave both originals' bytes and
+/// mtimes untouched.
+#[test]
+fn rate_sync_resolves_diverging_ratings_and_flushes() {
+    require_ground_truth!();
+    require_library!();
+    let dir = tempfile::tempdir().unwrap();
+    let nef = copy_into(dir.path(), "750_6278.NEF");
+    let jpg = copy_into(dir.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=3",
+        nef.to_str().unwrap(),
+    ]);
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=3",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, dir.path(), false).unwrap();
+    let flush_stats = npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+    assert_eq!(flush_stats.sidecars_written, 1);
+
+    // An external tool rates the JPG higher, after the one-shot seed already
+    // settled the catalog at 3 -- npc never looks again on its own.
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=5",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let sid = cat
+        .stack_id(&dir.path().to_string_lossy(), "750_6278")
+        .unwrap()
+        .unwrap();
+    let catalog_rating_before: Option<i64> = cat
+        .conn
+        .query_row("SELECT rating FROM stack WHERE id = ?1", [sid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        catalog_rating_before,
+        Some(3),
+        "test setup: seed must have settled at 3"
+    );
+
+    let before = fingerprint_tree(dir.path());
+
+    // The same sequence `Cmd::RateSync`'s handler runs.
+    let candidates: Vec<_> = npc::rating_sync::scan(&cat)
+        .unwrap()
+        .into_iter()
+        .filter(npc::rating_sync::Conflict::needs_write)
+        .collect();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].resolved,
+        Some(5),
+        "the higher rating must win"
+    );
+    npc::edit::apply(
+        &mut cat,
+        &[candidates[0].stack_id],
+        &[npc::edit::Change::SetRating(Some(5))],
+        &npc::config::Config::default(),
+    )
+    .unwrap();
+    let flush_stats = npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+    assert_eq!(
+        flush_stats.sidecars_written, 1,
+        "errors: {:?}",
+        flush_stats.errors
+    );
+
+    let catalog_rating_after: Option<i64> = cat
+        .conn
+        .query_row("SELECT rating FROM stack WHERE id = ?1", [sid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(catalog_rating_after, Some(5));
+
+    let sidecar =
+        npc::meta::read_sidecar(dir.path().join("750_6278.xmp").to_str().unwrap()).unwrap();
+    assert_eq!(
+        sidecar.rating, 5,
+        "the sidecar on disk must carry the resolved rating"
+    );
+
+    assert!(
+        npc::rating_sync::scan(&cat)
+            .unwrap()
+            .into_iter()
+            .all(|c| !c.needs_write()),
+        "the stack must no longer be flagged after resync"
+    );
+
+    // Only the two originals must survive untouched -- the sidecar is
+    // *supposed* to change, that's the resync actually writing.
+    let after = fingerprint_tree(dir.path());
+    for original in [&nef, &jpg] {
+        let path = original.to_string_lossy().to_string();
+        assert_eq!(
+            after.get(&path),
+            before.get(&path),
+            "{path} changed during resync"
+        );
+    }
+}
+
+/// `--dry-run` must compute and print the same thing a real resync would,
+/// without touching the catalog or the sidecar.
+#[test]
+fn rate_sync_dry_run_changes_nothing() {
+    require_ground_truth!();
+    require_library!();
+    let dir = tempfile::tempdir().unwrap();
+    let nef = copy_into(dir.path(), "750_6278.NEF");
+    let jpg = copy_into(dir.path(), "750_6278.JPG");
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=3",
+        nef.to_str().unwrap(),
+    ]);
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=3",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, dir.path(), false).unwrap();
+    npc::edit::flush(&mut cat, &npc::config::Config::default()).unwrap();
+    exiftool(&[
+        "-overwrite_original",
+        "-EXIF:Rating=5",
+        jpg.to_str().unwrap(),
+    ]);
+
+    let sid = cat
+        .stack_id(&dir.path().to_string_lossy(), "750_6278")
+        .unwrap()
+        .unwrap();
+
+    // Dry run: compute candidates, print nothing but the finding -- never
+    // call apply/flush.
+    let candidates: Vec<_> = npc::rating_sync::scan(&cat)
+        .unwrap()
+        .into_iter()
+        .filter(npc::rating_sync::Conflict::needs_write)
+        .collect();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].resolved, Some(5));
+
+    let (rating, dirty): (Option<i64>, i64) = cat
+        .conn
+        .query_row(
+            "SELECT rating, dirty FROM stack WHERE id = ?1",
+            [sid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rating, Some(3), "dry run must not touch the catalog");
+    assert_eq!(dirty, 0, "dry run must not mark the stack dirty");
+
+    let pending: i64 = cat
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending WHERE stack_id = ?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+
+    let sidecar =
+        npc::meta::read_sidecar(dir.path().join("750_6278.xmp").to_str().unwrap()).unwrap();
+    assert_eq!(
+        sidecar.rating, 3,
+        "dry run must not touch the sidecar on disk"
+    );
 }

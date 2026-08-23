@@ -35,7 +35,7 @@ pub struct ScanStats {
 
 /// Combine embedded ratings from a stack's RAW and JPG members. If only one
 /// carries a rating, use it; if both do, the higher one wins.
-fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> {
+pub(crate) fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> {
     match (raw, jpg) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) | (None, Some(a)) => Some(a),

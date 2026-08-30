@@ -33,6 +33,12 @@ pub struct Comparison {
     pub stack_id: i64,
     pub dir: String,
     pub base: String,
+    /// Whether this stack currently has a present RAW/JPG member at all --
+    /// distinct from that member's rating/tags being empty. `one_sided`
+    /// means nothing for a stack that never had a sibling to disagree with
+    /// (most of the library), so it's gated on both being present.
+    pub raw_present: bool,
+    pub jpg_present: bool,
     /// The RAW's own embedded rating, read live off the file.
     pub raw_rating: Option<i32>,
     /// The JPG's own embedded rating, read live off the file.
@@ -58,16 +64,21 @@ impl Comparison {
         matches!((self.raw_rating, self.jpg_rating), (Some(a), Some(b)) if a != b)
     }
 
-    /// Exactly one side carries a rating at all. Not a conflict -- there's
-    /// nothing to disagree about, and `combine_rating` already resolves this
-    /// to the one value that exists -- just worth being visible.
+    /// Both sides exist, but exactly one carries a rating at all. Not a
+    /// conflict -- there's nothing to disagree about, and `combine_rating`
+    /// already resolves this to the one value that exists -- just worth
+    /// being visible. False whenever a sibling is simply absent (most of
+    /// the library): there's no asymmetry between a file and a file that
+    /// was never there.
     pub fn rating_one_sided(&self) -> bool {
-        self.raw_rating.is_some() != self.jpg_rating.is_some()
+        self.raw_present
+            && self.jpg_present
+            && self.raw_rating.is_some() != self.jpg_rating.is_some()
     }
 
-    /// Exactly one side carries any embedded tags at all.
+    /// Both sides exist, but exactly one carries any embedded tags at all.
     pub fn tags_one_sided(&self) -> bool {
-        self.raw_tags.is_empty() != self.jpg_tags.is_empty()
+        self.raw_present && self.jpg_present && self.raw_tags.is_empty() != self.jpg_tags.is_empty()
     }
 
     pub fn one_sided(&self) -> bool {
@@ -107,7 +118,10 @@ impl Comparison {
 /// Read a role's own embedded rating and tags in one `read_meta` call --
 /// deliberately not two separate reads, so this costs no more Exiv2 calls
 /// than a rating-only check would.
-fn read_role_meta(dir: &str, name: &str) -> (Option<i32>, Vec<String>) {
+fn read_role_meta(dir: &str, name: Option<&str>) -> (Option<i32>, Vec<String>) {
+    let Some(name) = name else {
+        return (None, Vec::new());
+    };
     let path = format!("{dir}/{name}");
     match meta::read_meta(&path) {
         Ok(m) => ((m.rating >= 0).then_some(m.rating), m.tags),
@@ -131,37 +145,80 @@ fn all_stack_tags(cat: &Catalog) -> Result<HashMap<i64, Vec<String>>> {
     Ok(map)
 }
 
-/// Every stack that currently has both a present RAW and a present JPG,
-/// with each role's rating and tags read live -- not from the catalog,
-/// which only ever reflects the one-shot seed at first scan.
+type ScanRow = (
+    i64,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Every stack, with whichever of its RAW/JPG members are actually present
+/// read live -- not from the catalog, which only ever reflects the one-shot
+/// seed at first scan. A stack missing one role (most of the library: a JPG
+/// with no surviving RAW, or vice versa) still gets its one present side
+/// checked -- an inner join on both roles used to silently skip these
+/// entirely, so a tag added after import to a RAW-less JPG (or the reverse)
+/// was never picked up by `rate-sync` no matter how often it ran.
 pub fn scan(cat: &Catalog) -> Result<Vec<Comparison>> {
     let mut stmt = cat.conn.prepare(
         "SELECT s.id, s.dir, s.base, s.rating, r.name, j.name
          FROM stack s
-         JOIN file r ON r.stack_id = s.id AND r.role = 'raw'    AND r.present = 1
-         JOIN file j ON j.stack_id = s.id AND j.role = 'oocjpg' AND j.present = 1",
+         LEFT JOIN file r ON r.stack_id = s.id AND r.role = 'raw'    AND r.present = 1
+         LEFT JOIN file j ON j.stack_id = s.id AND j.role = 'oocjpg' AND j.present = 1",
     )?;
-    let rows: Vec<(i64, String, String, Option<i64>, String, String)> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        })?
+    let rows: Vec<ScanRow> = stmt
+        .query_map([], row_to_scan_row)?
         .collect::<std::result::Result<_, _>>()?;
+    build_comparisons(cat, rows)
+}
 
+/// Same as `scan`, but only for the given stack ids -- each of which costs a
+/// live Exiv2 read of its present member(s). `rate-sync` targets one stack or
+/// a handful via `-q`/explicit paths; running the full-library query first
+/// and filtering after, as this used to, meant checking one file re-read
+/// every original in the library first.
+pub fn scan_ids(cat: &Catalog, ids: &[i64]) -> Result<Vec<Comparison>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT s.id, s.dir, s.base, s.rating, r.name, j.name
+         FROM stack s
+         LEFT JOIN file r ON r.stack_id = s.id AND r.role = 'raw'    AND r.present = 1
+         LEFT JOIN file j ON j.stack_id = s.id AND j.role = 'oocjpg' AND j.present = 1
+         WHERE s.id IN ({placeholders})"
+    );
+    let mut stmt = cat.conn.prepare(&sql)?;
+    let rows: Vec<ScanRow> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), row_to_scan_row)?
+        .collect::<std::result::Result<_, _>>()?;
+    build_comparisons(cat, rows)
+}
+
+fn row_to_scan_row(r: &rusqlite::Row) -> rusqlite::Result<ScanRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
+fn build_comparisons(cat: &Catalog, rows: Vec<ScanRow>) -> Result<Vec<Comparison>> {
     let tags_by_stack = all_stack_tags(cat)?;
 
     Ok(rows
         .into_par_iter()
         .map(
             |(stack_id, dir, base, catalog_rating, raw_name, jpg_name)| {
-                let (raw_rating, raw_tags) = read_role_meta(&dir, &raw_name);
-                let (jpg_rating, jpg_tags) = read_role_meta(&dir, &jpg_name);
+                let (raw_present, jpg_present) = (raw_name.is_some(), jpg_name.is_some());
+                let (raw_rating, raw_tags) = read_role_meta(&dir, raw_name.as_deref());
+                let (jpg_rating, jpg_tags) = read_role_meta(&dir, jpg_name.as_deref());
                 let resolved_rating = crate::scan::combine_rating(raw_rating, jpg_rating);
                 let catalog_tags = tags_by_stack.get(&stack_id).cloned().unwrap_or_default();
                 let resolved_tags = crate::scan::union_embedded_tags(
@@ -176,6 +233,8 @@ pub fn scan(cat: &Catalog) -> Result<Vec<Comparison>> {
                     stack_id,
                     dir,
                     base,
+                    raw_present,
+                    jpg_present,
                     raw_rating,
                     jpg_rating,
                     resolved_rating,
@@ -214,6 +273,8 @@ mod tests {
             stack_id: 1,
             dir: "/d".into(),
             base: "750_0001".into(),
+            raw_present: true,
+            jpg_present: true,
             raw_rating,
             jpg_rating,
             resolved_rating: crate::scan::combine_rating(raw_rating, jpg_rating),
@@ -227,6 +288,35 @@ mod tests {
 
     fn rating_only(raw: Option<i32>, jpg: Option<i32>, catalog: Option<i64>) -> Comparison {
         comparison(raw, jpg, catalog, vec![], vec![], vec![])
+    }
+
+    /// A stack with no RAW at all (the common case: most of the library is
+    /// JPG-only) -- built directly rather than through `comparison()`, whose
+    /// `raw_present: true` would defeat the point of this fixture.
+    fn jpg_only(
+        jpg_rating: Option<i32>,
+        catalog_rating: Option<i64>,
+        jpg_tags: Vec<String>,
+        catalog_tags: Vec<String>,
+    ) -> Comparison {
+        let resolved_tags = crate::scan::union_embedded_tags(
+            [catalog_tags.as_slice(), jpg_tags.as_slice()].into_iter(),
+        );
+        Comparison {
+            stack_id: 1,
+            dir: "/d".into(),
+            base: "750_0001".into(),
+            raw_present: false,
+            jpg_present: true,
+            raw_rating: None,
+            jpg_rating,
+            resolved_rating: crate::scan::combine_rating(None, jpg_rating),
+            catalog_rating,
+            raw_tags: vec![],
+            jpg_tags,
+            resolved_tags,
+            catalog_tags,
+        }
     }
 
     #[test]
@@ -300,6 +390,30 @@ mod tests {
         );
         assert!(!c.one_sided());
         assert!(!comparison(None, None, None, vec![], vec![], vec![]).one_sided());
+    }
+
+    /// A JPG-only stack's tags are, by definition, only ever on the JPG --
+    /// that used to make `one_sided()` fire for nearly every tagged or rated
+    /// stack in a library that's mostly JPG-only, which would drown doctor's
+    /// actual signal (a genuine RAW/JPG asymmetry) in noise about stacks that
+    /// never had a RAW to be asymmetric with.
+    #[test]
+    fn one_sided_is_false_for_a_role_that_was_never_present() {
+        let c = jpg_only(Some(4), Some(4), vec!["a".into()], vec!["a".into()]);
+        assert!(!c.rating_one_sided());
+        assert!(!c.tags_one_sided());
+        assert!(!c.one_sided());
+    }
+
+    /// The whole point of widening `scan` past "both roles present": a
+    /// brand-new tag embedded in the only file a stack has must still be
+    /// picked up, even with no sibling to compare it against.
+    #[test]
+    fn needs_write_still_fires_with_no_sibling_to_compare_against() {
+        let c = jpg_only(None, None, vec!["Radisson".into()], vec![]);
+        assert_eq!(c.added_tags(), vec!["Radisson".to_string()]);
+        assert!(c.needs_tags_write());
+        assert!(c.needs_write());
     }
 
     #[test]

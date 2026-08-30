@@ -493,6 +493,7 @@ fn main() -> Result<()> {
             println!("  serial    {}", m.serial);
             println!("  shutter   {}", m.shutter_count);
             println!("  rating    {}", m.rating);
+            println!("  tags      {:?}", m.tags);
 
             if let Some(min_dim) = preview {
                 let p = meta::extract_preview(&path, min_dim)?;
@@ -706,10 +707,9 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
-            let candidates: Vec<_> = npc::metadata_sync::scan(&cat)?
+            let candidates: Vec<_> = npc::metadata_sync::scan_ids(&cat, &ids)?
                 .into_iter()
-                .filter(|c| id_set.contains(&c.stack_id) && c.needs_write())
+                .filter(npc::metadata_sync::Comparison::needs_write)
                 .collect();
 
             if candidates.is_empty() {

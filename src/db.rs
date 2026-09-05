@@ -124,8 +124,13 @@ impl Catalog {
     /// Both components are known without the drive mounted, so offline queries
     /// still work.
     pub fn open_for(vol_uuid: &str, root: &Path) -> Result<Self> {
-        let dir = Self::store();
-        std::fs::create_dir_all(&dir)
+        Self::open_for_in(&Self::store(), vol_uuid, root)
+    }
+
+    /// The store directory is a parameter so this can be tested without
+    /// writing into the real one.
+    pub fn open_for_in(dir: &Path, vol_uuid: &str, root: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)
             .with_context(|| format!("creating catalog directory {}", dir.display()))?;
 
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -141,7 +146,35 @@ impl Catalog {
             .take(24)
             .collect();
 
-        Self::open_at(dir.join(format!("{vol_uuid}-{label}-{short}.sqlite")))
+        let path = dir.join(format!("{vol_uuid}-{label}-{short}.sqlite"));
+
+        // Only worth checking when this catalog doesn't exist yet: an
+        // already-established one was presumably fine last time, and this
+        // would otherwise re-open every sibling catalog on every command.
+        if !path.exists() {
+            if let Some((other_path, other_root)) =
+                nested_catalog_conflict(dir, vol_uuid, &canonical)
+            {
+                anyhow::bail!(
+                    "refusing to create a catalog for {} -- {} already catalogs {}, \
+                     on the same volume and nested with it.\n\
+                     A root inside (or containing) another cataloged root is always \
+                     a mistake, not a second library: this is exactly what let 3104 \
+                     already-imported files get silently re-copied under a `_1` \
+                     collision suffix, because the narrower catalog had no memory \
+                     of what the wider one already held.\n\
+                     Pass the correct --root/--library (probably {}), or delete {} \
+                     first if it's genuinely stale.",
+                    canonical.display(),
+                    other_path.display(),
+                    other_root.display(),
+                    other_root.display(),
+                    other_path.display(),
+                );
+            }
+        }
+
+        Self::open_at(path)
     }
 
     /// The catalog directory, honouring `catalog_dir` in the config.
@@ -317,6 +350,43 @@ impl Catalog {
     }
 }
 
+/// A catalog, if any, already covering a root that nests inside (or
+/// contains) `root` on the same volume -- always a mistake, never a second
+/// library: `--root`/`--library` pointed at a subdirectory by accident. Two
+/// genuinely separate libraries on one filesystem don't nest, so this never
+/// fires for that legitimate case, only for the one that silently produced
+/// 3104 duplicate files (a narrower catalog with no memory of what the wider
+/// one already held, so an overlapping re-import saw nothing to recognize
+/// and fell back to a collision suffix instead of skipping a duplicate).
+fn nested_catalog_conflict(dir: &Path, vol_uuid: &str, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sqlite") {
+            continue;
+        }
+        let Ok(conn) = Connection::open(&path) else {
+            continue;
+        };
+        let row: Option<(String, String)> = conn
+            .query_row("SELECT vol_uuid, last_root FROM volume LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .ok();
+        let Some((other_uuid, other_root)) = row else {
+            continue;
+        };
+        if other_uuid != vol_uuid {
+            continue;
+        }
+        let other_root = PathBuf::from(other_root);
+        if other_root == root || other_root.starts_with(root) || root.starts_with(&other_root) {
+            return Some((path, other_root));
+        }
+    }
+    None
+}
+
 /// Bring an existing catalog up to date. The catalog is rebuildable, so a
 /// migration that cannot be applied is not a disaster -- but silently
 /// refusing to open would strand tags that only exist in sidecars until the
@@ -487,6 +557,101 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("2 catalogs"), "got: {err}");
+    }
+
+    /// The bug that produced 3104 duplicate files: a catalog already exists
+    /// for the whole library, and `--root` is pointed at a subdirectory of
+    /// it by mistake. The narrower catalog must never get created -- it
+    /// would have no memory of what the wider one already holds.
+    #[test]
+    fn refuses_a_new_catalog_nested_inside_an_already_cataloged_root() {
+        let store = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let nested = library.path().join("2025/08");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let existing = Catalog::open_for_in(store.path(), "VOL1", library.path()).unwrap();
+        existing
+            .register_volume("VOL1", None, library.path())
+            .unwrap();
+
+        let err = Catalog::open_for_in(store.path(), "VOL1", &nested)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nested"), "got: {err}");
+        assert!(
+            err.contains(&library.path().display().to_string()),
+            "should name the conflicting wider root: {err}"
+        );
+    }
+
+    /// The same mistake in the other order: the narrower catalog already
+    /// exists, and the correct, wider root is opened afterward.
+    #[test]
+    fn refuses_a_new_catalog_that_would_contain_an_already_cataloged_root() {
+        let store = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let nested = library.path().join("2025/08");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let existing = Catalog::open_for_in(store.path(), "VOL1", &nested).unwrap();
+        existing.register_volume("VOL1", None, &nested).unwrap();
+
+        let err = Catalog::open_for_in(store.path(), "VOL1", library.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nested"), "got: {err}");
+    }
+
+    /// Two real, separate libraries on the same filesystem is the case this
+    /// must not break -- non-nested roots are a legitimate, documented setup.
+    #[test]
+    fn a_sibling_root_on_the_same_volume_is_not_a_conflict() {
+        let store = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("PhotosA");
+        let b = base.path().join("PhotosB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let existing = Catalog::open_for_in(store.path(), "VOL1", &a).unwrap();
+        existing.register_volume("VOL1", None, &a).unwrap();
+
+        // Must not error.
+        Catalog::open_for_in(store.path(), "VOL1", &b).unwrap();
+    }
+
+    /// Reopening the exact same root a catalog already exists for is the
+    /// overwhelmingly common case (every ordinary command) and must stay
+    /// cheap and silent, not re-litigate whether it was a mistake.
+    #[test]
+    fn reopening_the_same_root_is_not_a_conflict() {
+        let store = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        let existing = Catalog::open_for_in(store.path(), "VOL1", library.path()).unwrap();
+        existing
+            .register_volume("VOL1", None, library.path())
+            .unwrap();
+        Catalog::open_for_in(store.path(), "VOL1", library.path()).unwrap();
+    }
+
+    /// A nested-looking root on a *different* volume is not this bug --
+    /// the conflict check is scoped to `vol_uuid`, not path text alone.
+    #[test]
+    fn a_nested_root_on_a_different_volume_is_not_a_conflict() {
+        let store = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let nested = library.path().join("2025/08");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let existing = Catalog::open_for_in(store.path(), "VOL1", library.path()).unwrap();
+        existing
+            .register_volume("VOL1", None, library.path())
+            .unwrap();
+
+        // Must not error: a different physical volume.
+        Catalog::open_for_in(store.path(), "VOL2", &nested).unwrap();
     }
 
     #[test]

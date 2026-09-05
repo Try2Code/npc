@@ -33,27 +33,51 @@ pub fn find(cat: &Catalog) -> Result<Vec<DupeGroup>> {
 }
 
 /// Same camera body, same shutter actuation.
+///
+/// Considers `raw` and `oocjpg` alike -- a JPG carries the same maker-note
+/// serial+shutter as its RAW, since the identity is shot-level, not
+/// file-level (`db::known_shots` relies on the same fact). Restricting this
+/// to `role = 'raw'` used to make a JPG-only duplicate pair invisible here
+/// entirely: `by_content` below skips anything that already has a valid
+/// serial+shutter, on the assumption this pass would catch it.
 fn by_actuation(cat: &Catalog) -> Result<Vec<DupeGroup>> {
     let mut stmt = cat.conn.prepare(
-        "SELECT f.serial, f.shutter_count, s.dir || '/' || f.name
+        "SELECT f.stack_id, f.role, f.serial, f.shutter_count, s.dir || '/' || f.name
          FROM file f JOIN stack s ON s.id = f.stack_id
          WHERE f.present = 1
            AND f.serial IS NOT NULL AND f.serial != ''
            AND f.shutter_count IS NOT NULL AND f.shutter_count != 0
-           AND f.role = 'raw'
+           AND f.role IN ('raw', 'oocjpg')
          ORDER BY f.id",
     )?;
 
-    let mut buckets: HashMap<(String, i64), Vec<String>> = HashMap::new();
     let rows = stmt.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
         ))
     })?;
+
+    // Collapse to one representative path per stack first: a RAW and its own
+    // sibling JPG share the same identity, so without this a stack's own
+    // RAW+JPG pair would bucket together and get reported as a duplicate of
+    // itself. Prefer the raw, exactly like `db::known_shots`.
+    let mut by_stack: HashMap<i64, (String, String, i64, String)> = HashMap::new();
     for row in rows {
-        let (serial, count, path) = row?;
+        let (stack_id, role, serial, count, path) = row?;
+        let keep_existing = by_stack
+            .get(&stack_id)
+            .is_some_and(|(prev_role, ..)| prev_role == "raw");
+        if !keep_existing {
+            by_stack.insert(stack_id, (role, serial, count, path));
+        }
+    }
+
+    let mut buckets: HashMap<(String, i64), Vec<String>> = HashMap::new();
+    for (_role, serial, count, path) in by_stack.into_values() {
         buckets.entry((serial, count)).or_default().push(path);
     }
 
@@ -120,6 +144,18 @@ mod tests {
     use super::*;
 
     fn insert(cat: &Catalog, dir: &str, base: &str, serial: &str, shutter: i64) {
+        insert_role(cat, dir, base, "raw", "NEF", serial, shutter);
+    }
+
+    fn insert_role(
+        cat: &Catalog,
+        dir: &str,
+        base: &str,
+        role: &str,
+        ext: &str,
+        serial: &str,
+        shutter: i64,
+    ) {
         cat.conn
             .execute(
                 "INSERT OR IGNORE INTO stack (dir, base) VALUES (?1, ?2)",
@@ -130,8 +166,8 @@ mod tests {
         cat.conn
             .execute(
                 "INSERT INTO file (stack_id, name, role, serial, shutter_count, present)
-                 VALUES (?1, ?2, 'raw', ?3, ?4, 1)",
-                rusqlite::params![sid, format!("{base}.NEF"), serial, shutter],
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![sid, format!("{base}.{ext}"), role, serial, shutter],
             )
             .unwrap();
     }
@@ -147,6 +183,67 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].paths.len(), 2);
         assert!(groups[0].reason.contains("63987"));
+    }
+
+    /// The bug behind 108 real duplicate JPGs in one library: a JPG-only
+    /// stack (no RAW at all) carries the same maker-note identity as any
+    /// RAW would, but `role = 'raw'` alone made it invisible to this pass --
+    /// and `by_content` deliberately skips anything with a valid identity,
+    /// so it fell through both nets.
+    #[test]
+    fn a_jpg_only_duplicate_pair_is_still_found() {
+        let cat = Catalog::open_memory().unwrap();
+        insert_role(
+            &cat,
+            "/lib/2026/09/05",
+            "750_7529",
+            "oocjpg",
+            "JPG",
+            "6094708",
+            64664,
+        );
+        insert_role(
+            &cat,
+            "/lib/2026/09/05",
+            "750_7529_1",
+            "oocjpg",
+            "JPG",
+            "6094708",
+            64664,
+        );
+
+        let groups = find(&cat).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths.len(), 2);
+        assert!(groups[0].reason.contains("64664"));
+    }
+
+    /// A stack's own RAW and its own sibling JPG share the same maker-note
+    /// identity by design -- that must never itself be reported as "the same
+    /// shot in two places", or every complete RAW+JPG stack in the library
+    /// would show up as a duplicate of itself.
+    #[test]
+    fn a_stacks_own_raw_and_jpg_are_not_a_duplicate_of_each_other() {
+        let cat = Catalog::open_memory().unwrap();
+        insert_role(
+            &cat,
+            "/lib/2026/09/05",
+            "750_0001",
+            "raw",
+            "NEF",
+            "6094708",
+            1,
+        );
+        insert_role(
+            &cat,
+            "/lib/2026/09/05",
+            "750_0001",
+            "oocjpg",
+            "JPG",
+            "6094708",
+            1,
+        );
+        assert!(find(&cat).unwrap().is_empty());
     }
 
     /// The same shutter count from a *different body* is not a duplicate --

@@ -206,6 +206,12 @@ enum Cmd {
     Tui {
         #[command(flatten)]
         root: RootArg,
+        /// Show trashed stacks alongside the rest of the library
+        #[arg(long, conflicts_with = "trash")]
+        all: bool,
+        /// Show only the trash, nothing else
+        #[arg(long)]
+        trash: bool,
     },
     /// Write every pending edit out to its sidecar.
     Sync {
@@ -1541,7 +1547,14 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Cmd::Tui { root } => npc::tui::run(library(root.get().as_deref())?)?,
+        Cmd::Tui { root, all, trash } => {
+            let trash_view = match (all, trash) {
+                (_, true) => npc::tui::TrashView::Only,
+                (true, false) => npc::tui::TrashView::Include,
+                (false, false) => npc::tui::TrashView::Exclude,
+            };
+            npc::tui::run(library(root.get().as_deref())?, trash_view)?;
+        }
 
         Cmd::Status { root } => {
             let root = library(root.get().as_deref())?;

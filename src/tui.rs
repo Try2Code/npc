@@ -74,6 +74,35 @@ enum Sidebar {
     Dates,
 }
 
+/// Whether trashed stacks appear alongside the rest of the library.
+/// `Exclude` is the default: a trashed stack is not part of what you're
+/// browsing, it's a stack on its way out, and mixing the two made a
+/// just-trashed duplicate resurface in the very view used to find and
+/// trash duplicates in the first place. `--all` asks for `Include`; a
+/// dedicated `--trash` (not a query anyone would think to type) asks for
+/// `Only`, so the trash itself is still reachable to review before
+/// `trash-empty`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum TrashView {
+    Exclude,
+    Include,
+    Only,
+}
+
+impl TrashView {
+    /// The clause to AND onto a query whose stack-id column is `col`
+    /// (`"s.id"`, `"f.stack_id"`, `"st.stack_id"`, ...). `Include` needs no
+    /// clause at all, since `1=1` would otherwise force every caller to
+    /// special-case "no filter" separately.
+    fn clause(self, col: &str) -> String {
+        match self {
+            TrashView::Exclude => format!("{col} NOT IN (SELECT stack_id FROM trashed)"),
+            TrashView::Include => "1=1".to_string(),
+            TrashView::Only => format!("{col} IN (SELECT stack_id FROM trashed)"),
+        }
+    }
+}
+
 /// How the timeline buckets capture time. Day is finest, Year coarsest;
 /// `[`/`]` step between them and clamp at the ends (like `grid_cols`'s
 /// `+`/`-`, not wrapping) rather than jumping from Year back to Day.
@@ -232,18 +261,21 @@ pub struct App {
     /// Tiles across in grid view. Adjustable live, because the right value
     /// depends on font size and window, which only the user can see.
     grid_cols: u16,
+    /// Set once at startup from `--all`/`--trash`; nothing in a session
+    /// changes it.
+    trash_view: TrashView,
 }
 
 impl App {
-    pub fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf, trash_view: TrashView) -> Result<Self> {
         let (cat, online) = Catalog::open_for_root(&root)?;
-        let mut app = Self::with_catalog(cat, root)?;
+        let mut app = Self::with_catalog(cat, root, trash_view)?;
         app.online = online;
         Ok(app)
     }
 
     /// Split out so the interaction logic can be exercised without a terminal.
-    pub fn with_catalog(cat: Catalog, root: PathBuf) -> Result<Self> {
+    pub fn with_catalog(cat: Catalog, root: PathBuf, trash_view: TrashView) -> Result<Self> {
         let mut app = Self {
             cat,
             config: {
@@ -290,6 +322,7 @@ impl App {
             page_size: 20,
             grid_cols: 5,
             online: true,
+            trash_view,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -319,7 +352,12 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
-        let compiled = query::compile(&self.query)?;
+        let mut compiled = query::compile(&self.query)?;
+        compiled.where_sql = format!(
+            "({}) AND {}",
+            compiled.where_sql,
+            self.trash_view.clause("s.id")
+        );
 
         self.total = {
             let sql = format!("SELECT COUNT(*) FROM stack s WHERE {}", compiled.where_sql);
@@ -401,11 +439,12 @@ impl App {
             Sidebar::Tags => self
                 .cat
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT t.name, COUNT(st.stack_id) n FROM tag t
-                     LEFT JOIN stack_tag st ON st.tag_id = t.id
+                     LEFT JOIN stack_tag st ON st.tag_id = t.id AND {}
                      GROUP BY t.id ORDER BY n DESC, t.name",
-                )?
+                    self.trash_view.clause("st.stack_id")
+                ))?
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
                 .filter_map(Result::ok)
                 .collect(),
@@ -417,16 +456,18 @@ impl App {
             Sidebar::Dates => self
                 .cat
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT COALESCE(
                               NULLIF(e.name, ''),
                               date(e.start_time, 'unixepoch'),
                               'undated') AS d,
                             COUNT(s.id) AS n
                      FROM stack s LEFT JOIN event e ON e.id = s.event_id
+                     WHERE {}
                      GROUP BY COALESCE(e.id, -1)
                      ORDER BY (e.start_time IS NULL), e.start_time DESC",
-                )?
+                    self.trash_view.clause("s.id")
+                ))?
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
                 .filter_map(Result::ok)
                 .collect(),
@@ -467,7 +508,7 @@ impl App {
                 "SELECT date(f.capture_time,'unixepoch'),
                         date(f.capture_time,'unixepoch'),
                         COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL
+                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
                  GROUP BY date(f.capture_time,'unixepoch')
                  ORDER BY date(f.capture_time,'unixepoch')"
             }
@@ -478,7 +519,7 @@ impl App {
                 "SELECT date(f.capture_time,'unixepoch','weekday 0','-6 days'),
                         date(f.capture_time,'unixepoch','weekday 0'),
                         COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL
+                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
                  GROUP BY date(f.capture_time,'unixepoch','weekday 0','-6 days')
                  ORDER BY date(f.capture_time,'unixepoch','weekday 0','-6 days')"
             }
@@ -486,7 +527,7 @@ impl App {
                 "SELECT strftime('%Y-%m', f.capture_time,'unixepoch'),
                         strftime('%Y-%m', f.capture_time,'unixepoch'),
                         COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL
+                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
                  GROUP BY strftime('%Y-%m', f.capture_time,'unixepoch')
                  ORDER BY strftime('%Y-%m', f.capture_time,'unixepoch')"
             }
@@ -494,16 +535,17 @@ impl App {
                 "SELECT strftime('%Y', f.capture_time,'unixepoch'),
                         strftime('%Y', f.capture_time,'unixepoch'),
                         COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL
+                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
                  GROUP BY strftime('%Y', f.capture_time,'unixepoch')
                  ORDER BY strftime('%Y', f.capture_time,'unixepoch')"
             }
         };
+        let sql = sql.replace("{trash}", &self.trash_view.clause("f.stack_id"));
 
         self.timeline = self
             .cat
             .conn
-            .prepare(sql)?
+            .prepare(&sql)?
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -2117,8 +2159,8 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 /// Run the browser. The terminal is restored even on panic: leaving a user in
 /// a wrecked tty because of a bug in a photo cataloger is not acceptable.
-pub fn run(root: PathBuf) -> Result<()> {
-    let mut app = App::new(root)?;
+pub fn run(root: PathBuf, trash_view: TrashView) -> Result<()> {
+    let mut app = App::new(root, trash_view)?;
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2205,7 +2247,7 @@ mod tests {
         // Events derive from capture time, which the fixture stamps after the
         // scan, so they have to be recomputed here.
         crate::scan::derive_events(&mut cat).unwrap();
-        let app = App::with_catalog(cat, dir.path().to_path_buf()).unwrap();
+        let app = App::with_catalog(cat, dir.path().to_path_buf(), TrashView::Exclude).unwrap();
         (dir, app)
     }
 
@@ -2240,6 +2282,73 @@ mod tests {
         assert_eq!(app.total, 3);
         assert_eq!(app.rows.len(), 3);
         assert_eq!(app.cursor, 0);
+    }
+
+    /// Marks a stack trashed exactly the way `trash::trash` does, without
+    /// pulling in the filesystem-moving half of that module -- only the
+    /// catalog row this test cares about.
+    fn mark_trashed(cat: &Catalog, stack_id: i64) {
+        cat.conn
+            .execute(
+                "INSERT OR REPLACE INTO trashed (stack_id, orig_dir, trashed_at)
+                 VALUES (?1, '', 0)",
+                rusqlite::params![stack_id],
+            )
+            .unwrap();
+    }
+
+    /// The bug report this exists for: a stack just moved to `.trash/` kept
+    /// showing up in the very browser used to find and trash duplicates,
+    /// making it look like nothing had happened.
+    #[test]
+    fn trashed_stacks_are_excluded_by_default() {
+        let (dir, mut app) = app();
+        let id = app
+            .cat
+            .stack_id(&dir.path().join("2026/08/09").to_string_lossy(), "750_0001")
+            .unwrap()
+            .expect("750_0001 must be cataloged");
+        mark_trashed(&app.cat, id);
+        app.reload().unwrap();
+
+        assert_eq!(app.total, 2, "the trashed stack must not be counted");
+        assert!(
+            app.rows.iter().all(|r| r.id != id),
+            "the trashed stack must not appear in the rows"
+        );
+    }
+
+    #[test]
+    fn include_shows_trashed_stacks_alongside_the_rest() {
+        let (dir, mut app) = app();
+        let id = app
+            .cat
+            .stack_id(&dir.path().join("2026/08/09").to_string_lossy(), "750_0001")
+            .unwrap()
+            .expect("750_0001 must be cataloged");
+        mark_trashed(&app.cat, id);
+        app.trash_view = TrashView::Include;
+        app.reload().unwrap();
+
+        assert_eq!(app.total, 3, "Include must count everything");
+        assert!(app.rows.iter().any(|r| r.id == id));
+    }
+
+    #[test]
+    fn trash_only_shows_nothing_but_the_trash() {
+        let (dir, mut app) = app();
+        let id = app
+            .cat
+            .stack_id(&dir.path().join("2026/08/09").to_string_lossy(), "750_0001")
+            .unwrap()
+            .expect("750_0001 must be cataloged");
+        mark_trashed(&app.cat, id);
+        app.trash_view = TrashView::Only;
+        app.reload().unwrap();
+
+        assert_eq!(app.total, 1);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].id, id);
     }
 
     #[test]
@@ -3287,7 +3396,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let app = App::with_catalog(cat, dir.path().to_path_buf()).unwrap();
+        let app = App::with_catalog(cat, dir.path().to_path_buf(), TrashView::Exclude).unwrap();
         (dir, app)
     }
 

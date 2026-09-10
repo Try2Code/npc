@@ -1,0 +1,106 @@
+# Example npc config, showing every setting the tool reads. Real path:
+# ~/.config/npc/config.toml (or $XDG_CONFIG_HOME/npc/config.toml).
+#
+# Nothing here is required -- every field has a sensible default, and a
+# missing file is not an error. Copy what you want, uncomment, edit.
+
+# The library this tool works on when no root is given on the command line
+# (and no positional root is passed to scan/status/tui either).
+#library = "~/Pictures"
+
+# Roots this tool refuses to write to, whatever it is asked to do -- checked
+# at dispatch, before any path is opened. Worth setting for any drive holding
+# your originals, especially one without Unix permissions to fall back on
+# (exFAT, the common case for a card-reader-sized external drive).
+#protected_roots = ["/media/me/MyPics"]
+
+# Where catalogs and thumbnail caches are kept. Defaults to the XDG data and
+# cache directories. A catalog is rebuildable from the library with
+# `npc scan --full`, so relocating this costs a rescan and nothing more.
+#catalog_dir = "~/photo-catalogs"
+
+# Thumbnail sizing -- the right values depend on your screen and your
+# camera's RAW preview tiers, which the program cannot see and you can.
+[thumbs]
+grid_px = 1280      # long edge for grid tiles
+view_px = 1620      # long edge for the single-image view
+quality = 80        # JPEG quality, 1-100
+
+# --- Actions: what the TUI's `a` menu launches on the current selection ---
+#
+# Defining ANY [[action]] block replaces the built-ins entirely (not
+# additive) -- so if you want to keep some of the defaults, repeat them here
+# alongside whatever you're adding. The built-ins, for reference:
+#
+#   r  RawTherapee  rawtherapee {raw}
+#   d  darktable    darktable {raw}
+#   g  GIMP         gimp {jpg}
+#   o  Open         xdg-open {file}
+#
+# Placeholders (each becomes its own argv element -- never shell-interpolated,
+# so filenames with spaces or quotes are always safe):
+#   {raw}    every selected stack's RAW member
+#   {jpg}    every selected stack's JPG member
+#   {file}   the single stack under the cursor, whatever its best member is
+#   {files}  every RAW and JPG in the selection (never a derived preview)
+#
+# `mode` controls how the program runs:
+#   "detach"  spawn and return immediately, TUI stays live (GUI apps)
+#   "wait"    leave the terminal, run in the foreground, block until it exits
+#   "term"    run non-interactively, show captured stdout in the status area
+#
+# `shell = true` opts into shell interpretation (pipes, redirects) instead of
+# a direct argv -- off by default, and your responsibility once turned on.
+
+[[action]]
+key  = "r"
+name = "RawTherapee"
+cmd  = ["rawtherapee", "{raw}"]
+mode = "detach"
+
+[[action]]
+key  = "d"
+name = "darktable"
+cmd  = ["darktable", "{raw}"]
+mode = "detach"
+
+[[action]]
+key  = "g"
+name = "GIMP"
+cmd  = ["gimp", "{jpg}"]
+mode = "detach"
+
+[[action]]
+key  = "o"
+name = "Open"
+cmd  = ["xdg-open", "{file}"]
+mode = "detach"
+
+[[action]]
+key  = "k"
+name = "Krita"
+cmd  = ["krita", "{jpg}"]
+mode = "detach"
+
+# A CLI tool that needs the terminal, run in "wait" mode:
+#[[action]]
+#key  = "v"
+#name = "exiv2 print"
+#cmd  = ["exiv2", "-pa", "{file}"]
+#mode = "wait"
+
+# A quick non-interactive command, with its output shown in the status area:
+#[[action]]
+#key  = "e"
+#name = "Export to /tmp"
+#cmd  = ["cp", "-v", "-t", "/tmp", "{jpg}"]
+#mode = "term"
+
+# --- Export presets: named, `npc export --preset <name>` -------------------
+#
+# Additive (no built-ins to worry about replacing). {src}/{dst} are filled in
+# per file; `ext` names the output extension (defaults to "jpg").
+
+[[export]]
+name = "web"
+cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]

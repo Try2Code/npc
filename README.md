@@ -183,7 +183,9 @@ cargo build --release          # target/release/npc
 
 ## Configuration
 
-`~/.config/npc/config.toml`:
+`~/.config/npc/config.toml`. See [`config.example.toml`](config.example.toml)
+for every setting, commented, including the action-menu placeholders/modes
+and export presets:
 
 ```toml
 library = "~/Pictures"                      # used when no root is given

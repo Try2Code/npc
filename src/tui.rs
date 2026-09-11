@@ -264,6 +264,11 @@ pub struct App {
     /// Set once at startup from `--all`/`--trash`; nothing in a session
     /// changes it.
     trash_view: TrashView,
+    /// Single view only: `+` requests `Size::Full` instead of `Size::View`
+    /// for the current image -- a full-resolution decode instead of the
+    /// RAW's fast preview tier. Persists across `h`/`l` like `grid_cols`
+    /// persists across pages, rather than resetting per image.
+    single_zoom: bool,
 }
 
 impl App {
@@ -323,6 +328,7 @@ impl App {
             grid_cols: 5,
             online: true,
             trash_view,
+            single_zoom: false,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -1061,6 +1067,14 @@ impl App {
                 self.grid_cols = self.grid_cols.saturating_sub(1).max(1);
                 self.images.clear();
                 self.status = format!("{} tiles across (bigger)", self.grid_cols);
+            }
+            KeyCode::Char('+' | '=') if self.view == View::Single => {
+                self.single_zoom = true;
+                self.status = "full resolution".into();
+            }
+            KeyCode::Char('-') if self.view == View::Single => {
+                self.single_zoom = false;
+                self.status = "preview".into();
             }
             KeyCode::Char('o') => {
                 let n = self.current_members().len().max(1);
@@ -1909,9 +1923,17 @@ impl App {
             (inner, None)
         };
 
+        // Neighbors prefetch at the fast preview tier regardless of zoom --
+        // a full-resolution decode is the expensive path this project
+        // measured at ~140ms, not worth paying for images not yet on screen.
         self.prefetch(ThumbSize::View, 2);
 
-        match self.image_for(self.cursor, ThumbSize::View) {
+        let size = if self.single_zoom {
+            ThumbSize::Full
+        } else {
+            ThumbSize::View
+        };
+        match self.image_for(self.cursor, size) {
             Some(path) if self.ensure_decoded_at(&path, picture) => {
                 self.frame_used.insert(path.clone());
                 if let Some(p) = self.images.get_mut(&path) {
@@ -2129,6 +2151,7 @@ const HELP: &str = "\
  h l                  previous / next  (single view)
  o                    cycle which file of the stack is shown
  - +                  fewer / more tiles across (grid view)
+ - +                  preview / full resolution (single view)
 
  a                    actions menu
  r                    re-send images to the terminal (if one still renders
@@ -3358,6 +3381,32 @@ mod tests {
 
         press_code(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::Single);
+    }
+
+    /// `+`/`-` in single view toggle the decode tier, distinct from the same
+    /// keys resizing the grid -- the two must not interfere with each other.
+    #[test]
+    fn plus_minus_toggle_full_resolution_in_single_view_only() {
+        let (_d, mut app) = app();
+        let cols_before = app.grid_cols;
+
+        press_code(&mut app, KeyCode::Enter); // -> single view
+        assert!(!app.single_zoom);
+
+        press(&mut app, '+');
+        assert!(app.single_zoom, "+ must switch to full resolution");
+        assert_eq!(app.grid_cols, cols_before, "must not also resize the grid");
+
+        press(&mut app, '-');
+        assert!(!app.single_zoom, "- must switch back to the preview tier");
+
+        press_code(&mut app, KeyCode::Esc); // -> grid view
+        press(&mut app, '+');
+        assert_eq!(
+            app.grid_cols,
+            cols_before + 1,
+            "+ in grid view must resize the grid, not touch single_zoom"
+        );
     }
 
     /// ..but Esc must still clear a selection where there is nothing to back

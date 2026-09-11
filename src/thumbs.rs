@@ -41,6 +41,14 @@ pub enum Size {
     Grid,
     /// Single-image view.
     View,
+    /// Single-image view, zoomed: a `min_dim` past any real sensor's long
+    /// edge, so `extract_preview` can never satisfy it from a smaller tier
+    /// and falls back to the largest one available -- the same "asking for
+    /// more forces full resolution" behavior `View` avoids by staying under
+    /// a RAW's preview-pyramid tiers. A fixed constant rather than reusing
+    /// `VIEW_PX`'s clamp (12288) so zoom means full resolution regardless of
+    /// how `view_px` is configured.
+    Full,
 }
 
 /// Runtime sizing, set once from config at startup. Kept as statics rather
@@ -49,6 +57,7 @@ pub enum Size {
 static GRID_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1280);
 static VIEW_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3200);
 static QUALITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(78);
+const FULL_PX: u32 = 20_000;
 
 /// Apply configured thumbnail sizes. Because the cache key includes the pixel
 /// size, changing these invalidates the affected thumbnails automatically.
@@ -69,20 +78,22 @@ impl Size {
         match self {
             Size::Grid => GRID_PX.load(Relaxed),
             Size::View => VIEW_PX.load(Relaxed),
+            Size::Full => FULL_PX,
         }
     }
     fn tag(self) -> &'static str {
         match self {
             Size::Grid => "g",
             Size::View => "v",
+            Size::Full => "f",
         }
     }
-    /// Grid tiles are small and numerous, so speed wins; the single view is
-    /// looked at closely, so quality does.
+    /// Grid tiles are small and numerous, so speed wins; the single view
+    /// (plain or zoomed) is looked at closely, so quality does.
     fn filter(self) -> FilterType {
         match self {
             Size::Grid => FilterType::Triangle,
-            Size::View => FilterType::Lanczos3,
+            Size::View | Size::Full => FilterType::Lanczos3,
         }
     }
 }
@@ -247,6 +258,7 @@ impl Cache {
             if let Ok(Some(src)) = best_source(cat, id) {
                 keep.insert(self.path_for(&src, Size::Grid));
                 keep.insert(self.path_for(&src, Size::View));
+                keep.insert(self.path_for(&src, Size::Full));
             }
         }
 
@@ -495,6 +507,21 @@ mod tests {
         assert_eq!((made.width(), made.height()), (200, 100));
     }
 
+    /// `Full` asks for a `min_dim` past any real sensor precisely so a
+    /// non-embedded source (this test's plain JPEG) can never satisfy it
+    /// either -- it must fall back to the source's own resolution, not
+    /// upscale toward the huge target.
+    #[test]
+    fn zoomed_view_does_not_upscale_past_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source(dir.path(), 400, 300, 1);
+        let out = dir.path().join("t.jpg");
+        generate(&src, Size::Full, &out).unwrap();
+
+        let made = image::open(&out).unwrap();
+        assert_eq!((made.width(), made.height()), (400, 300));
+    }
+
     /// Orientation 8 is the D750's portrait tag, and it appears throughout this
     /// library. Skipping it would show half the shots on their side.
     #[test]
@@ -555,6 +582,12 @@ mod tests {
             cache.path_for(&a, Size::Grid),
             cache.path_for(&a, Size::View),
             "sizes must not collide"
+        );
+        assert_ne!(
+            cache.path_for(&a, Size::View),
+            cache.path_for(&a, Size::Full),
+            "the zoomed-in tier must not collide with the plain single view, \
+             or toggling zoom would keep showing whichever was cached first"
         );
         // Regression: the key must contain the pixel dimension, not just a
         // label, or changing Grid's size serves stale thumbnails forever.

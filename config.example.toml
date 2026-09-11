@@ -26,6 +26,20 @@ grid_px = 1280      # long edge for grid tiles
 view_px = 1620      # long edge for the single-image view
 quality = 80        # JPEG quality, 1-100
 
+# The TUI's palette -- seven semantic roles, not one setting per widget.
+# Each value is anything ratatui::style::Color parses: a named color, a
+# "#rrggbb" hex string, or a 256-color palette index as a string. Every role
+# left out keeps its own default (shown here), so only name what you want to
+# change.
+[colors]
+focus  = "cyan"       # which panel has keyboard focus; the cursor in the grid/timeline
+accent = "yellow"     # a marked or notable value: ratings, selection marks, the timeline cursor
+muted  = "darkgray"   # secondary/dim text, unfocused borders
+ok     = "green"      # a stack marked flagged
+warn   = "red"        # a stack marked rejected
+tag    = "blue"       # the tag list next to a filename
+text   = "white"      # the current filename, the most prominent line on screen
+
 # --- Actions: what the TUI's `a` menu launches on the current selection ---
 #
 # Defining ANY [[action]] block replaces the built-ins entirely (not

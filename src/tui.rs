@@ -1408,7 +1408,10 @@ impl App {
             .iter()
             .map(|(name, n)| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{n:>6}  "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{n:>6}  "),
+                        Style::default().fg(self.config.colors.muted),
+                    ),
                     Span::raw(name.clone()),
                 ]))
             })
@@ -1416,9 +1419,9 @@ impl App {
         let mut side_state = ListState::default();
         side_state.select(Some(self.sidebar_cursor));
         let side_border = if self.sidebar_focus {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(self.config.colors.focus)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.config.colors.muted)
         };
         f.render_stateful_widget(
             List::new(items)
@@ -1476,7 +1479,9 @@ impl App {
         let identity = Line::from(vec![
             Span::styled(
                 offline_badge,
-                Style::default().fg(Color::Black).bg(Color::Yellow),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.config.colors.accent),
             ),
             Span::styled(
                 if self.query.is_empty() {
@@ -1484,13 +1489,15 @@ impl App {
                 } else {
                     format!("  {}  ", self.query)
                 },
-                Style::default().fg(Color::Black).bg(Color::Cyan),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.config.colors.focus),
             ),
-            Span::styled(position, Style::default().fg(Color::DarkGray)),
+            Span::styled(position, Style::default().fg(self.config.colors.muted)),
             Span::styled(
                 self.current_label().unwrap_or_default(),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.config.colors.text)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1499,13 +1506,13 @@ impl App {
                     .filter(|r| !r.tags.is_empty())
                     .map(|r| format!("   [{}]", r.tags))
                     .unwrap_or_default(),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(self.config.colors.tag),
             ),
             Span::styled(
                 exif.as_ref()
                     .map(|e| format!("   {}", e.line()))
                     .unwrap_or_default(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(self.config.colors.accent),
             ),
         ]);
         f.render_widget(Paragraph::new(identity), rows[0]);
@@ -1513,7 +1520,7 @@ impl App {
         let bottom = if self.input == Input::None {
             Line::from(vec![Span::styled(
                 format!("  {}", self.status),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.config.colors.muted),
             )])
         } else {
             let prompt = match self.input {
@@ -1538,7 +1545,9 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!("  {prompt}  "),
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(self.config.colors.accent),
                 ),
                 Span::raw(format!(" {before}")),
                 Span::styled(cursor_ch, Style::default().add_modifier(Modifier::REVERSED)),
@@ -1593,9 +1602,9 @@ impl App {
         Block::default()
             .borders(Borders::ALL)
             .border_style(if self.sidebar_focus {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(self.config.colors.muted)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(self.config.colors.focus)
             })
             .title(title)
     }
@@ -1630,11 +1639,11 @@ impl App {
             (
                 "\u{25b8} ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(self.config.colors.focus)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            ("  ", Style::default().fg(Color::DarkGray))
+            ("  ", Style::default().fg(self.config.colors.muted))
         };
 
         if self.timeline.is_empty() {
@@ -1673,11 +1682,11 @@ impl App {
                 let level =
                     ((b.count as f64 / max as f64) * (TIMELINE_LEVELS.len() - 1) as f64).round();
                 let ch = TIMELINE_LEVELS[(level as usize).min(TIMELINE_LEVELS.len() - 1)];
-                let style = if self.timeline_offset + i == self.timeline_cursor {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                };
+                let style = timeline_bar_style(
+                    self.timeline_offset + i == self.timeline_cursor,
+                    self.config.colors.focus,
+                    self.config.colors.accent,
+                );
                 Span::styled(ch.to_string(), style)
             })
             .collect();
@@ -1699,7 +1708,7 @@ impl App {
             }
         }
         f.render_widget(
-            Paragraph::new(tick_line).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(tick_line).style(Style::default().fg(self.config.colors.muted)),
             rows[2],
         );
     }
@@ -1724,19 +1733,29 @@ impl App {
                 };
                 let date = r.captured.map_or_else(|| "----------".into(), format_date);
                 ListItem::new(Line::from(vec![
-                    Span::styled(sel.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        sel.to_string(),
+                        Style::default().fg(self.config.colors.accent),
+                    ),
                     Span::raw(format!(" {:<20}", r.base)),
                     Span::styled(
                         format!("{:<9}", r.roles),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.config.colors.muted),
                     ),
                     Span::raw(format!("{date}  ")),
-                    Span::styled(format!("{stars:<5}"), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{stars:<5}"),
+                        Style::default().fg(self.config.colors.accent),
+                    ),
                     Span::styled(
                         format!("{mark} "),
-                        Style::default().fg(if r.reject { Color::Red } else { Color::Green }),
+                        Style::default().fg(if r.reject {
+                            self.config.colors.warn
+                        } else {
+                            self.config.colors.ok
+                        }),
                     ),
-                    Span::styled(r.tags.clone(), Style::default().fg(Color::Blue)),
+                    Span::styled(r.tags.clone(), Style::default().fg(self.config.colors.tag)),
                 ]))
             })
             .collect();
@@ -1794,11 +1813,11 @@ impl App {
             let is_sel = self.selected.contains(&row.id);
 
             let border = if is_cursor {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(self.config.colors.focus)
             } else if is_sel {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(self.config.colors.accent)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(self.config.colors.muted)
             };
             let rating_col = "*".repeat(row.rating.unwrap_or(0).clamp(0, 5) as usize);
             let mark = if row.flag {
@@ -1814,9 +1833,9 @@ impl App {
                 .title(Line::from(vec![Span::styled(
                     format!(" {rating_col}{mark} "),
                     Style::default().fg(if row.reject {
-                        Color::Red
+                        self.config.colors.warn
                     } else {
-                        Color::Yellow
+                        self.config.colors.accent
                     }),
                 )]));
             let picture = tile.inner(cell);
@@ -1832,7 +1851,7 @@ impl App {
                 _ => {
                     f.render_widget(
                         Paragraph::new(row.base.clone())
-                            .style(Style::default().fg(Color::DarkGray)),
+                            .style(Style::default().fg(self.config.colors.muted)),
                         picture,
                     );
                 }
@@ -1900,7 +1919,7 @@ impl App {
                 }
             }
             _ => f.render_widget(
-                Paragraph::new("rendering...").style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new("rendering...").style(Style::default().fg(self.config.colors.muted)),
                 picture,
             ),
         }
@@ -1908,8 +1927,11 @@ impl App {
         if let (Some(area), Some(e)) = (panel, exif.as_ref()) {
             let label = |k: &str, v: String| {
                 Line::from(vec![
-                    Span::styled(format!("{k:<3}"), Style::default().fg(Color::DarkGray)),
-                    Span::styled(v, Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{k:<3}"),
+                        Style::default().fg(self.config.colors.muted),
+                    ),
+                    Span::styled(v, Style::default().fg(self.config.colors.accent)),
                 ])
             };
             let mut lines = Vec::new();
@@ -1938,20 +1960,20 @@ impl App {
                 if !e.lens.is_empty() {
                     lines.push(Line::from(Span::styled(
                         e.lens.clone(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.config.colors.muted),
                     )));
                 }
                 if !e.camera.is_empty() {
                     lines.push(Line::from(Span::styled(
                         e.camera.clone(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.config.colors.muted),
                     )));
                 }
             } else {
                 // One row across, under a landscape frame.
                 lines.push(Line::from(Span::styled(
                     e.line(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(self.config.colors.accent),
                 )));
                 let mut tail = String::new();
                 if !e.lens.is_empty() {
@@ -1966,7 +1988,7 @@ impl App {
                 if !tail.is_empty() {
                     lines.push(Line::from(Span::styled(
                         tail,
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.config.colors.muted),
                     )));
                 }
             }
@@ -1985,7 +2007,7 @@ impl App {
             Paragraph::new(body).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(self.config.colors.focus))
                     .title(title),
             ),
             area,
@@ -2125,6 +2147,19 @@ fn format_date(unix: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Every timeline bar already uses `bar`; inverting bar-on-default to
+/// black-on-bar for the cursor just swaps which half of the same hue is
+/// filled, which reads as another bar, not a cursor. `accent` is this app's
+/// "here" color elsewhere (the list's selection mark, the offline badge), so
+/// it's the one color a bar chart in `bar` is guaranteed not to already show.
+fn timeline_bar_style(is_cursor: bool, bar: Color, accent: Color) -> Style {
+    if is_cursor {
+        Style::default().fg(Color::Black).bg(accent)
+    } else {
+        Style::default().fg(bar)
+    }
+}
+
 fn civil(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -2226,6 +2261,29 @@ mod tests {
     fn dates_render_with_the_same_convention_as_capture_times() {
         assert_eq!(format_date(1_786_233_666), "2026-08-09");
         assert_eq!(format_date(0), "1970-01-01");
+    }
+
+    /// The cursor bar used to be black-on-cyan against cyan bars -- a
+    /// same-hue highlight that reads as just another bar, not a cursor. This
+    /// must hold for whatever colors the config supplies, not just the
+    /// defaults -- a `bar` and `accent` set to the same color would recreate
+    /// the exact bug, so that's the case worth pinning here.
+    #[test]
+    fn the_timeline_cursor_is_not_just_another_bar_of_the_same_color() {
+        let (bar, accent) = (Color::Cyan, Color::Yellow);
+        let cursor = timeline_bar_style(true, bar, accent);
+        let other = timeline_bar_style(false, bar, accent);
+        assert_eq!(cursor.bg, Some(accent));
+        assert_eq!(other.fg, Some(bar));
+        assert_ne!(
+            cursor.bg, other.bg,
+            "cursor and non-cursor bars must not share a background"
+        );
+        assert_ne!(
+            (cursor.fg, cursor.bg),
+            (other.fg, other.bg),
+            "the cursor style must be visually distinct from a plain bar"
+        );
     }
 
     /// A three-stack library on disk, so edits really do write sidecars.

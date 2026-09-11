@@ -7,8 +7,52 @@
 //! available there as a backstop.
 
 use anyhow::{bail, Context, Result};
+use ratatui::style::Color;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+/// The TUI's palette, collapsed to the handful of roles the screen actually
+/// distinguishes -- not one slot per call site, which today's code would
+/// need 44 of. Each role is deserialized by `ratatui::style::Color` itself
+/// (named colors, `"#rrggbb"`, or a 256-color index as a string), so nothing
+/// here has to reparse what that crate already parses correctly.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Colors {
+    /// Which panel has keyboard focus, and the cursor within one (the
+    /// sidebar's border, the timeline's marker/header/bars, the grid tile
+    /// under the cursor, the query text badge).
+    pub focus: Color,
+    /// A marked or notable value: ratings, the exposure line, the offline
+    /// badge, a multi-selected grid tile, the list's selection mark, the
+    /// timeline's cursor bar.
+    pub accent: Color,
+    /// Secondary or dim text: counts, roles, an unfocused border, the status
+    /// line.
+    pub muted: Color,
+    /// A stack marked flagged.
+    pub ok: Color,
+    /// A stack marked rejected.
+    pub warn: Color,
+    /// The tag list next to a filename.
+    pub tag: Color,
+    /// The single most prominent line on screen: the current filename.
+    pub text: Color,
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Self {
+            focus: Color::Cyan,
+            accent: Color::Yellow,
+            muted: Color::DarkGray,
+            ok: Color::Green,
+            warn: Color::Red,
+            tag: Color::Blue,
+            text: Color::White,
+        }
+    }
+}
 
 /// Thumbnail sizing. Exposed in config because the right values depend on
 /// screen and font size, which the program cannot see and the user can.
@@ -58,6 +102,9 @@ pub struct Config {
     pub protected_roots: Vec<PathBuf>,
     #[serde(default)]
     pub thumbs: Thumbs,
+    /// The TUI's palette. See [`Colors`] for what each role covers.
+    #[serde(default)]
+    pub colors: Colors,
     /// The library this tool works on when no root is given on the command line.
     ///
     /// Without it every command would need an explicit path, and hardcoding
@@ -264,7 +311,7 @@ mod tests {
     #[test]
     fn config_parses_the_documented_shape() {
         let c: Config = toml::from_str(
-            r#"
+            r##"
             protected_roots = ["/media/ram/MyPics"]
             catalog_dir = "~/photo-catalogs"
 
@@ -272,12 +319,44 @@ mod tests {
             grid_px = 1280
             view_px = 1620
             quality = 80
-            "#,
+
+            [colors]
+            accent = "magenta"
+            warn = "#ff0000"
+            "##,
         )
         .unwrap();
         assert_eq!(c.protected_roots.len(), 1);
         assert_eq!(c.thumbs.grid_px, 1280);
         assert!(c.catalog_dir.is_some());
+        assert_eq!(c.colors.accent, Color::Magenta);
+        assert_eq!(c.colors.warn, Color::Rgb(255, 0, 0));
+        // Roles left unset in [colors] still get their own default, not a
+        // blanket fallback to whatever was set elsewhere in the table.
+        assert_eq!(c.colors.focus, Color::Cyan);
+    }
+
+    /// A `[colors]` table naming only the roles someone actually wants to
+    /// change is the whole point -- the rest must fall back to the same
+    /// defaults `Colors::default()` gives an absent table entirely.
+    #[test]
+    fn colors_default_when_the_section_is_absent() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.colors.focus, Color::Cyan);
+        assert_eq!(c.colors.accent, Color::Yellow);
+        assert_eq!(c.colors.muted, Color::DarkGray);
+        assert_eq!(c.colors.ok, Color::Green);
+        assert_eq!(c.colors.warn, Color::Red);
+        assert_eq!(c.colors.tag, Color::Blue);
+        assert_eq!(c.colors.text, Color::White);
+    }
+
+    #[test]
+    fn an_unknown_color_name_is_rejected_with_a_useful_message() {
+        let err = toml::from_str::<Config>("[colors]\naccent = \"not-a-color\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not-a-color"), "got: {err}");
     }
 
     #[test]

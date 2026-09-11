@@ -44,6 +44,17 @@ use std::time::Duration;
 
 const PAGE: usize = 500;
 
+/// Single-view zoom: each `+`/`-` multiplies or divides `zoom_level` by this.
+const ZOOM_STEP: f32 = 1.4;
+/// A crop narrower than this starts showing individual source pixels as
+/// visible blocks rather than detail -- past it, "more zoom" stops helping.
+const ZOOM_MAX: f32 = 8.0;
+/// Pan step per arrow press, as a fraction of the *crop's* width/height, so
+/// the same key press feels like the same amount of motion whether zoomed in
+/// a little or a lot -- a fixed fraction of the whole image would barely
+/// move a highly zoomed-in crop and fly across a barely-zoomed one.
+const PAN_STEP: f32 = 0.1;
+
 /// Eighth-block glyphs, low to high -- the timeline bar's height encoding.
 const TIMELINE_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -266,9 +277,28 @@ pub struct App {
     trash_view: TrashView,
     /// Single view only: `+` requests `Size::Full` instead of `Size::View`
     /// for the current image -- a full-resolution decode instead of the
-    /// RAW's fast preview tier. Persists across `h`/`l` like `grid_cols`
-    /// persists across pages, rather than resetting per image.
+    /// RAW's fast preview tier -- and enters zoom mode. A second `+` crops
+    /// in further (`zoom_level` above 1.0); `-` backs out, leaving zoom mode
+    /// entirely once `zoom_level` would drop back to 1.0. Does not persist
+    /// across `h`/`l`, unlike `grid_cols` persisting across pages -- panned
+    /// into a corner of one shot is not a framing anyone wants inherited by
+    /// the next.
     single_zoom: bool,
+    /// 1.0 is the whole `Size::Full` frame; higher crops a smaller, centered
+    /// region out of it. Never below 1.0 while `single_zoom` is true.
+    zoom_level: f32,
+    /// Normalized center of the crop within the full image, each axis
+    /// 0.0..=1.0, clamped so the crop rectangle never leaves the image.
+    zoom_center: (f32, f32),
+    /// The cropped-and-resized protocol currently on screen, plus the
+    /// (path, rect, level, center) it was built for -- rebuilt only when one
+    /// of those actually changes, the same invalidation shape as
+    /// `ensure_decoded_at` uses for `last_rect`. Kept separate from `images`
+    /// because that map is one full-frame protocol per source path; a zoom
+    /// crop is a different image on every pan step without the underlying
+    /// file, or its path, ever changing.
+    zoom_image: Option<ratatui_image::protocol::StatefulProtocol>,
+    zoom_image_key: Option<(PathBuf, Rect, u32, u32, u32)>,
 }
 
 impl App {
@@ -329,6 +359,10 @@ impl App {
             online: true,
             trash_view,
             single_zoom: false,
+            zoom_level: 1.0,
+            zoom_center: (0.5, 0.5),
+            zoom_image: None,
+            zoom_image_key: None,
         };
         app.reload()?;
         app.status = format!("{} stacks. ? for help.", app.total);
@@ -665,6 +699,68 @@ impl App {
         true
     }
 
+    /// Like `ensure_decoded`, but stops after populating `decoded` -- a
+    /// zoom crop needs the raw pixels, never the full-frame protocol
+    /// `ensure_decoded` would otherwise build and immediately discard.
+    fn ensure_full_decoded(&mut self, path: &PathBuf) -> bool {
+        if self.decoded.contains_key(path) {
+            return true;
+        }
+        let Ok(img) = image::open(path) else {
+            return false;
+        };
+        self.decoded.insert(path.clone(), img);
+        true
+    }
+
+    /// Crops `decoded[path]` to the `zoom_level`/`zoom_center` window and
+    /// builds a fresh protocol for just that crop, into `zoom_image` --
+    /// never `images`, which holds one full-frame protocol per path, not a
+    /// continuously-changing crop of one. Rebuilds only when the key
+    /// (path, screen rect, level, center) actually changed, the same
+    /// invalidation shape `ensure_decoded_at` uses via `last_rect`.
+    fn ensure_zoom_image(&mut self, path: &PathBuf, rect: Rect) -> bool {
+        if !self.ensure_full_decoded(path) {
+            return false;
+        }
+        // Quantized so tiny float drift from repeated pans doesn't defeat
+        // the cache -- a few pan steps that end up back where they started
+        // must compare equal, not rebuild on floating-point noise.
+        let key = (
+            path.clone(),
+            rect,
+            (self.zoom_level * 1000.0).round() as u32,
+            (self.zoom_center.0 * 1_000_000.0).round() as u32,
+            (self.zoom_center.1 * 1_000_000.0).round() as u32,
+        );
+        if self.zoom_image_key.as_ref() == Some(&key) {
+            return true;
+        }
+        let Some(img) = self.decoded.get(path) else {
+            return false;
+        };
+        let (w, h) = (img.width(), img.height());
+        let crop_w = ((w as f32 / self.zoom_level).round() as u32).clamp(1, w);
+        let crop_h = ((h as f32 / self.zoom_level).round() as u32).clamp(1, h);
+        // Center in pixel space, then pull back inside the image if the crop
+        // box would otherwise hang off an edge -- `clamp_zoom_center` keeps
+        // this from being needed in the normal pan/zoom path, but a stack
+        // change can land here with a center computed for a differently
+        // sized image (a portrait RAW's JPG sibling, say).
+        let cx = (self.zoom_center.0 * w as f32).round() as i64;
+        let cy = (self.zoom_center.1 * h as f32).round() as i64;
+        let x = (cx - i64::from(crop_w) / 2).clamp(0, i64::from(w - crop_w)) as u32;
+        let y = (cy - i64::from(crop_h) / 2).clamp(0, i64::from(h - crop_h)) as u32;
+        let cropped = img.crop_imm(x, y, crop_w, crop_h);
+
+        let Some(picker) = self.picker.as_mut() else {
+            return false;
+        };
+        self.zoom_image = Some(picker.new_resize_protocol(cropped));
+        self.zoom_image_key = Some(key);
+        true
+    }
+
     /// Like `ensure_decoded`, but also forces a fresh protocol -- a new
     /// `StatefulProtocol`, hence a full retransmit -- whenever `path` is
     /// about to be drawn at a different rect than it was last frame, the
@@ -909,8 +1005,13 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('a') => self.show_actions = true,
 
-            KeyCode::Char('j') | KeyCode::Down if !self.sidebar_focus => self.move_cursor(1)?,
-            KeyCode::Char('k') | KeyCode::Up if !self.sidebar_focus => self.move_cursor(-1)?,
+            // Split from the arrow keys below: j/k always move the cursor,
+            // even while a zoomed single view has claimed the arrows for
+            // panning -- only the arrows change meaning in that mode.
+            KeyCode::Char('j') if !self.sidebar_focus => self.move_cursor(1)?,
+            KeyCode::Char('k') if !self.sidebar_focus => self.move_cursor(-1)?,
+            KeyCode::Down if !self.sidebar_focus && !self.single_zoom => self.move_cursor(1)?,
+            KeyCode::Up if !self.sidebar_focus && !self.single_zoom => self.move_cursor(-1)?,
             KeyCode::PageDown => self.move_cursor(self.page_size as isize)?,
             KeyCode::PageUp => self.move_cursor(-(self.page_size as isize))?,
             // Half a screen, the vi convention.
@@ -953,6 +1054,7 @@ impl App {
             KeyCode::Esc if self.view == View::Single => {
                 self.view = View::Grid;
                 self.member = 0;
+                self.reset_zoom();
                 self.status = "grid".into();
             }
             KeyCode::Esc => {
@@ -1026,6 +1128,7 @@ impl App {
                     View::Single => View::List,
                 };
                 self.member = 0;
+                self.reset_zoom();
                 self.status = format!("{:?} view", self.view);
             }
             KeyCode::BackTab => {
@@ -1035,6 +1138,7 @@ impl App {
                     View::Single => View::Grid,
                 };
                 self.member = 0;
+                self.reset_zoom();
                 self.status = format!("{:?} view", self.view);
             }
             // Timeline focus claims the arrows first -- checked before the
@@ -1068,13 +1172,30 @@ impl App {
                 self.images.clear();
                 self.status = format!("{} tiles across (bigger)", self.grid_cols);
             }
-            KeyCode::Char('+' | '=') if self.view == View::Single => {
+            KeyCode::Char('+' | '=') if self.view == View::Single && !self.single_zoom => {
                 self.single_zoom = true;
                 self.status = "full resolution".into();
             }
-            KeyCode::Char('-') if self.view == View::Single => {
-                self.single_zoom = false;
-                self.status = "preview".into();
+            KeyCode::Char('+' | '=') if self.view == View::Single && self.single_zoom => {
+                self.adjust_zoom(1);
+            }
+            KeyCode::Char('-') if self.view == View::Single && self.single_zoom => {
+                self.adjust_zoom(-1);
+            }
+            // Every arrow direction, while zoomed, pans the crop instead of
+            // moving the cursor -- see the split j/k-vs-arrows guard above
+            // for why this is arrows-only, not h/l too.
+            KeyCode::Up if self.view == View::Single && self.single_zoom => {
+                self.pan_zoom(0.0, -1.0);
+            }
+            KeyCode::Down if self.view == View::Single && self.single_zoom => {
+                self.pan_zoom(0.0, 1.0);
+            }
+            KeyCode::Left if self.view == View::Single && self.single_zoom => {
+                self.pan_zoom(-1.0, 0.0);
+            }
+            KeyCode::Right if self.view == View::Single && self.single_zoom => {
+                self.pan_zoom(1.0, 0.0);
             }
             KeyCode::Char('o') => {
                 let n = self.current_members().len().max(1);
@@ -1083,10 +1204,12 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left if self.view == View::Single => {
                 self.move_cursor(-1)?;
                 self.member = 0;
+                self.reset_zoom();
             }
             KeyCode::Char('l') | KeyCode::Right if self.view == View::Single => {
                 self.move_cursor(1)?;
                 self.member = 0;
+                self.reset_zoom();
             }
             KeyCode::Enter if self.timeline_focus => {
                 if let Some(b) = self.timeline.get(self.timeline_cursor) {
@@ -1311,6 +1434,57 @@ impl App {
         }
         self.cursor = target as usize;
         Ok(())
+    }
+
+    /// Back to the plain preview -- whenever the framing a zoom crop was
+    /// centered on stops being valid: leaving single view, or moving to a
+    /// different image within it.
+    fn reset_zoom(&mut self) {
+        self.single_zoom = false;
+        self.zoom_level = 1.0;
+        self.zoom_center = (0.5, 0.5);
+        self.zoom_image = None;
+        self.zoom_image_key = None;
+    }
+
+    /// `+`/`-` on an already-zoomed image: positive `delta` crops in,
+    /// negative backs out. Backing out of `zoom_level` 1.0 leaves zoom mode
+    /// entirely -- that is `reset_zoom`'s job, not a `zoom_level` below 1.0.
+    fn adjust_zoom(&mut self, delta: i32) {
+        if delta > 0 {
+            self.zoom_level = (self.zoom_level * ZOOM_STEP).min(ZOOM_MAX);
+            self.clamp_zoom_center();
+            self.status = format!("zoomed {:.1}x", self.zoom_level);
+        } else if self.zoom_level <= 1.0 {
+            // Already at the floor -- one more '-' leaves zoom mode, rather
+            // than landing on some level below 1.0 that '+' would then have
+            // to climb back up from.
+            self.reset_zoom();
+            self.status = "preview".into();
+        } else {
+            self.zoom_level = (self.zoom_level / ZOOM_STEP).max(1.0);
+            self.clamp_zoom_center();
+            self.status = format!("zoomed {:.1}x", self.zoom_level);
+        }
+    }
+
+    /// Move the crop center by `PAN_STEP` of the crop's own size -- see
+    /// `PAN_STEP`'s doc comment for why it scales with `zoom_level` rather
+    /// than being a fixed fraction of the whole image.
+    fn pan_zoom(&mut self, dx: f32, dy: f32) {
+        self.zoom_center.0 += dx * PAN_STEP / self.zoom_level;
+        self.zoom_center.1 += dy * PAN_STEP / self.zoom_level;
+        self.clamp_zoom_center();
+    }
+
+    /// Keeps the crop rectangle -- width and height `1.0 / zoom_level` in
+    /// normalized image space -- entirely within the image. At `zoom_level`
+    /// 1.0 this pins the center to exactly `(0.5, 0.5)`, correctly making
+    /// panning a no-op when there is nowhere left to pan.
+    fn clamp_zoom_center(&mut self) {
+        let half = 0.5 / self.zoom_level;
+        self.zoom_center.0 = self.zoom_center.0.clamp(half, 1.0 - half);
+        self.zoom_center.1 = self.zoom_center.1.clamp(half, 1.0 - half);
     }
 
     /// Jump to the true first row of the whole result set, not just the
@@ -1613,13 +1787,19 @@ impl App {
     }
 
     fn frame_block(&self, title: String) -> Block<'static> {
+        // A white frame is zoom mode's only screen-wide cue that the arrows
+        // now pan instead of moving the cursor -- distinct from the normal
+        // focus/muted pair so it can never be mistaken for either.
+        let border = if self.view == View::Single && self.single_zoom {
+            Style::default().fg(Color::White)
+        } else if self.sidebar_focus {
+            Style::default().fg(self.config.colors.muted)
+        } else {
+            Style::default().fg(self.config.colors.focus)
+        };
         Block::default()
             .borders(Borders::ALL)
-            .border_style(if self.sidebar_focus {
-                Style::default().fg(self.config.colors.muted)
-            } else {
-                Style::default().fg(self.config.colors.focus)
-            })
+            .border_style(border)
             .title(title)
     }
 
@@ -1933,17 +2113,32 @@ impl App {
         } else {
             ThumbSize::View
         };
-        match self.image_for(self.cursor, size) {
+        let drawn = match self.image_for(self.cursor, size) {
+            Some(path) if self.single_zoom => {
+                if self.ensure_zoom_image(&path, picture) {
+                    self.frame_used.insert(path.clone());
+                    if let Some(p) = self.zoom_image.as_mut() {
+                        f.render_stateful_widget(StatefulImage::default(), picture, p);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             Some(path) if self.ensure_decoded_at(&path, picture) => {
                 self.frame_used.insert(path.clone());
                 if let Some(p) = self.images.get_mut(&path) {
                     f.render_stateful_widget(StatefulImage::default(), picture, p);
                 }
+                true
             }
-            _ => f.render_widget(
+            _ => false,
+        };
+        if !drawn {
+            f.render_widget(
                 Paragraph::new("rendering...").style(Style::default().fg(self.config.colors.muted)),
                 picture,
-            ),
+            );
         }
 
         if let (Some(area), Some(e)) = (panel, exif.as_ref()) {
@@ -2151,7 +2346,7 @@ const HELP: &str = "\
  h l                  previous / next  (single view)
  o                    cycle which file of the stack is shown
  - +                  fewer / more tiles across (grid view)
- - +                  preview / full resolution (single view)
+ - +                  crop out / in past full res (single view; arrows pan)
 
  a                    actions menu
  r                    re-send images to the terminal (if one still renders
@@ -3407,6 +3602,133 @@ mod tests {
             cols_before + 1,
             "+ in grid view must resize the grid, not touch single_zoom"
         );
+    }
+
+    /// A second `+` (and beyond) crops in further rather than doing nothing
+    /// -- the whole point of asking for more than the plain toggle.
+    #[test]
+    fn further_plus_presses_crop_in_and_minus_backs_out_before_leaving_zoom() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+
+        press(&mut app, '+'); // enter zoom mode: level 1.0
+        assert!((app.zoom_level - 1.0).abs() < 1e-6);
+        press(&mut app, '+'); // crop in
+        assert!(app.single_zoom);
+        assert!(
+            (app.zoom_level - ZOOM_STEP).abs() < 1e-6,
+            "expected {ZOOM_STEP}, got {}",
+            app.zoom_level
+        );
+
+        press(&mut app, '-'); // back to level 1.0
+        assert!(app.single_zoom, "must still be zoomed, just at level 1.0");
+        assert!((app.zoom_level - 1.0).abs() < 1e-6);
+
+        press(&mut app, '-'); // and now leave zoom mode entirely
+        assert!(!app.single_zoom);
+        assert!((app.zoom_level - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_level_is_clamped_at_the_configured_maximum() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+        for _ in 0..30 {
+            press(&mut app, '+');
+        }
+        assert!(app.zoom_level <= ZOOM_MAX);
+    }
+
+    /// Arrows pan the crop while zoomed; j/k must still move the cursor
+    /// exactly like they do everywhere else, since only the arrows changed
+    /// meaning.
+    #[test]
+    fn arrows_pan_while_zoomed_but_j_k_still_move_the_cursor() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+        press(&mut app, '+');
+        press(&mut app, '+'); // level > 1.0, so there is room to pan
+
+        let center_before = app.zoom_center;
+        press_code(&mut app, KeyCode::Right);
+        assert!(
+            app.zoom_center.0 > center_before.0,
+            "Right must pan toward higher x, not move the cursor"
+        );
+        assert_eq!(app.cursor, 0, "the cursor must not have moved");
+
+        press_code(&mut app, KeyCode::Left);
+        press_code(&mut app, KeyCode::Left);
+        assert!(app.zoom_center.0 < center_before.0);
+
+        let cursor_before = app.cursor;
+        press(&mut app, 'j');
+        assert_eq!(
+            app.cursor,
+            cursor_before + 1,
+            "j must still move the cursor while zoomed"
+        );
+    }
+
+    /// The crop can be panned to any edge of the image, but never past one --
+    /// `clamp_zoom_center` is what makes "reach every area" also mean
+    /// "never point the crop partway off the picture".
+    #[test]
+    fn panning_never_pushes_the_crop_past_the_image_edge() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+        press(&mut app, '+');
+        press(&mut app, '+'); // zoom_level == ZOOM_STEP, half-width = 0.5/ZOOM_STEP
+
+        for _ in 0..50 {
+            press_code(&mut app, KeyCode::Right);
+            press_code(&mut app, KeyCode::Down);
+        }
+        let half = 0.5 / app.zoom_level;
+        assert!((app.zoom_center.0 - (1.0 - half)).abs() < 1e-4);
+        assert!((app.zoom_center.1 - (1.0 - half)).abs() < 1e-4);
+
+        for _ in 0..50 {
+            press_code(&mut app, KeyCode::Left);
+            press_code(&mut app, KeyCode::Up);
+        }
+        assert!((app.zoom_center.0 - half).abs() < 1e-4);
+        assert!((app.zoom_center.1 - half).abs() < 1e-4);
+    }
+
+    /// Panning is a no-op at zoom_level 1.0: the crop is already the whole
+    /// image, so there is nowhere for the center to go.
+    #[test]
+    fn panning_does_nothing_at_the_unzoomed_level() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+        press(&mut app, '+'); // level 1.0
+        press_code(&mut app, KeyCode::Right);
+        press_code(&mut app, KeyCode::Down);
+        assert_eq!(app.zoom_center, (0.5, 0.5));
+    }
+
+    /// Leaving single view, or moving to a different image within it, must
+    /// not carry a zoom/pan state that was framed for a different picture.
+    #[test]
+    fn zoom_resets_on_navigation_away_from_the_current_image() {
+        let (_d, mut app) = app();
+        press_code(&mut app, KeyCode::Enter);
+        press(&mut app, '+');
+        press(&mut app, '+');
+        assert!(app.single_zoom);
+
+        press_code(&mut app, KeyCode::Esc); // -> grid
+        assert!(!app.single_zoom);
+        assert!((app.zoom_level - 1.0).abs() < 1e-6);
+
+        press_code(&mut app, KeyCode::Enter); // -> single, fresh
+        press(&mut app, '+');
+        press(&mut app, '+');
+        press(&mut app, 'l'); // next image
+        assert!(!app.single_zoom, "l must reset zoom for the new image");
+        assert!((app.zoom_level - 1.0).abs() < 1e-6);
     }
 
     /// ..but Esc must still clear a selection where there is nothing to back

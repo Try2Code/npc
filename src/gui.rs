@@ -57,6 +57,64 @@ fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
+/// One row of the Events sidebar section: a named event, or a bare day when
+/// none was ever named -- `label` is exactly what `event="{label}"` matches,
+/// the same name-or-day convention `tui.rs`'s own Events/Dates sidebar uses.
+/// `month` (`"YYYY-MM"`, from the same capture time) is `None` only for a
+/// stack with no event and no capture time at all -- grouped as "Undated".
+struct EventEntry {
+    label: String,
+    count: i64,
+    month: Option<String>,
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// `"2026-08"` -> `"August 2026"`. Falls back to the raw key on anything
+/// malformed, which cannot happen from `EventEntry::month` (always produced
+/// by slicing `exif::format_date`'s own output) but keeps this total rather
+/// than panicking if that ever changes.
+fn month_label(month: &str) -> String {
+    let Some((y, m)) = month.split_once('-') else {
+        return month.to_string();
+    };
+    let Some(idx) = m.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) else {
+        return month.to_string();
+    };
+    match MONTH_NAMES.get(idx) {
+        Some(name) => format!("{name} {y}"),
+        None => month.to_string(),
+    }
+}
+
+/// Bucket a start-time-descending-sorted event list into month-sized runs --
+/// a linear scan rather than a sort, since months are contiguous ranges
+/// under a descending time order and can never interleave once the input is
+/// already sorted that way (which `reload_sidebar`'s query guarantees).
+fn group_events_by_month(events: &[EventEntry]) -> Vec<(Option<String>, Vec<&EventEntry>)> {
+    let mut groups: Vec<(Option<String>, Vec<&EventEntry>)> = Vec::new();
+    for e in events {
+        match groups.last_mut() {
+            Some((last_month, items)) if *last_month == e.month => items.push(e),
+            _ => groups.push((e.month.clone(), vec![e])),
+        }
+    }
+    groups
+}
+
 /// A row from a flat `(name, count)` query, grouped into a tree by splitting
 /// each name on `/` -- the same convention the query grammar already treats
 /// as parent/child (`tag:"beach"` matches `beach` and everything nested
@@ -174,6 +232,14 @@ struct GuiApp {
     status: Option<String>,
     rows: Vec<Row>,
     selected: usize,
+    /// A batch selection, by stack id -- Ctrl/Cmd-click in the grid, or
+    /// Space on the keyboard, toggles membership. When non-empty, rating
+    /// and tagging apply to the whole batch instead of just `selected`
+    /// (`targets()`), mirroring `tui.rs`'s own `selected: HashSet<i64>` and
+    /// its `targets()` method. Persists across filtering/query changes on
+    /// purpose, same as the TUI: building a batch across more than one
+    /// query, then editing it in one step, is the point.
+    multi_selected: std::collections::HashSet<i64>,
     /// Cache-file path -> uploaded GPU texture. Unlike the TUI's
     /// `decoded`/`images`/`last_rect` three-way split (needed because a
     /// kitty placement is bound to a screen rect and must be rebuilt
@@ -196,7 +262,7 @@ struct GuiApp {
     /// purpose: the next sidebar click replaces just this fragment instead
     /// of clobbering anything typed in the query box alongside it.
     applied_filter: Option<String>,
-    events: Vec<(String, i64)>,
+    events: Vec<EventEntry>,
     tags: Vec<TagNode>,
     /// One entry per distinct `stack.dir` -- a flat list, not a real
     /// filesystem tree; this catalog has no folder-nesting concept beyond
@@ -232,6 +298,7 @@ impl GuiApp {
             status: None,
             rows,
             selected: 0,
+            multi_selected: std::collections::HashSet::new(),
             textures: HashMap::new(),
             cols: 1,
             mode: Mode::Grid,
@@ -262,14 +329,21 @@ impl GuiApp {
                           NULLIF(e.name, ''),
                           date(e.start_time, 'unixepoch'),
                           'undated') AS d,
-                        COUNT(s.id) AS n
+                        COUNT(s.id) AS n,
+                        e.start_time
                  FROM stack s LEFT JOIN event e ON e.id = s.event_id
                  GROUP BY COALESCE(e.id, -1)
                  ORDER BY (e.start_time IS NULL), e.start_time DESC",
             )
             .and_then(|mut st| {
-                let rows =
-                    st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let rows = st.query_map([], |r| {
+                    let start: Option<i64> = r.get(2)?;
+                    Ok(EventEntry {
+                        label: r.get(0)?,
+                        count: r.get(1)?,
+                        month: start.map(|t| exif::format_date(t)[0..7].to_string()),
+                    })
+                })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
             .unwrap_or_default();
@@ -334,23 +408,38 @@ impl GuiApp {
         }
     }
 
-    /// Set (or clear, for `None`) the star rating of the selected stack.
-    /// Mirrors `tui.rs`'s rating keys: same `edit::apply` + `edit::flush`
-    /// pair, then a full reload from the catalog rather than an optimistic
-    /// local update, so the grid never shows a rating that failed to write.
-    /// No undo stack here yet -- `tui.rs` has one; out of scope for this
-    /// first cut.
+    /// Stacks an edit applies to: the batch selection if there is one, else
+    /// whatever is under the cursor. Mirrors `tui.rs`'s method of the same
+    /// name and the same rule.
+    fn targets(&self) -> Vec<i64> {
+        if !self.multi_selected.is_empty() {
+            return self.multi_selected.iter().copied().collect();
+        }
+        self.rows
+            .get(self.selected)
+            .map(|r| r.id)
+            .into_iter()
+            .collect()
+    }
+
+    /// Set (or clear, for `None`) the star rating of every target. Mirrors
+    /// `tui.rs`'s rating keys: same `edit::apply` + `edit::flush` pair, then
+    /// a full reload from the catalog rather than an optimistic local
+    /// update, so the grid never shows a rating that failed to write. No
+    /// undo stack here yet -- `tui.rs` has one; out of scope for this cut.
     fn rate_selected(&mut self, n: Option<i64>) {
-        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
+        let ids = self.targets();
+        if ids.is_empty() {
             return;
-        };
-        if let Err(e) = edit::apply(&mut self.cat, &[id], &[Change::SetRating(n)], &self.config) {
+        }
+        if let Err(e) = edit::apply(&mut self.cat, &ids, &[Change::SetRating(n)], &self.config) {
             self.status = Some(format!("rate failed: {e}"));
             return;
         }
         self.status = match edit::flush(&mut self.cat, &self.config) {
             Ok(stats) => Some(format!(
-                "rated: {} sidecar(s) written",
+                "rated {} stack(s): {} sidecar(s) written",
+                ids.len(),
                 stats.sidecars_written
             )),
             Err(e) => Some(format!("rate failed: {e}")),
@@ -361,10 +450,11 @@ impl GuiApp {
     }
 
     /// Comma-separated tag names, same convention as `tui.rs`'s `t`/`T`
-    /// prompts: split, trim, drop anything empty. `reload_sidebar` runs
-    /// afterward since a brand-new tag (or a tag's count reaching zero)
-    /// needs to show up in the Tags tree, unlike a rating change, which
-    /// touches nothing the sidebar displays.
+    /// prompts: split, trim, drop anything empty. Applies to every target
+    /// (the batch selection, or just the cursor when nothing is batched).
+    /// `reload_sidebar` runs afterward since a brand-new tag (or a tag's
+    /// count reaching zero) needs to show up in the Tags tree, unlike a
+    /// rating change, which touches nothing the sidebar displays.
     fn add_tags_to_selected(&mut self, raw: &str) {
         let tags: Vec<String> = raw
             .split(',')
@@ -375,21 +465,18 @@ impl GuiApp {
         if tags.is_empty() {
             return;
         }
-        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
-            return;
-        };
-        self.apply_tag_change(id, Change::AddTags(tags));
+        self.apply_tag_change(&self.targets(), Change::AddTags(tags));
     }
 
     fn remove_tag_from_selected(&mut self, name: &str) {
-        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
-            return;
-        };
-        self.apply_tag_change(id, Change::RemoveTags(vec![name.to_string()]));
+        self.apply_tag_change(&self.targets(), Change::RemoveTags(vec![name.to_string()]));
     }
 
-    fn apply_tag_change(&mut self, id: i64, change: Change) {
-        if let Err(e) = edit::apply(&mut self.cat, &[id], &[change], &self.config) {
+    fn apply_tag_change(&mut self, ids: &[i64], change: Change) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = edit::apply(&mut self.cat, ids, &[change], &self.config) {
             self.status = Some(format!("tag failed: {e}"));
             return;
         }
@@ -445,7 +532,15 @@ impl GuiApp {
                         Err(e) => self.query_error = Some(e.to_string()),
                     }
                 }
-                ui.label(format!("{} stack(s)", self.rows.len()));
+                if self.multi_selected.is_empty() {
+                    ui.label(format!("{} stack(s)", self.rows.len()));
+                } else {
+                    ui.label(format!(
+                        "{} stack(s), {} selected",
+                        self.rows.len(),
+                        self.multi_selected.len()
+                    ));
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("zoom:");
@@ -487,12 +582,41 @@ impl GuiApp {
                 egui::CollapsingHeader::new("Events")
                     .default_open(true)
                     .show(ui, |ui| {
-                        for (name, count) in &self.events {
-                            if ui
-                                .selectable_label(false, format!("{name} ({count})"))
-                                .clicked()
-                            {
-                                clicked = Some(format!("event=\"{name}\""));
+                        // Grouped by month, Shotwell-style, rather than one
+                        // flat list of days -- a library with a year of
+                        // near-daily shoots turned that flat list into a
+                        // long scroll with no structure to jump around by.
+                        for (month, items) in group_events_by_month(&self.events) {
+                            let total: i64 = items.iter().map(|e| e.count).sum();
+                            let label = month
+                                .as_deref()
+                                .map_or_else(|| "Undated".to_string(), month_label);
+                            let resp = egui::CollapsingHeader::new(format!("{label} ({total})"))
+                                .id_salt(month.as_deref().unwrap_or("undated"))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for e in &items {
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                format!("{} ({})", e.label, e.count),
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked = Some(format!("event=\"{}\"", e.label));
+                                        }
+                                    }
+                                });
+                            // Same combined expand+filter click as a Tags
+                            // parent node -- clicking the month header
+                            // filters to the whole month, via the
+                            // already-supported `date="YYYY-MM"` whole-month
+                            // range. "Undated" has no date to filter by, so
+                            // its header only ever toggles.
+                            if let Some(m) = &month {
+                                if resp.header_response.clicked() {
+                                    clicked = Some(format!("date=\"{m}\""));
+                                }
                             }
                         }
                     });
@@ -524,11 +648,18 @@ impl GuiApp {
         }
     }
 
-    /// EXIF, rating, and tags (add/remove included) for the selected photo.
-    /// Reads `self.rows[self.selected]` -- the same field the grid, single
-    /// view's prev/next, and sidebar-filter reload all share, so this always
-    /// shows whatever is actually selected regardless of which changed it.
+    /// EXIF, rating, and tags (add/remove included) for the selected photo
+    /// -- or, when a batch is active, a reduced panel whose rating stars and
+    /// "add tag" field apply to the whole batch (`self.targets()`) instead.
+    /// Reads `self.rows[self.selected]` for the single-photo case -- the
+    /// same field the grid, single view's prev/next, and sidebar-filter
+    /// reload all share, so this always shows whatever is actually selected
+    /// regardless of which changed it.
     fn draw_info_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.multi_selected.is_empty() {
+            self.draw_batch_info_panel(ui);
+            return;
+        }
         let id = self.rows.get(self.selected).map(|r| r.id);
         let rating = self.rows.get(self.selected).and_then(|r| r.rating);
         egui::Panel::right("info").show(ui, |ui| {
@@ -629,10 +760,61 @@ impl GuiApp {
         });
     }
 
+    /// The multi-select variant of the info panel: no single stack's EXIF or
+    /// per-photo tag list makes sense for a batch, so this shows just a
+    /// count, plus rating stars and an "add tag" field that both apply to
+    /// every stack in `self.multi_selected` via `rate_selected`/
+    /// `add_tags_to_selected` (both already read `self.targets()`, which
+    /// prefers the batch over the single cursor). No remove-tag list here --
+    /// removing a tag that isn't on every selected stack is a real design
+    /// question ("remove from all, or only those that have it?") deferred
+    /// rather than guessed at.
+    fn draw_batch_info_panel(&mut self, ui: &mut egui::Ui) {
+        let count = self.multi_selected.len();
+        egui::Panel::right("info").show(ui, |ui| {
+            ui.heading("Info");
+            ui.label(format!("{count} stack(s) selected"));
+            if ui.button("clear selection").clicked() {
+                self.multi_selected.clear();
+            }
+
+            ui.separator();
+            ui.label("Rating (applies to all selected)");
+            ui.horizontal(|ui| {
+                for n in 1..=5 {
+                    if ui.selectable_label(false, "*").clicked() {
+                        self.rate_selected(Some(n));
+                    }
+                }
+                if ui.small_button("clear").clicked() {
+                    self.rate_selected(None);
+                }
+            });
+
+            ui.separator();
+            ui.label("Add tag (applies to all selected)");
+            ui.horizontal(|ui| {
+                let resp = ui.text_edit_singleline(&mut self.tag_input);
+                let submitted = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("add").clicked() || submitted) && !self.tag_input.trim().is_empty() {
+                    self.add_tags_to_selected(&self.tag_input.clone());
+                    self.tag_input.clear();
+                }
+            });
+        });
+    }
+
     /// `0`-`5` rate the selected tile (`0` clears), matching `tui.rs`. Same
     /// keyboard-focus guard as `handle_nav_keys`, and for the same reason:
     /// digits are how you type a query like `rating>=3`. Works in both grid
     /// and single view, since both read/write the same `selected` index.
+    ///
+    /// Guarded by `text_edit_focused()`, not the broader
+    /// `egui_wants_keyboard_input()` -- the latter is true whenever ANY
+    /// widget has focus, including a plain `Button` after it's been clicked,
+    /// so rating a tile with a number key stopped working the instant you'd
+    /// clicked anything. `text_edit_focused()` asks the narrower, actually
+    /// intended question: is a text field currently taking the keyboard.
     fn handle_rating_keys(&mut self, ui: &egui::Ui) {
         const KEYS: [(egui::Key, Option<i64>); 6] = [
             (egui::Key::Num0, None),
@@ -642,7 +824,7 @@ impl GuiApp {
             (egui::Key::Num4, Some(4)),
             (egui::Key::Num5, Some(5)),
         ];
-        if ui.ctx().egui_wants_keyboard_input() {
+        if ui.ctx().text_edit_focused() {
             return;
         }
         let action = ui
@@ -654,21 +836,21 @@ impl GuiApp {
         }
     }
 
-    /// Arrow/Page keys move the grid selection or scroll -- but the query
+    /// Arrow/Page keys move the grid selection or scroll, and Space toggles
+    /// the tile under the cursor into or out of the batch selection (the
+    /// keyboard equivalent of Ctrl/Cmd-click in the grid) -- but the query
     /// box is a text field, and Left/Right/digits are how you edit text in
     /// it. Without this guard, typing e.g. `rating>=3` into the query would
-    /// also move the selection and rate the current tile. Checked once per
-    /// frame and threaded through rather than re-checked per key, since it
-    /// answers one question ("does some widget want the keyboard right
-    /// now") that does not change mid-frame.
+    /// also move the selection and rate the current tile.
     fn handle_nav_keys(&mut self, ui: &egui::Ui) {
-        if ui.ctx().egui_wants_keyboard_input() {
+        if ui.ctx().text_edit_focused() {
             return;
         }
         let cols = self.cols.max(1);
         // ScrollArea only answers to the wheel/drag by default -- Page
         // Up/Down need an explicit scroll request.
         let mut scroll_by = 0.0f32;
+        let mut toggle_current = false;
         ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
                 self.selected += 1;
@@ -685,6 +867,9 @@ impl GuiApp {
             if i.key_pressed(egui::Key::Enter) && !self.rows.is_empty() {
                 self.mode = Mode::Single;
             }
+            if i.key_pressed(egui::Key::Space) {
+                toggle_current = true;
+            }
             if i.key_pressed(egui::Key::PageDown) {
                 scroll_by -= 3.0 * (self.tile_px + 8.0);
             }
@@ -692,6 +877,13 @@ impl GuiApp {
                 scroll_by += 3.0 * (self.tile_px + 8.0);
             }
         });
+        if toggle_current {
+            if let Some(id) = self.rows.get(self.selected).map(|r| r.id) {
+                if !self.multi_selected.remove(&id) {
+                    self.multi_selected.insert(id);
+                }
+            }
+        }
         if scroll_by != 0.0 {
             ui.scroll_with_delta(egui::Vec2::new(0.0, scroll_by));
         }
@@ -701,7 +893,7 @@ impl GuiApp {
     /// order the grid built, Escape returns to the grid without disturbing
     /// `selected`. Same keyboard-focus guard as the grid's nav keys.
     fn handle_single_keys(&mut self, ui: &egui::Ui) {
-        if ui.ctx().egui_wants_keyboard_input() {
+        if ui.ctx().text_edit_focused() {
             return;
         }
         ui.ctx().input(|i| {
@@ -776,19 +968,54 @@ impl GuiApp {
                                     // first tile: column 0 was recorded as
                                     // almost the whole window's width.
                                     ui.set_width(tile_px);
+                                    let is_selected =
+                                        idx == self.selected || self.multi_selected.contains(&id);
                                     let resp = if let Some(tex) = tex {
-                                        let btn = egui::Button::image(&tex)
-                                            .selected(idx == self.selected);
+                                        // `Button::image(&tex)` alone draws the
+                                        // texture at its own native resolution
+                                        // (whatever `Size::Grid`'s configured
+                                        // pixel target is) regardless of the
+                                        // button's requested size -- the zoom
+                                        // slider changed the button's hit-box
+                                        // and the grid's column math, but not
+                                        // what was actually drawn, so tiles
+                                        // never visibly resized and, at
+                                        // anything but the largest slider
+                                        // setting, spilled past their own
+                                        // column into whatever was next
+                                        // (including the window edge for the
+                                        // last column). `fit_to_exact_size`
+                                        // makes the image content itself scale
+                                        // to `tile_px`, which is what the
+                                        // slider is actually supposed to
+                                        // control.
+                                        let img = egui::Image::new(&tex)
+                                            .fit_to_exact_size(egui::Vec2::splat(tile_px));
+                                        let btn = egui::Button::image(img).selected(is_selected);
                                         ui.add_sized([tile_px, tile_px], btn)
                                     } else {
-                                        let btn =
-                                            egui::Button::new("...").selected(idx == self.selected);
+                                        let btn = egui::Button::new("...").selected(is_selected);
                                         ui.add_sized([tile_px, tile_px], btn)
                                     };
                                     if resp.double_clicked() {
                                         self.selected = idx;
+                                        self.multi_selected.clear();
                                         open_single = true;
                                     } else if resp.clicked() {
+                                        // Ctrl/Cmd-click toggles this tile into
+                                        // or out of the batch selection without
+                                        // disturbing the rest of it -- a plain
+                                        // click starts a fresh single selection,
+                                        // the common file-manager convention.
+                                        let extend =
+                                            ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                                        if extend {
+                                            if !self.multi_selected.remove(&id) {
+                                                self.multi_selected.insert(id);
+                                            }
+                                        } else {
+                                            self.multi_selected.clear();
+                                        }
                                         self.selected = idx;
                                     }
                                     let stars =
@@ -933,6 +1160,54 @@ mod tests {
 
     fn n(name: &str, count: i64) -> (String, i64) {
         (name.to_string(), count)
+    }
+
+    fn ev(label: &str, count: i64, month: Option<&str>) -> EventEntry {
+        EventEntry {
+            label: label.to_string(),
+            count,
+            month: month.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn month_keys_render_as_a_name_and_year() {
+        assert_eq!(month_label("2026-08"), "August 2026");
+        assert_eq!(month_label("2026-01"), "January 2026");
+        assert_eq!(month_label("2026-12"), "December 2026");
+    }
+
+    /// Malformed input can't come from `EventEntry::month` in practice (it's
+    /// always sliced from `exif::format_date`'s own output), but the
+    /// fallback must not panic if that ever changes.
+    #[test]
+    fn a_malformed_month_key_falls_back_to_itself_rather_than_panicking() {
+        assert_eq!(month_label("not-a-month"), "not-a-month");
+        assert_eq!(month_label("2026-13"), "2026-13");
+        assert_eq!(month_label("2026-00"), "2026-00");
+    }
+
+    /// Consecutive same-month entries merge into one run; a month change
+    /// starts a new one, and "Undated" (`month: None`) is its own run at
+    /// the end -- matching the descending-time-then-NULLs-last order
+    /// `reload_sidebar`'s query actually produces.
+    #[test]
+    fn events_group_into_contiguous_month_runs() {
+        let events = vec![
+            ev("2026-08-09", 2, Some("2026-08")),
+            ev("Berlin trip", 5, Some("2026-08")),
+            ev("2026-07-14", 1, Some("2026-07")),
+            ev("undated", 3, None),
+            ev("also undated", 1, None),
+        ];
+        let groups = group_events_by_month(&events);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0.as_deref(), Some("2026-08"));
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0.as_deref(), Some("2026-07"));
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[2].0, None);
+        assert_eq!(groups[2].1.len(), 2);
     }
 
     #[test]

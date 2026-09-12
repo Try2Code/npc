@@ -54,6 +54,31 @@ impl Default for Colors {
     }
 }
 
+/// The native GUI's theme. Deliberately just this one on/off switch rather
+/// than `Colors`' seven roles -- egui's built-in dark/light `Visuals` already
+/// covers every widget's chrome consistently, so there is no per-role palette
+/// worth inventing here. Sets only the *starting* theme: an in-app toggle
+/// changes the running session's look without writing back here, since
+/// nothing in this tool writes its own config file today.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Gui {
+    pub theme: Theme,
+}
+
+impl Default for Gui {
+    fn default() -> Self {
+        Self { theme: Theme::Dark }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Dark,
+    Light,
+}
+
 /// Thumbnail sizing. Exposed in config because the right values depend on
 /// screen and font size, which the program cannot see and the user can.
 #[derive(Debug, Deserialize)]
@@ -105,6 +130,9 @@ pub struct Config {
     /// The TUI's palette. See [`Colors`] for what each role covers.
     #[serde(default)]
     pub colors: Colors,
+    /// The native GUI's starting theme. See [`Gui`].
+    #[serde(default)]
+    pub gui: Gui,
     /// The library this tool works on when no root is given on the command line.
     ///
     /// Without it every command would need an explicit path, and hardcoding
@@ -357,6 +385,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not-a-color"), "got: {err}");
+    }
+
+    #[test]
+    fn gui_theme_defaults_to_dark_and_parses_light() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.gui.theme, Theme::Dark);
+
+        let c: Config = toml::from_str("[gui]\ntheme = \"light\"").unwrap();
+        assert_eq!(c.gui.theme, Theme::Light);
     }
 
     #[test]

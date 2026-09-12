@@ -40,6 +40,14 @@ warn   = "red"        # a stack marked rejected
 tag    = "blue"       # the tag list next to a filename
 text   = "white"      # the current filename, the most prominent line on screen
 
+# The native GUI's starting theme -- "dark" or "light". egui's built-in
+# theme already covers every widget consistently, so unlike [colors] there
+# is no per-role palette here. This only sets the theme a fresh launch
+# starts in; an in-app toggle changes the running session without writing
+# back to this file.
+[gui]
+theme = "dark"
+
 # --- Actions: what the TUI's `a` menu launches on the current selection ---
 #
 # Defining ANY [[action]] block replaces the built-ins entirely (not

@@ -12,6 +12,7 @@ pub mod db;
 pub mod doctor;
 pub mod dupes;
 pub mod edit;
+pub mod exif;
 pub mod export;
 pub mod import;
 pub mod meta;

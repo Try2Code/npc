@@ -26,6 +26,7 @@ use crate::action::{self, Action};
 use crate::config::Config;
 use crate::db::Catalog;
 use crate::edit::{self, Change};
+use crate::exif::{self, format_date, format_datetime, format_ev, format_shutter, Exif};
 use crate::query;
 use crate::thumbs::{self, Size as ThumbSize};
 use anyhow::Result;
@@ -834,34 +835,7 @@ impl App {
     /// Shooting data for the file under the cursor.
     fn current_exif(&self) -> Option<Exif> {
         let row = self.rows.get(self.cursor)?;
-        self.cat
-            .conn
-            .query_row(
-                "SELECT capture_time, exposure, fnumber, iso, exposure_bias, focal,
-                        lens, camera, width, height,
-                        COALESCE(?2, exif_orientation, 1)
-                 FROM file
-                 WHERE stack_id = ?1 AND present = 1
-                 ORDER BY CASE role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END
-                 LIMIT 1",
-                rusqlite::params![row.id, None::<i64>],
-                |r| {
-                    Ok(Exif {
-                        captured: r.get(0)?,
-                        exposure: r.get(1)?,
-                        fnumber: r.get(2)?,
-                        iso: r.get(3)?,
-                        bias: r.get(4)?,
-                        focal: r.get(5)?,
-                        lens: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                        camera: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                        width: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                        height: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
-                        orientation: r.get::<_, Option<i64>>(10)?.unwrap_or(1) as u16,
-                    })
-                },
-            )
-            .ok()
+        exif::for_stack(&self.cat, row.id)
     }
 
     /// Files of the stack under the cursor, for the single view's `o` cycling.
@@ -2232,89 +2206,6 @@ impl App {
     }
 }
 
-/// Shooting data, as it is displayed rather than as it is stored.
-#[derive(Debug, Clone, Default)]
-struct Exif {
-    captured: Option<i64>,
-    exposure: Option<f64>,
-    fnumber: Option<f64>,
-    iso: Option<i64>,
-    bias: Option<f64>,
-    focal: Option<f64>,
-    lens: String,
-    camera: String,
-    width: i64,
-    height: i64,
-    orientation: u16,
-}
-
-impl Exif {
-    /// True when the frame is taller than it is wide *as displayed*, which is
-    /// what decides whether the info panel goes beside it or beneath it.
-    fn is_portrait(&self) -> bool {
-        let (w, h) = if matches!(self.orientation, 5..=8) {
-            (self.height, self.width)
-        } else {
-            (self.width, self.height)
-        };
-        h > w && w > 0
-    }
-
-    /// The exposure quintet, in the order a photographer reads it.
-    fn line(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(t) = self.captured {
-            parts.push(format_datetime(t));
-        }
-        if let Some(e) = self.exposure.filter(|e| *e > 0.0) {
-            parts.push(format!("S {}", format_shutter(e)));
-        }
-        if let Some(f) = self.fnumber.filter(|f| *f > 0.0) {
-            parts.push(format!("A f/{f:.1}"));
-        }
-        if let Some(i) = self.iso.filter(|i| *i > 0) {
-            parts.push(format!("I {i}"));
-        }
-        if let Some(b) = self.bias {
-            parts.push(format!("EV {}", format_ev(b)));
-        }
-        if let Some(f) = self.focal.filter(|f| *f > 0.0) {
-            parts.push(format!("{f:.0}mm"));
-        }
-        parts.join("   ")
-    }
-}
-
-/// `1/400` below a second, `2.5\"` above it -- how a camera displays it.
-fn format_shutter(seconds: f64) -> String {
-    if seconds >= 1.0 {
-        format!("{seconds:.1}\"")
-    } else {
-        format!("1/{:.0}", (1.0 / seconds).round())
-    }
-}
-
-/// Signed, because the sign is the whole point of exposure compensation.
-fn format_ev(ev: f64) -> String {
-    if ev.abs() < 0.01 {
-        "0".to_string()
-    } else {
-        format!("{ev:+.1}")
-    }
-}
-
-fn format_datetime(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let (y, m, d) = civil(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
-}
-
 const HELP: &str = "\
  j k  up  down        move
  g G  home end        first / last of the WHOLE result, not just this page
@@ -2359,12 +2250,6 @@ const HELP: &str = "\
 Edits are written to <base>.xmp immediately. Original images are
 never opened for writing.";
 
-fn format_date(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
-    let (y, m, d) = civil(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Every timeline bar already uses `bar`; inverting bar-on-default to
 /// black-on-bar for the cursor just swaps which half of the same hue is
 /// filled, which reads as another bar, not a cursor. `accent` is this app's
@@ -2376,19 +2261,6 @@ fn timeline_bar_style(is_cursor: bool, bar: Color, accent: Color) -> Style {
     } else {
         Style::default().fg(bar)
     }
-}
-
-fn civil(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
@@ -2474,12 +2346,6 @@ pub fn run(root: PathBuf, trash_view: TrashView) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dates_render_with_the_same_convention_as_capture_times() {
-        assert_eq!(format_date(1_786_233_666), "2026-08-09");
-        assert_eq!(format_date(0), "1970-01-01");
-    }
 
     /// The cursor bar used to be black-on-cyan against cyan bars -- a
     /// same-hue highlight that reads as just another bar, not a cursor. This
@@ -3453,95 +3319,6 @@ mod tests {
         type_str(&mut app, "beach");
         let screen = render(&mut app, 120, 30);
         assert!(screen.contains("[beach]"), "tags missing:\n{screen}");
-    }
-
-    #[test]
-    fn shutter_speeds_read_the_way_a_camera_shows_them() {
-        assert_eq!(format_shutter(1.0 / 400.0), "1/400");
-        assert_eq!(format_shutter(0.0025), "1/400");
-        assert_eq!(format_shutter(1.0 / 13.0), "1/13");
-        assert_eq!(format_shutter(1.0), "1.0\"");
-        assert_eq!(format_shutter(2.5), "2.5\"");
-    }
-
-    /// Exposure compensation is meaningless without its sign, and Nikon works
-    /// in thirds -- -2/3 EV arrives as -0.6666 and must read as the camera
-    /// displays it.
-    #[test]
-    fn exposure_compensation_keeps_its_sign() {
-        assert_eq!(format_ev(0.0), "0");
-        assert_eq!(format_ev(-0.666_666_7), "-0.7");
-        assert_eq!(format_ev(-0.333_333_3), "-0.3");
-        assert_eq!(format_ev(1.0), "+1.0");
-        assert_eq!(format_ev(-1.666_666_6), "-1.7");
-    }
-
-    #[test]
-    fn the_exposure_line_is_labelled() {
-        let e = Exif {
-            captured: Some(1_786_233_666),
-            exposure: Some(0.0025),
-            fnumber: Some(4.5),
-            iso: Some(2500),
-            bias: Some(-0.666_666_7),
-            focal: Some(200.0),
-            ..Default::default()
-        };
-        let line = e.line();
-        assert!(line.contains("S 1/400"), "{line}");
-        assert!(line.contains("A f/4.5"), "{line}");
-        assert!(line.contains("I 2500"), "{line}");
-        assert!(line.contains("EV -0.7"), "{line}");
-        assert!(line.contains("200mm"), "{line}");
-        assert!(line.contains("2026-08-09"), "{line}");
-    }
-
-    /// Missing fields are omitted rather than shown as zero. One file in the
-    /// library has no ISO recorded, and `I 0` would be a lie.
-    #[test]
-    fn missing_fields_are_omitted_not_zeroed() {
-        let e = Exif {
-            captured: Some(1_786_233_666),
-            iso: Some(0),
-            fnumber: Some(0.0),
-            exposure: None,
-            ..Default::default()
-        };
-        let line = e.line();
-        assert!(!line.contains("I 0"), "{line}");
-        assert!(!line.contains("f/0"), "{line}");
-        assert!(!line.contains("S "), "{line}");
-    }
-
-    /// The layout decision: orientation, not stored dimensions, decides
-    /// whether a frame displays portrait. A D750 writes 6016x4016 with
-    /// orientation 8 for a portrait shot.
-    #[test]
-    fn portrait_is_decided_after_rotation() {
-        let landscape = Exif {
-            width: 6016,
-            height: 4016,
-            orientation: 1,
-            ..Default::default()
-        };
-        assert!(!landscape.is_portrait());
-
-        let rotated = Exif {
-            width: 6016,
-            height: 4016,
-            orientation: 8,
-            ..Default::default()
-        };
-        assert!(
-            rotated.is_portrait(),
-            "orientation 8 must display as portrait"
-        );
-
-        let unknown = Exif::default();
-        assert!(
-            !unknown.is_portrait(),
-            "no dimensions must not claim portrait"
-        );
     }
 
     #[test]

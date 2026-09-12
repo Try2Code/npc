@@ -213,6 +213,10 @@ struct GuiApp {
     /// nothing in this tool writes its own config file, and the user chose
     /// session-only over persisting the toggle.
     theme: Theme,
+    /// The info panel's "add tag" text field. Not cleared automatically on
+    /// selection change -- typing a tag, then clicking a different tile
+    /// before pressing Enter, keeps the draft rather than silently losing it.
+    tag_input: String,
 }
 
 impl GuiApp {
@@ -237,6 +241,7 @@ impl GuiApp {
             folders: Vec::new(),
             tile_px: DEFAULT_TILE_PX,
             theme,
+            tag_input: String::new(),
         };
         app.reload_sidebar();
         app
@@ -244,9 +249,10 @@ impl GuiApp {
 
     /// Whole-library counts for the three sidebar sections, independent of
     /// the current query -- the same relationship `tui.rs`'s timeline/sidebar
-    /// has to its own filtered result set. Nothing in this cut changes tag,
-    /// event, or folder membership, so this only needs to run once at
-    /// startup; a future tagging feature would call it again after an edit.
+    /// has to its own filtered result set. Called once at startup, and again
+    /// after every tag edit (`apply_tag_change`), since that's the only thing
+    /// in this app that can change what these three sections show; a rating
+    /// edit touches none of them.
     fn reload_sidebar(&mut self) {
         self.events = self
             .cat
@@ -354,6 +360,49 @@ impl GuiApp {
         }
     }
 
+    /// Comma-separated tag names, same convention as `tui.rs`'s `t`/`T`
+    /// prompts: split, trim, drop anything empty. `reload_sidebar` runs
+    /// afterward since a brand-new tag (or a tag's count reaching zero)
+    /// needs to show up in the Tags tree, unlike a rating change, which
+    /// touches nothing the sidebar displays.
+    fn add_tags_to_selected(&mut self, raw: &str) {
+        let tags: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if tags.is_empty() {
+            return;
+        }
+        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
+            return;
+        };
+        self.apply_tag_change(id, Change::AddTags(tags));
+    }
+
+    fn remove_tag_from_selected(&mut self, name: &str) {
+        let Some(id) = self.rows.get(self.selected).map(|r| r.id) else {
+            return;
+        };
+        self.apply_tag_change(id, Change::RemoveTags(vec![name.to_string()]));
+    }
+
+    fn apply_tag_change(&mut self, id: i64, change: Change) {
+        if let Err(e) = edit::apply(&mut self.cat, &[id], &[change], &self.config) {
+            self.status = Some(format!("tag failed: {e}"));
+            return;
+        }
+        self.status = match edit::flush(&mut self.cat, &self.config) {
+            Ok(stats) => Some(format!(
+                "tagged: {} sidecar(s) written",
+                stats.sidecars_written
+            )),
+            Err(e) => Some(format!("tag failed: {e}")),
+        };
+        self.reload_sidebar();
+    }
+
     fn texture_for(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
         if let Some(t) = self.textures.get(path) {
             return Some(t.clone());
@@ -375,15 +424,18 @@ impl GuiApp {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("query:");
-                ui.text_edit_singleline(&mut self.query);
-                // Deliberately not gated on the text field's own focus state
-                // (`response.lost_focus()`) -- that's the documented egui
-                // idiom, but it didn't fire reliably here. There is exactly
-                // one text field in this app, so an unconditional check on
-                // Enter being pressed anywhere this frame is just as
-                // correct and doesn't depend on focus-tracking behaving as
-                // expected in this (very recent) egui release.
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let resp = ui.text_edit_singleline(&mut self.query);
+                // The documented egui idiom for "submit on Enter" is
+                // `response.lost_focus() && Enter pressed` -- that didn't
+                // fire reliably in this (very recent) egui release, so this
+                // checks `has_focus()` instead: this field currently has the
+                // keyboard, and Enter was pressed this frame. Gating on
+                // *this* field's focus (not just "Enter pressed anywhere")
+                // matters now that the info panel's tag field is a second
+                // text widget in the same app -- without it, adding a tag
+                // with Enter would also re-run this query and reset
+                // `selected` back to 0.
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     match run_query(&self.cat, &self.query) {
                         Ok(rows) => {
                             self.rows = rows;
@@ -472,10 +524,10 @@ impl GuiApp {
         }
     }
 
-    /// EXIF, rating, and a read-only tag list for the selected photo. Reads
-    /// `self.rows[self.selected]` -- the same field the grid, single view's
-    /// prev/next, and sidebar-filter reload all share, so this always shows
-    /// whatever is actually selected regardless of which of those changed it.
+    /// EXIF, rating, and tags (add/remove included) for the selected photo.
+    /// Reads `self.rows[self.selected]` -- the same field the grid, single
+    /// view's prev/next, and sidebar-filter reload all share, so this always
+    /// shows whatever is actually selected regardless of which changed it.
     fn draw_info_panel(&mut self, ui: &mut egui::Ui) {
         let id = self.rows.get(self.selected).map(|r| r.id);
         let rating = self.rows.get(self.selected).and_then(|r| r.rating);
@@ -542,8 +594,38 @@ impl GuiApp {
             if tags.is_empty() {
                 ui.label("(none)");
             } else {
-                ui.label(tags.join(", "));
+                let mut to_remove = None;
+                for tag in &tags {
+                    ui.horizontal(|ui| {
+                        ui.label(tag);
+                        // A small, deliberately unlabelled button -- the
+                        // TUI's `T` (remove tag) has the same one-key
+                        // immediacy; this is its mouse equivalent, right
+                        // next to the tag it removes rather than a separate
+                        // prompt naming it again.
+                        if ui.small_button("\u{2715}").clicked() {
+                            to_remove = Some(tag.clone());
+                        }
+                    });
+                }
+                if let Some(name) = to_remove {
+                    self.remove_tag_from_selected(&name);
+                }
             }
+
+            ui.horizontal(|ui| {
+                let resp = ui.text_edit_singleline(&mut self.tag_input);
+                // Same `has_focus()` reasoning as the query bar: this field
+                // specifically must have the keyboard, not just "Enter was
+                // pressed somewhere this frame" -- otherwise submitting a
+                // query with Enter would also try to add whatever is
+                // sitting in this field.
+                let submitted = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("add").clicked() || submitted) && !self.tag_input.trim().is_empty() {
+                    self.add_tags_to_selected(&self.tag_input.clone());
+                    self.tag_input.clear();
+                }
+            });
         });
     }
 

@@ -21,6 +21,7 @@ use crate::config::{Config, Theme};
 use crate::db::Catalog;
 use crate::edit::{self, Change};
 use crate::exif;
+use crate::tui::TrashView;
 use crate::{query, thumbs, vol};
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -47,7 +48,19 @@ struct Row {
 /// `ScrollArea::show_rows` now handles by only drawing whatever is
 /// actually scrolled into view.
 fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
-    let compiled = query::compile(text)?;
+    let mut compiled = query::compile(text)?;
+    // Excluded by default, same as `tui.rs`'s own `TrashView::Exclude`: a
+    // trashed stack is on its way out of the library, not part of what
+    // browsing shows. Without this, a day with a couple of hundred trashed
+    // near-duplicates or bad frames mixed in among its real photos showed
+    // every one of them right alongside the rest, arrows and all -- exactly
+    // the "just-trashed stack resurfaces in the view you're browsing"
+    // scenario `TrashView`'s own doc comment was written to prevent.
+    compiled.where_sql = format!(
+        "({}) AND {}",
+        compiled.where_sql,
+        TrashView::Exclude.clause("s.id")
+    );
     let sql = compiled.select_stacks(None);
     let mut stmt = cat.conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = compiled
@@ -330,10 +343,15 @@ impl GuiApp {
     /// in this app that can change what these three sections show; a rating
     /// edit touches none of them.
     fn reload_sidebar(&mut self) {
+        // Excluded from every section here for the same reason `run_query`
+        // excludes them: a trashed stack is leaving the library, not part
+        // of what browsing shows, and a count that included them would
+        // disagree with what a click could ever actually display.
+        let exclude_stack = TrashView::Exclude.clause("s.id");
         self.events = self
             .cat
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT COALESCE(
                           NULLIF(e.name, ''),
                           date(e.start_time, 'unixepoch'),
@@ -341,9 +359,10 @@ impl GuiApp {
                         COUNT(s.id) AS n,
                         e.start_time
                  FROM stack s LEFT JOIN event e ON e.id = s.event_id
+                 WHERE {exclude_stack}
                  GROUP BY COALESCE(e.id, -1)
-                 ORDER BY (e.start_time IS NULL), e.start_time DESC",
-            )
+                 ORDER BY (e.start_time IS NULL), e.start_time DESC"
+            ))
             .and_then(|mut st| {
                 let rows = st.query_map([], |r| {
                     let start: Option<i64> = r.get(2)?;
@@ -360,11 +379,12 @@ impl GuiApp {
         let flat_tags: Vec<(String, i64)> = self
             .cat
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT t.name, COUNT(st.stack_id) n FROM tag t
-                 LEFT JOIN stack_tag st ON st.tag_id = t.id
+                 LEFT JOIN stack_tag st ON st.tag_id = t.id AND {}
                  GROUP BY t.id ORDER BY n DESC, t.name",
-            )
+                TrashView::Exclude.clause("st.stack_id")
+            ))
             .and_then(|mut st| {
                 let rows =
                     st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -376,7 +396,10 @@ impl GuiApp {
         self.folders = self
             .cat
             .conn
-            .prepare("SELECT dir, COUNT(*) n FROM stack GROUP BY dir ORDER BY dir")
+            .prepare(&format!(
+                "SELECT dir, COUNT(*) n FROM stack s WHERE {exclude_stack}
+                 GROUP BY dir ORDER BY dir"
+            ))
             .and_then(|mut st| {
                 let rows =
                     st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;

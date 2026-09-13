@@ -27,7 +27,6 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const RESULT_LIMIT: usize = 200;
 const MIN_TILE_PX: f32 = 64.0;
 const MAX_TILE_PX: f32 = 400.0;
 const DEFAULT_TILE_PX: f32 = 160.0;
@@ -37,9 +36,19 @@ struct Row {
     rating: Option<i64>,
 }
 
+/// No SQL-level cap: a single day of a real library was measured at just
+/// over 1000 stacks, and a hard 200-row limit silently dropped everything
+/// past that with no indication anywhere that it had happened -- the
+/// sidebar's own count (an independent, unlimited query) disagreed with
+/// what the grid could ever show, and there was no way to reach the rest.
+/// A `Row` is two `i64`s, so fetching every match (`tui.rs`'s own
+/// `select_stacks(None)` does the same) costs nothing that matters; what
+/// has to stay bounded is *rendering*, which `draw_grid`'s
+/// `ScrollArea::show_rows` now handles by only drawing whatever is
+/// actually scrolled into view.
 fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
     let compiled = query::compile(text)?;
-    let sql = compiled.select_stacks(Some(RESULT_LIMIT));
+    let sql = compiled.select_stacks(None);
     let mut stmt = cat.conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = compiled
         .params
@@ -915,117 +924,108 @@ impl GuiApp {
             self.cols = ((ui.available_width() / (tile_px + 8.0)).floor() as usize).max(1);
             let cols = self.cols;
             let ctx = ui.ctx().clone();
-            // `ScrollArea` auto-shrinks to fit its content by default, and a
-            // tightly-sized row layout shrinks to match -- so the scroll
-            // area's hit-test rect shrank too, and the wheel stopped
-            // registering over the margin outside the tiles. Force it to
-            // fill the panel instead.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::Vec2::splat(8.0);
-                    let mut open_single = false;
-                    let mut idx = 0;
-                    while idx < self.rows.len() {
-                        // One `ui.horizontal` per row, not `egui::Grid`.
-                        // `Grid` negotiates each column's width from the
-                        // *previous frame*'s measured content
-                        // (`GridLayout::available_rect` in egui's own
-                        // grid.rs reads `prev_state`, not this frame's
-                        // actual cell) -- so a column's rect can lag one
-                        // size behind whatever this frame draws into it.
-                        // That is not a one-off startup glitch: it means a
-                        // column's rect can go on disagreeing with its own
-                        // tile indefinitely, with nothing that forces a
-                        // resync -- which is exactly what a zoom change or
-                        // window resize that "doesn't fix it" looks like.
-                        // Shotwell (and every other fixed-cell photo grid)
-                        // never negotiates a cell's width from history: it
-                        // places a fixed-size cell at a directly-computed
-                        // pixel position, fresh, every single frame. Plain
-                        // `horizontal` gives the same guarantee: every
-                        // tile's rect is exactly `tile_px` this frame,
-                        // computed from nothing but this frame's own
-                        // widgets, with no size ever inherited from the
-                        // last one drawn.
-                        ui.horizontal(|ui| {
-                            for i in idx..(idx + cols).min(self.rows.len()) {
-                                let id = self.rows[i].id;
-                                let rating = self.rows[i].rating;
-                                let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
-                                    continue;
+            ui.spacing_mut().item_spacing = egui::Vec2::splat(8.0);
+            let label_height = ui.text_style_height(&egui::TextStyle::Body);
+            // A grid-row's total height: the tile, the gap above the rating
+            // label, and the label itself. `show_rows` adds one more
+            // `item_spacing.y` between this and the next row on its own.
+            let row_height = tile_px + ui.spacing().item_spacing.y + label_height;
+            let grid_rows = self.rows.len().div_ceil(cols.max(1));
+            let mut open_single = false;
+            egui::ScrollArea::vertical().show_rows(ui, row_height, grid_rows, |ui, visible| {
+                // Only the grid-rows egui actually reports as scrolled into
+                // view are drawn -- and, critically, only for those does
+                // `texture_for` ever run. Every stack matching the current
+                // query is fetched (`run_query` has no row cap any more:
+                // a query the sidebar counted at 1000+ silently showed only
+                // a couple hundred before, with no way to reach the rest,
+                // and no indication anything had been dropped). Decoding a
+                // cached thumbnail into a GPU texture is still synchronous
+                // on the UI thread the first time a path is seen
+                // (`texture_for`), so without this, an unfiltered query
+                // against a 90k-stack library would try to decode all
+                // 90,000 thumbnails in one frame the instant it loaded.
+                // `ScrollArea::show_rows` is egui's own answer to exactly
+                // this shape of problem (see its doc example, a 10,000-row
+                // list) -- it reports only the row indices whose vertical
+                // span intersects the visible viewport.
+                for row in visible {
+                    let idx = row * cols;
+                    ui.horizontal(|ui| {
+                        for i in idx..(idx + cols).min(self.rows.len()) {
+                            let id = self.rows[i].id;
+                            let rating = self.rows[i].rating;
+                            let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
+                                continue;
+                            };
+                            // Non-blocking: `None` means generation was
+                            // just queued on Cache's background worker
+                            // thread. The blocking form (`make_now`) is
+                            // what froze the window on a query that
+                            // matched hundreds of stacks never before
+                            // cached at this size -- generating a whole
+                            // page's worth of thumbnails serially,
+                            // synchronously, inside the UI thread's own
+                            // frame.
+                            let tex = self
+                                .cache
+                                .get(&src, thumbs::Size::Grid)
+                                .and_then(|path| self.texture_for(&ctx, &path));
+                            ui.vertical(|ui| {
+                                ui.set_width(tile_px);
+                                let is_selected =
+                                    i == self.selected || self.multi_selected.contains(&id);
+                                let resp = if let Some(tex) = tex {
+                                    // `Button::image(&tex)` alone draws the
+                                    // texture at its own native resolution
+                                    // (whatever `Size::Grid`'s configured
+                                    // pixel target is) regardless of the
+                                    // button's requested size -- the zoom
+                                    // slider changed the button's hit-box
+                                    // but not what was actually drawn.
+                                    // `fit_to_exact_size` makes the image
+                                    // content itself scale to `tile_px`,
+                                    // which is what the slider is
+                                    // actually supposed to control.
+                                    let img = egui::Image::new(&tex)
+                                        .fit_to_exact_size(egui::Vec2::splat(tile_px));
+                                    let btn = egui::Button::image(img).selected(is_selected);
+                                    ui.add_sized([tile_px, tile_px], btn)
+                                } else {
+                                    let btn = egui::Button::new("...").selected(is_selected);
+                                    ui.add_sized([tile_px, tile_px], btn)
                                 };
-                                // Non-blocking: `None` means generation was
-                                // just queued on Cache's background worker
-                                // thread. The blocking form (`make_now`) is
-                                // what froze the window on a query that
-                                // matched hundreds of stacks never before
-                                // cached at this size -- generating a whole
-                                // page's worth of thumbnails serially,
-                                // synchronously, inside the UI thread's own
-                                // frame.
-                                let tex = self
-                                    .cache
-                                    .get(&src, thumbs::Size::Grid)
-                                    .and_then(|path| self.texture_for(&ctx, &path));
-                                ui.vertical(|ui| {
-                                    ui.set_width(tile_px);
-                                    let is_selected =
-                                        i == self.selected || self.multi_selected.contains(&id);
-                                    let resp = if let Some(tex) = tex {
-                                        // `Button::image(&tex)` alone draws the
-                                        // texture at its own native resolution
-                                        // (whatever `Size::Grid`'s configured
-                                        // pixel target is) regardless of the
-                                        // button's requested size -- the zoom
-                                        // slider changed the button's hit-box
-                                        // but not what was actually drawn.
-                                        // `fit_to_exact_size` makes the image
-                                        // content itself scale to `tile_px`,
-                                        // which is what the slider is
-                                        // actually supposed to control.
-                                        let img = egui::Image::new(&tex)
-                                            .fit_to_exact_size(egui::Vec2::splat(tile_px));
-                                        let btn = egui::Button::image(img).selected(is_selected);
-                                        ui.add_sized([tile_px, tile_px], btn)
-                                    } else {
-                                        let btn = egui::Button::new("...").selected(is_selected);
-                                        ui.add_sized([tile_px, tile_px], btn)
-                                    };
-                                    if resp.double_clicked() {
-                                        self.selected = i;
-                                        self.multi_selected.clear();
-                                        open_single = true;
-                                    } else if resp.clicked() {
-                                        // Ctrl/Cmd-click toggles this tile into
-                                        // or out of the batch selection without
-                                        // disturbing the rest of it -- a plain
-                                        // click starts a fresh single selection,
-                                        // the common file-manager convention.
-                                        let extend = ui.input(|inp| {
-                                            inp.modifiers.ctrl || inp.modifiers.command
-                                        });
-                                        if extend {
-                                            if !self.multi_selected.remove(&id) {
-                                                self.multi_selected.insert(id);
-                                            }
-                                        } else {
-                                            self.multi_selected.clear();
+                                if resp.double_clicked() {
+                                    self.selected = i;
+                                    self.multi_selected.clear();
+                                    open_single = true;
+                                } else if resp.clicked() {
+                                    // Ctrl/Cmd-click toggles this tile into
+                                    // or out of the batch selection without
+                                    // disturbing the rest of it -- a plain
+                                    // click starts a fresh single selection,
+                                    // the common file-manager convention.
+                                    let extend =
+                                        ui.input(|inp| inp.modifiers.ctrl || inp.modifiers.command);
+                                    if extend {
+                                        if !self.multi_selected.remove(&id) {
+                                            self.multi_selected.insert(id);
                                         }
-                                        self.selected = i;
+                                    } else {
+                                        self.multi_selected.clear();
                                     }
-                                    let stars =
-                                        "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
-                                    ui.label(stars);
-                                });
-                            }
-                        });
-                        idx += cols;
-                    }
-                    if open_single {
-                        self.mode = Mode::Single;
-                    }
-                });
+                                    self.selected = i;
+                                }
+                                let stars = "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
+                                ui.label(stars);
+                            });
+                        }
+                    });
+                }
+            });
+            if open_single {
+                self.mode = Mode::Single;
+            }
         });
     }
 

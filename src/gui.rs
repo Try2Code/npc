@@ -915,32 +915,43 @@ impl GuiApp {
             self.cols = ((ui.available_width() / (tile_px + 8.0)).floor() as usize).max(1);
             let cols = self.cols;
             let ctx = ui.ctx().clone();
-            // `ScrollArea` auto-shrinks to fit its content by default, and
-            // `egui::Grid` sizes itself tightly to its tiles rather than the
-            // full panel width -- so the scroll area's hit-test rect shrank
-            // to match, and the wheel stopped registering over the margin
-            // outside the tiles. Force it to fill the panel instead.
+            // `ScrollArea` auto-shrinks to fit its content by default, and a
+            // tightly-sized row layout shrinks to match -- so the scroll
+            // area's hit-test rect shrank too, and the wheel stopped
+            // registering over the margin outside the tiles. Force it to
+            // fill the panel instead.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // `horizontal_wrapped` is a flow layout (built for wrapping
-                    // text and mixed-size content); it does not guarantee a
-                    // shared row baseline for uniformly-sized items, and tiles
-                    // came out vertically offset within a row. `egui::Grid`
-                    // is an actual table layout -- every cell in a row shares
-                    // the row's height by construction.
-                    egui::Grid::new("thumbnail-grid")
-                        .min_col_width(tile_px)
-                        .min_row_height(tile_px)
-                        .spacing([8.0, 8.0])
-                        .show(ui, |ui| {
-                            let mut open_single = false;
-                            for idx in 0..self.rows.len() {
-                                let id = self.rows[idx].id;
-                                let rating = self.rows[idx].rating;
-                                if idx > 0 && idx % cols == 0 {
-                                    ui.end_row();
-                                }
+                    ui.spacing_mut().item_spacing = egui::Vec2::splat(8.0);
+                    let mut open_single = false;
+                    let mut idx = 0;
+                    while idx < self.rows.len() {
+                        // One `ui.horizontal` per row, not `egui::Grid`.
+                        // `Grid` negotiates each column's width from the
+                        // *previous frame*'s measured content
+                        // (`GridLayout::available_rect` in egui's own
+                        // grid.rs reads `prev_state`, not this frame's
+                        // actual cell) -- so a column's rect can lag one
+                        // size behind whatever this frame draws into it.
+                        // That is not a one-off startup glitch: it means a
+                        // column's rect can go on disagreeing with its own
+                        // tile indefinitely, with nothing that forces a
+                        // resync -- which is exactly what a zoom change or
+                        // window resize that "doesn't fix it" looks like.
+                        // Shotwell (and every other fixed-cell photo grid)
+                        // never negotiates a cell's width from history: it
+                        // places a fixed-size cell at a directly-computed
+                        // pixel position, fresh, every single frame. Plain
+                        // `horizontal` gives the same guarantee: every
+                        // tile's rect is exactly `tile_px` this frame,
+                        // computed from nothing but this frame's own
+                        // widgets, with no size ever inherited from the
+                        // last one drawn.
+                        ui.horizontal(|ui| {
+                            for i in idx..(idx + cols).min(self.rows.len()) {
+                                let id = self.rows[i].id;
+                                let rating = self.rows[i].rating;
                                 let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
                                     continue;
                                 };
@@ -958,18 +969,9 @@ impl GuiApp {
                                     .get(&src, thumbs::Size::Grid)
                                     .and_then(|path| self.texture_for(&ctx, &path));
                                 ui.vertical(|ui| {
-                                    // `vertical()` otherwise claims the
-                                    // full remaining width of the row as
-                                    // this cell's width (it has no content
-                                    // yet to size itself by), and Grid
-                                    // measures column width from that --
-                                    // not from the tile-sized button inside
-                                    // it. That's the huge dead gap after the
-                                    // first tile: column 0 was recorded as
-                                    // almost the whole window's width.
                                     ui.set_width(tile_px);
                                     let is_selected =
-                                        idx == self.selected || self.multi_selected.contains(&id);
+                                        i == self.selected || self.multi_selected.contains(&id);
                                     let resp = if let Some(tex) = tex {
                                         // `Button::image(&tex)` alone draws the
                                         // texture at its own native resolution
@@ -977,18 +979,11 @@ impl GuiApp {
                                         // pixel target is) regardless of the
                                         // button's requested size -- the zoom
                                         // slider changed the button's hit-box
-                                        // and the grid's column math, but not
-                                        // what was actually drawn, so tiles
-                                        // never visibly resized and, at
-                                        // anything but the largest slider
-                                        // setting, spilled past their own
-                                        // column into whatever was next
-                                        // (including the window edge for the
-                                        // last column). `fit_to_exact_size`
-                                        // makes the image content itself scale
-                                        // to `tile_px`, which is what the
-                                        // slider is actually supposed to
-                                        // control.
+                                        // but not what was actually drawn.
+                                        // `fit_to_exact_size` makes the image
+                                        // content itself scale to `tile_px`,
+                                        // which is what the slider is
+                                        // actually supposed to control.
                                         let img = egui::Image::new(&tex)
                                             .fit_to_exact_size(egui::Vec2::splat(tile_px));
                                         let btn = egui::Button::image(img).selected(is_selected);
@@ -998,7 +993,7 @@ impl GuiApp {
                                         ui.add_sized([tile_px, tile_px], btn)
                                     };
                                     if resp.double_clicked() {
-                                        self.selected = idx;
+                                        self.selected = i;
                                         self.multi_selected.clear();
                                         open_single = true;
                                     } else if resp.clicked() {
@@ -1007,8 +1002,9 @@ impl GuiApp {
                                         // disturbing the rest of it -- a plain
                                         // click starts a fresh single selection,
                                         // the common file-manager convention.
-                                        let extend =
-                                            ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                                        let extend = ui.input(|inp| {
+                                            inp.modifiers.ctrl || inp.modifiers.command
+                                        });
                                         if extend {
                                             if !self.multi_selected.remove(&id) {
                                                 self.multi_selected.insert(id);
@@ -1016,17 +1012,19 @@ impl GuiApp {
                                         } else {
                                             self.multi_selected.clear();
                                         }
-                                        self.selected = idx;
+                                        self.selected = i;
                                     }
                                     let stars =
                                         "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
                                     ui.label(stars);
                                 });
                             }
-                            if open_single {
-                                self.mode = Mode::Single;
-                            }
                         });
+                        idx += cols;
+                    }
+                    if open_single {
+                        self.mode = Mode::Single;
+                    }
                 });
         });
     }

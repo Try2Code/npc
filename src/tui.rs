@@ -106,7 +106,7 @@ impl TrashView {
     /// (`"s.id"`, `"f.stack_id"`, `"st.stack_id"`, ...). `Include` needs no
     /// clause at all, since `1=1` would otherwise force every caller to
     /// special-case "no filter" separately.
-    fn clause(self, col: &str) -> String {
+    pub(crate) fn clause(self, col: &str) -> String {
         match self {
             TrashView::Exclude => format!("{col} NOT IN (SELECT stack_id FROM trashed)"),
             TrashView::Include => "1=1".to_string(),

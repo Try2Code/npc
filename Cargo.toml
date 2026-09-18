@@ -1,6 +1,6 @@
 [package]
 name = "npc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
 
@@ -25,6 +25,8 @@ ratatui = { version = "0.29", features = ["serde"] }
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ratatui-image = "4"
+eframe = "0.36.1"
+egui = "0.36.1"
 
 [build-dependencies]
 cxx-build = "1.0"

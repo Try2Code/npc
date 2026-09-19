@@ -162,6 +162,13 @@ enum Cmd {
         /// Delete cache entries nothing would ask for any more
         #[arg(long)]
         prune: bool,
+        /// Internal: a file of newline-separated stack ids, as an
+        /// alternative to `--query`. Not documented as a user-facing
+        /// selector -- this exists so `import` can hand off an exact id
+        /// list to a detached background prewarm process without going
+        /// through the query language.
+        #[arg(long, hide = true, conflicts_with = "query")]
+        ids_file: Option<PathBuf>,
     },
     /// Report what this terminal can actually do. Run it inside the terminal
     /// you use for `npc tui`.
@@ -350,6 +357,35 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
             None => anyhow::bail!("no stack in the catalog for {p}"),
         }
     }
+    Ok(ids)
+}
+
+/// Every stack currently cataloged under one of `dirs`, by exact match --
+/// used to hand `import`'s background thumbnail warm-up an exact id list
+/// for what it just copied, without going through the query language's
+/// `path=` (a substring match, imprecise for this purpose).
+fn stack_ids_in_dirs(cat: &Catalog, dirs: &std::collections::HashSet<PathBuf>) -> Result<Vec<i64>> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir_strings: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+    let placeholders = dir_strings
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id FROM stack WHERE dir IN ({placeholders})");
+    let params: Vec<&dyn rusqlite::ToSql> = dir_strings
+        .iter()
+        .map(|d| d as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = cat.conn.prepare(&sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map(params.as_slice(), |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(ids)
 }
 
@@ -965,6 +1001,12 @@ fn main() -> Result<()> {
             };
 
             let mut totals = npc::import::ImportStats::default();
+            // Every destination directory a stack actually landed in this
+            // run -- used after the post-import scan (below) to resolve
+            // exactly which stacks to prewarm thumbnails for, without
+            // touching anything import.rs itself returns.
+            let mut touched_dirs: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
             for source in &sources {
                 let plans = npc::import::plan(&cat, source, &root, verify_content)?;
                 let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
@@ -1066,6 +1108,7 @@ fn main() -> Result<()> {
                                     );
                                 }
                             } else {
+                                touched_dirs.insert(stack.dest_dir.clone());
                                 bytes_so_far += bytes;
                                 print!(
                                     "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
@@ -1113,8 +1156,69 @@ fn main() -> Result<()> {
             }
 
             if !dry_run {
-                let (s, _) = scan::scan_root(&root, false)?;
+                let (s, scanned_cat) = scan::scan_root(&root, false)?;
                 println!("catalog now holds {} stacks", s.stacks);
+
+                // Thumbnails for what just landed: warm the Grid tier in a
+                // detached background process rather than making `import`
+                // wait, or leaving every tile a cold cache miss the first
+                // time this import is browsed. Resolved by exact directory
+                // match against what was actually copied above, not the
+                // query language's `path=` (a substring match) -- this is
+                // an internal handoff, not a user-typed filter.
+                if !touched_dirs.is_empty() {
+                    let ids = stack_ids_in_dirs(&scanned_cat, &touched_dirs)?;
+
+                    if !ids.is_empty() {
+                        let ids_path = std::env::temp_dir().join(format!(
+                            "npc-prewarm-{}-{}.ids",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or_default()
+                        ));
+                        let body = ids
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        std::fs::write(&ids_path, body)
+                            .with_context(|| format!("writing {}", ids_path.display()))?;
+
+                        let spawned = std::env::current_exe().and_then(|exe| {
+                            std::process::Command::new(exe)
+                                .arg("thumbs")
+                                .arg("--root")
+                                .arg(&root)
+                                .arg("--size")
+                                .arg("grid")
+                                .arg("--ids-file")
+                                .arg(&ids_path)
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn()
+                        });
+                        match spawned {
+                            // Deliberately not `.wait()`-ed: on Linux an
+                            // un-waited child is reparented to init when
+                            // this process exits normally, not killed. That
+                            // is what lets it keep generating thumbnails
+                            // after `import` itself has already returned.
+                            Ok(child) => {
+                                drop(child);
+                                println!("warming {} thumbnail(s) in the background", ids.len());
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "note: could not start background thumbnail warm-up: {e}"
+                                );
+                                let _ = std::fs::remove_file(&ids_path);
+                            }
+                        }
+                    }
+                }
             }
             if sources.len() > 1 {
                 println!(
@@ -1333,6 +1437,7 @@ fn main() -> Result<()> {
             query,
             size,
             prune,
+            ids_file,
         } => {
             let size = match size.as_str() {
                 "grid" => npc::thumbs::Size::Grid,
@@ -1355,17 +1460,38 @@ fn main() -> Result<()> {
             );
             let cache = npc::thumbs::Cache::new(&uuid)?;
 
-            let compiled = npc::query::compile(query.as_deref().unwrap_or(""))?;
-            let stmt = compiled.select_stacks(None);
-            let mut prepared = cat.conn.prepare(&stmt)?;
-            let params: Vec<&dyn rusqlite::ToSql> = compiled
-                .params
-                .iter()
-                .map(|p| p as &dyn rusqlite::ToSql)
-                .collect();
-            let ids: Vec<i64> = prepared
-                .query_map(params.as_slice(), |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
+            // An explicit id list (from `import`'s background handoff) skips
+            // the query compiler entirely -- these ids are already known
+            // exactly, and running them back through the query language
+            // would just be a slower, lossier way to say the same thing.
+            let ids: Vec<i64> = if let Some(path) = &ids_file {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let ids = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| {
+                        l.trim().parse::<i64>().with_context(|| {
+                            format!("parsing stack id from {}: {l:?}", path.display())
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let _ = std::fs::remove_file(path);
+                ids
+            } else {
+                let compiled = npc::query::compile(query.as_deref().unwrap_or(""))?;
+                let stmt = compiled.select_stacks(None);
+                let mut prepared = cat.conn.prepare(&stmt)?;
+                let params: Vec<&dyn rusqlite::ToSql> = compiled
+                    .params
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::ToSql)
+                    .collect();
+                let resolved: Vec<i64> = prepared
+                    .query_map(params.as_slice(), |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                resolved
+            };
 
             if prune {
                 let (n, bytes) = cache.prune(&cat, &ids)?;
@@ -1577,4 +1703,58 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insert_stack(cat: &Catalog, dir: &str, base: &str) {
+        cat.conn
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES (?1, ?2)",
+                rusqlite::params![dir, base],
+            )
+            .unwrap();
+    }
+
+    /// The exact scenario `import`'s background thumbnail warm-up relies on:
+    /// given the directories a run actually copied into, resolve precisely
+    /// the stacks now living there -- no more (a same-day directory that
+    /// merely looks similar), no fewer (every stack in a touched dir, not
+    /// just the first).
+    #[test]
+    fn stack_ids_in_dirs_resolves_exactly_the_touched_directories() {
+        let store = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_at(store.path().join("test.sqlite")).unwrap();
+        insert_stack(&cat, "/lib/2026/07/23", "a");
+        insert_stack(&cat, "/lib/2026/07/23", "b");
+        insert_stack(&cat, "/lib/2026/07/24", "c");
+        // A same-day directory from a *different* year -- must not be
+        // pulled in by a substring-style match on "2026/07/23".
+        insert_stack(&cat, "/lib/2020/07/23", "d");
+
+        let mut dirs = std::collections::HashSet::new();
+        dirs.insert(PathBuf::from("/lib/2026/07/23"));
+        let mut ids = stack_ids_in_dirs(&cat, &dirs).unwrap();
+        ids.sort_unstable();
+
+        let mut expected: Vec<i64> = [
+            cat.stack_id("/lib/2026/07/23", "a").unwrap().unwrap(),
+            cat.stack_id("/lib/2026/07/23", "b").unwrap().unwrap(),
+        ]
+        .to_vec();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn stack_ids_in_dirs_is_empty_for_no_directories() {
+        let store = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_at(store.path().join("test.sqlite")).unwrap();
+        insert_stack(&cat, "/lib/2026/07/23", "a");
+
+        let ids = stack_ids_in_dirs(&cat, &std::collections::HashSet::new()).unwrap();
+        assert!(ids.is_empty());
+    }
 }

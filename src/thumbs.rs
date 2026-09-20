@@ -403,13 +403,21 @@ pub fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::D
 }
 
 /// Pre-warm the cache for a set of stacks. Returns (made, skipped, failed).
+/// `on_progress`, when given, is called after every completed item with
+/// `(done, total)` -- `done` counting skips and failures too, since those
+/// still represent work finished. Called from whichever rayon worker
+/// thread finished that item (hence `Sync`, not just `Fn`), so a caller
+/// driving a progress display must do its own printing/throttling; this
+/// stays as presentation-free as `import::execute`'s own `on_event`.
 pub fn prewarm(
     cat: &Catalog,
     cache: &Cache,
     stack_ids: &[i64],
     size: Size,
+    on_progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> (usize, usize, usize) {
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Destination paths are resolved up front: `Cache` owns a channel receiver
     // and so is not `Sync`, and there is no reason for the workers to see it.
@@ -421,17 +429,23 @@ pub fn prewarm(
             (src, out)
         })
         .collect();
+    let total = work.len();
+    let done = AtomicUsize::new(0);
 
     let counts: Vec<(usize, usize, usize)> = work
         .par_iter()
         .map(|(src, out)| {
-            if out.exists() {
+            let result = if out.exists() {
                 (0, 1, 0)
             } else if generate(src, size, out).is_ok() {
                 (1, 0, 0)
             } else {
                 (0, 0, 1)
+            };
+            if let Some(cb) = on_progress {
+                cb(done.fetch_add(1, Ordering::Relaxed) + 1, total);
             }
+            result
         })
         .collect();
 

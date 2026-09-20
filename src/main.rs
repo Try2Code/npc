@@ -1504,7 +1504,13 @@ fn main() -> Result<()> {
             }
 
             let started = std::time::Instant::now();
-            let (made, skipped, failed) = npc::thumbs::prewarm(&cat, &cache, &ids, size);
+            let on_progress = |done: usize, total: usize| {
+                print!("\rthumbnails: {done}/{total}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            };
+            let (made, skipped, failed) =
+                npc::thumbs::prewarm(&cat, &cache, &ids, size, Some(&on_progress));
+            println!();
             let secs = started.elapsed().as_secs_f64();
 
             println!("thumbnails ({} px) for {} stack(s)", size.px(), ids.len());

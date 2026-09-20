@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const MIN_TILE_PX: f32 = 64.0;
-const MAX_TILE_PX: f32 = 400.0;
+const MAX_TILE_PX: f32 = 1000.0;
 const DEFAULT_TILE_PX: f32 = 160.0;
 
 struct Row {
@@ -554,18 +554,35 @@ impl GuiApp {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("query:");
-                let resp = ui.text_edit_singleline(&mut self.query);
-                // The documented egui idiom for "submit on Enter" is
-                // `response.lost_focus() && Enter pressed` -- that didn't
-                // fire reliably in this (very recent) egui release, so this
-                // checks `has_focus()` instead: this field currently has the
-                // keyboard, and Enter was pressed this frame. Gating on
-                // *this* field's focus (not just "Enter pressed anywhere")
-                // matters now that the info panel's tag field is a second
-                // text widget in the same app -- without it, adding a tag
-                // with Enter would also re-run this query and reset
-                // `selected` back to 0.
-                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Neither documented "submit on Enter" idiom actually works
+                // for this, both confirmed directly against egui's own
+                // source rather than assumed:
+                //   - `response.lost_focus()` is a *one-frame-deferred*
+                //     signal for a mid-frame focus transfer -- egui's own
+                //     regression test `lost_focus_fires_after_mid_frame_
+                //     focus_transfer` (memory/mod.rs) asserts it explicitly:
+                //     "Frame N: click B mid-frame" -> lost_focus for A is
+                //     still false that same frame; only "Frame N+1" does it
+                //     fire. Checking it right after this call, same frame,
+                //     never sees it.
+                //   - `response.has_focus()` evaluates *live* against
+                //     current memory (`ctx.memory(|m| m.has_focus(id))`,
+                //     response.rs), and a singleline `TextEdit` calls
+                //     `surrender_focus` on Enter *during its own
+                //     processing*, before returning -- so by the time we
+                //     check `resp.has_focus()` right after, it has already
+                //     surrendered and always reads false. This is why the
+                //     query never actually resubmitted on Enter: the whole
+                //     block was dead.
+                // The fix: capture focus *before* the widget runs, via an
+                // explicit id, so the widget's own internal surrender can't
+                // erase what we needed to know.
+                let query_id = ui.make_persistent_id("gui_query_text_edit");
+                let was_focused = ui.memory(|m| m.has_focus(query_id));
+                ui.add(egui::TextEdit::singleline(&mut self.query).id(query_id));
+                if was_focused
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                {
                     match run_query(&self.cat, &self.query) {
                         Ok(rows) => {
                             self.rows = rows;
@@ -788,13 +805,16 @@ impl GuiApp {
             }
 
             ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.tag_input);
-                // Same `has_focus()` reasoning as the query bar: this field
-                // specifically must have the keyboard, not just "Enter was
-                // pressed somewhere this frame" -- otherwise submitting a
-                // query with Enter would also try to add whatever is
-                // sitting in this field.
-                let submitted = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                // Same "focus before the widget runs" reasoning as the query
+                // bar (see its comment for why `has_focus()`/`lost_focus()`
+                // both fail here): the field's own Enter handling surrenders
+                // its focus during this exact call, so `has_focus()` checked
+                // on the response is always already false.
+                let tag_id = ui.make_persistent_id("gui_tag_input_single");
+                let was_focused = ui.memory(|m| m.has_focus(tag_id));
+                ui.add(egui::TextEdit::singleline(&mut self.tag_input).id(tag_id));
+                let submitted = was_focused
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 if (ui.button("add").clicked() || submitted) && !self.tag_input.trim().is_empty() {
                     self.add_tags_to_selected(&self.tag_input.clone());
                     self.tag_input.clear();
@@ -837,8 +857,13 @@ impl GuiApp {
             ui.separator();
             ui.label("Add tag (applies to all selected)");
             ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.tag_input);
-                let submitted = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                // See `draw_query_bar`'s comment for why focus has to be
+                // captured *before* this call, not read off its response.
+                let tag_id = ui.make_persistent_id("gui_tag_input_batch");
+                let was_focused = ui.memory(|m| m.has_focus(tag_id));
+                ui.add(egui::TextEdit::singleline(&mut self.tag_input).id(tag_id));
+                let submitted = was_focused
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 if (ui.button("add").clicked() || submitted) && !self.tag_input.trim().is_empty() {
                     self.add_tags_to_selected(&self.tag_input.clone());
                     self.tag_input.clear();
@@ -1092,14 +1117,18 @@ impl GuiApp {
                 return;
             };
             let ctx = ui.ctx().clone();
-            // `Size::Full` is a `min_dim` past any real sensor's long edge,
-            // so `extract_preview` can never satisfy it from a smaller
-            // preview tier and falls back to the largest one available --
-            // the same "asking for more forces full resolution" behavior
-            // `tui.rs`'s single view already relies on for its own zoom.
+            // `Size::View`, not `Size::Full` -- matching `tui.rs`'s own
+            // *default* single view. `Full` is a `min_dim` past any real
+            // sensor's long edge, so it forces the largest preview tier
+            // available (measured elsewhere in this project at ~140ms/frame,
+            // vs. `View`'s ~24ms) -- worth paying when the TUI's `+` key
+            // explicitly asks to zoom in further, not on every single-view
+            // open. This GUI has no such zoom escalation (yet), so it should
+            // default to the tier the TUI itself defaults to, not the one it
+            // reserves for an explicit zoom request.
             match self
                 .cache
-                .get(&src, thumbs::Size::Full)
+                .get(&src, thumbs::Size::View)
                 .and_then(|path| self.texture_for(&ctx, &path))
             {
                 Some(tex) => {
@@ -1107,7 +1136,7 @@ impl GuiApp {
                     ui.add(egui::Image::new(&tex).max_size(avail).shrink_to_fit());
                 }
                 None => {
-                    ui.label("loading full-resolution image...");
+                    ui.label("loading image...");
                 }
             }
         });

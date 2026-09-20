@@ -48,6 +48,19 @@ text   = "white"      # the current filename, the most prominent line on screen
 [gui]
 theme = "dark"
 
+# The background library watcher: while `npc tui` or `npcg` is open, notices
+# a file that appears anywhere in the library outside the dated YYYY/MM/DD
+# tree those tools manage themselves (and outside .trash) -- typically a
+# reprocessed export saved back in by RawTherapee/GIMP/darktable -- and
+# catalogs it in place, the same as running `npc scan` yourself would. It
+# never copies, moves, or writes to any original; the only write is the
+# catalog row. Pass --no-watch to either tool to disable it for one session
+# without editing this file.
+[watch]
+enabled = true
+debounce_ms = 2000   # how long a directory must go quiet before it's rescanned
+exclude = []          # extra top-level directory names to never watch
+
 # --- Actions: what the TUI's `a` menu launches on the current selection ---
 #
 # Defining ANY [[action]] block replaces the built-ins entirely (not

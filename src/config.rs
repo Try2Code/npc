@@ -119,6 +119,35 @@ impl Default for Thumbs {
     }
 }
 
+/// The background library watcher (`tui`/`npcg` only): notices a file that
+/// appears outside the dated `YYYY/MM/DD` import tree -- typically a
+/// reprocessed export saved back into the library by RawTherapee/GIMP/
+/// darktable -- and catalogs it in place, the same as running `npc scan`
+/// yourself would. See `src/watch.rs`'s module doc for the full design and
+/// why this is a scoped `scan()`, not `import`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Watch {
+    pub enabled: bool,
+    /// How long a directory must go quiet before it's rescanned -- long
+    /// enough that an editor's multi-file export batch, or a RAW+JPG pair
+    /// arriving moments apart, settles into one scan instead of several.
+    pub debounce_ms: u64,
+    /// Extra top-level directory names to never watch, beyond the two
+    /// always-excluded ones (the `YYYY` dated tree, and `.trash`).
+    pub exclude: Vec<String>,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 2000,
+            exclude: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Absolute paths. Any mutating operation whose target resolves inside one
@@ -133,6 +162,9 @@ pub struct Config {
     /// The native GUI's starting theme. See [`Gui`].
     #[serde(default)]
     pub gui: Gui,
+    /// The background library watcher. See [`Watch`].
+    #[serde(default)]
+    pub watch: Watch,
     /// The library this tool works on when no root is given on the command line.
     ///
     /// Without it every command would need an explicit path, and hardcoding
@@ -394,6 +426,21 @@ mod tests {
 
         let c: Config = toml::from_str("[gui]\ntheme = \"light\"").unwrap();
         assert_eq!(c.gui.theme, Theme::Light);
+    }
+
+    #[test]
+    fn watch_defaults_to_enabled_with_a_two_second_debounce() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.watch.enabled);
+        assert_eq!(c.watch.debounce_ms, 2000);
+        assert!(c.watch.exclude.is_empty());
+
+        let c: Config =
+            toml::from_str("[watch]\nenabled = false\ndebounce_ms = 500\nexclude = [\"inbox\"]")
+                .unwrap();
+        assert!(!c.watch.enabled);
+        assert_eq!(c.watch.debounce_ms, 500);
+        assert_eq!(c.watch.exclude, vec!["inbox".to_string()]);
     }
 
     #[test]

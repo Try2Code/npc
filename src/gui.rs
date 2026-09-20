@@ -22,6 +22,7 @@ use crate::db::Catalog;
 use crate::edit::{self, Change};
 use crate::exif;
 use crate::tui::TrashView;
+use crate::watch;
 use crate::{query, thumbs, vol};
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -305,10 +306,19 @@ struct GuiApp {
     /// selection change -- typing a tag, then clicking a different tile
     /// before pressing Enter, keeps the draft rather than silently losing it.
     tag_input: String,
+    /// Background library watcher (see `watch.rs`). `None` when disabled in
+    /// config or failed to start -- either way, just "no automatic
+    /// cataloging this session," never fatal to launching the GUI.
+    watcher: Option<watch::Watcher>,
 }
 
 impl GuiApp {
-    fn new(cat: Catalog, cache: thumbs::Cache, config: Config) -> Self {
+    fn new(
+        cat: Catalog,
+        cache: thumbs::Cache,
+        config: Config,
+        watcher: Option<watch::Watcher>,
+    ) -> Self {
         let rows = run_query(&cat, "").unwrap_or_default();
         let theme = config.gui.theme;
         let mut app = Self {
@@ -318,6 +328,7 @@ impl GuiApp {
             query: String::new(),
             query_error: None,
             status: None,
+            watcher,
             rows,
             selected: 0,
             multi_selected: std::collections::HashSet::new(),
@@ -1114,6 +1125,33 @@ impl GuiApp {
         while self.cache.done.try_recv().is_ok() {}
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
     }
+
+    /// The watcher runs on its own thread and its own catalog connection;
+    /// draining here is what turns "a directory was just rescanned" into
+    /// "the screen reflects it," same shape as `poll_thumbnail_generation`
+    /// just above. One re-run of the current query covers however many
+    /// directories settled between frames.
+    fn poll_watcher(&mut self) {
+        let Some(watcher) = self.watcher.as_ref() else {
+            return;
+        };
+        let mut rescanned = false;
+        loop {
+            match watcher.changed.try_recv() {
+                Ok(watch::WatchEvent::Rescanned(_)) => rescanned = true,
+                Ok(watch::WatchEvent::Error(e)) => {
+                    self.status = Some(format!("watch: {e}"));
+                }
+                Err(_) => break,
+            }
+        }
+        if rescanned {
+            if let Ok(rows) = run_query(&self.cat, &self.query) {
+                self.rows = rows;
+            }
+            self.reload_sidebar();
+        }
+    }
 }
 
 fn visuals_for(theme: Theme) -> egui::Visuals {
@@ -1125,6 +1163,7 @@ fn visuals_for(theme: Theme) -> egui::Visuals {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_watcher();
         self.draw_query_bar(ui);
         self.draw_sidebar(ui);
         self.draw_info_panel(ui);
@@ -1146,8 +1185,11 @@ impl eframe::App for GuiApp {
 
 /// Resolve config, open the catalog, and launch the window. Mirrors
 /// `tui::run`'s startup order.
-pub fn run(root: &Path) -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+pub fn run(root: &Path, no_watch: bool) -> Result<()> {
+    let mut config = Config::load().unwrap_or_default();
+    if no_watch {
+        config.watch.enabled = false;
+    }
     // Must happen before any `thumbs::Cache` use, or generation silently
     // falls back to the hardcoded 1280px default -- see thumbs::configure.
     thumbs::configure(&config.thumbs);
@@ -1163,13 +1205,16 @@ pub fn run(root: &Path) -> Result<()> {
     let v = vol::identify(root)?;
     let cache = thumbs::Cache::new(&v.uuid)?;
     let theme = config.gui.theme;
+    // Already confirmed online above; a failure here (disabled in config,
+    // or the watcher itself erroring) is never fatal to launching the GUI.
+    let watcher = watch::Watcher::spawn(root.to_path_buf(), &config).unwrap_or(None);
 
     eframe::run_native(
         "npcg",
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(visuals_for(theme));
-            Ok(Box::new(GuiApp::new(cat, cache, config)))
+            Ok(Box::new(GuiApp::new(cat, cache, config, watcher)))
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))

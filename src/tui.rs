@@ -29,6 +29,7 @@ use crate::edit::{self, Change};
 use crate::exif::{self, format_date, format_datetime, format_ev, format_shutter, Exif};
 use crate::query;
 use crate::thumbs::{self, Size as ThumbSize};
+use crate::watch;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -239,6 +240,10 @@ pub struct App {
 
     view: View,
     cache: Option<thumbs::Cache>,
+    /// Background library watcher (see `watch.rs`). `None` when disabled in
+    /// config, offline, or failed to start -- any of which just means "no
+    /// automatic cataloging this session," never a fatal error.
+    watcher: Option<watch::Watcher>,
     /// Raw decoded pixels, keyed by cache-file path -- content only, no
     /// screen position or protocol state. Reading and JPEG-decoding a
     /// thumbnail is the expensive part of showing one; nothing about *where*
@@ -349,6 +354,7 @@ impl App {
             quit: false,
             view: View::List,
             cache: None,
+            watcher: None,
             decoded: HashMap::new(),
             images: HashMap::new(),
             last_rect: HashMap::new(),
@@ -651,6 +657,22 @@ impl App {
                 .unwrap_or_default();
             self.cache = thumbs::Cache::new(&uuid).ok();
         }
+        // Watching needs the real filesystem, same precondition as
+        // generating a new thumbnail -- offline, there is nothing to watch.
+        // A failure to start (disabled in config, or the watcher itself
+        // erroring) is never fatal to the session; it just means no
+        // automatic cataloging this time.
+        let watch_error = if self.online {
+            match watch::Watcher::spawn(self.root.clone(), &self.config) {
+                Ok(w) => {
+                    self.watcher = w;
+                    None
+                }
+                Err(e) => Some(e.to_string()),
+            }
+        } else {
+            None
+        };
         self.picker = Picker::from_query_stdio().ok();
         // Say plainly what was detected. A silent fallback to halfblocks looks
         // like broken thumbnails rather than an unsupported terminal.
@@ -667,6 +689,10 @@ impl App {
             }
             None => "terminal graphics query failed; thumbnails unavailable".into(),
         };
+        if let Some(e) = watch_error {
+            use std::fmt::Write as _;
+            let _ = write!(self.status, " (library watcher failed to start: {e})");
+        }
     }
 
     /// Cached thumbnail for a row, decoded and ready to draw. Returns `None`
@@ -2284,8 +2310,11 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 /// Run the browser. The terminal is restored even on panic: leaving a user in
 /// a wrecked tty because of a bug in a photo cataloger is not acceptable.
-pub fn run(root: PathBuf, trash_view: TrashView) -> Result<()> {
+pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
     let mut app = App::new(root, trash_view)?;
+    if no_watch {
+        app.config.watch.enabled = false;
+    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2329,6 +2358,24 @@ pub fn run(root: PathBuf, trash_view: TrashView) -> Result<()> {
             // repaint, and draining keeps the channel from growing.
             if let Some(cache) = app.cache.as_ref() {
                 while cache.done.try_recv().is_ok() {}
+            }
+            // The watcher runs on its own thread and its own catalog
+            // connection; draining here is what turns "a directory was just
+            // rescanned" into "the screen reflects it," same shape as the
+            // thumbnail cache's `done` channel just above. One `reload()`
+            // covers however many directories settled between frames.
+            if let Some(watcher) = app.watcher.as_ref() {
+                let mut rescanned = false;
+                loop {
+                    match watcher.changed.try_recv() {
+                        Ok(watch::WatchEvent::Rescanned(_)) => rescanned = true,
+                        Ok(watch::WatchEvent::Error(e)) => app.status = format!("watch: {e}"),
+                        Err(_) => break,
+                    }
+                }
+                if rescanned {
+                    let _ = app.reload();
+                }
             }
             if app.quit {
                 break;

@@ -9,6 +9,10 @@ use std::path::PathBuf;
 struct Cli {
     /// Library root. Defaults to `library` in the config.
     root: Option<PathBuf>,
+    /// Disable the background library watcher for this session (overrides
+    /// `[watch] enabled` in config.toml)
+    #[arg(long)]
+    no_watch: bool,
 }
 
 fn main() -> Result<()> {
@@ -28,5 +32,5 @@ fn main() -> Result<()> {
             })?,
     };
 
-    npc::gui::run(&root)
+    npc::gui::run(&root, cli.no_watch)
 }

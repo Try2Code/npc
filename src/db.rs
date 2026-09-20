@@ -253,6 +253,14 @@ impl Catalog {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // WAL allows concurrent readers alongside one writer, but two
+        // connections can still collide if they write in the same instant --
+        // low-odds when every `npc` invocation was short-lived, but the
+        // library watcher (src/watch.rs) now holds its own long-lived
+        // connection writing at unpredictable moments alongside the TUI/GUI's
+        // own. Without a timeout, the loser gets an immediate `SQLITE_BUSY`
+        // instead of a short automatic retry.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(SCHEMA)?;
 

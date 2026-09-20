@@ -219,6 +219,10 @@ enum Cmd {
         /// Show only the trash, nothing else
         #[arg(long)]
         trash: bool,
+        /// Disable the background library watcher for this session
+        /// (overrides `[watch] enabled` in config.toml)
+        #[arg(long)]
+        no_watch: bool,
     },
     /// Write every pending edit out to its sidecar.
     Sync {
@@ -1673,13 +1677,18 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Cmd::Tui { root, all, trash } => {
+        Cmd::Tui {
+            root,
+            all,
+            trash,
+            no_watch,
+        } => {
             let trash_view = match (all, trash) {
                 (_, true) => npc::tui::TrashView::Only,
                 (true, false) => npc::tui::TrashView::Include,
                 (false, false) => npc::tui::TrashView::Exclude,
             };
-            npc::tui::run(library(root.get().as_deref())?, trash_view)?;
+            npc::tui::run(library(root.get().as_deref())?, trash_view, no_watch)?;
         }
 
         Cmd::Status { root } => {

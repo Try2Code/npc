@@ -48,7 +48,7 @@ struct Row {
 /// has to stay bounded is *rendering*, which `draw_grid`'s
 /// `ScrollArea::show_rows` now handles by only drawing whatever is
 /// actually scrolled into view.
-fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
+fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5]) -> Result<Vec<Row>> {
     let mut compiled = query::compile(text)?;
     // Excluded by default, same as `tui.rs`'s own `TrashView::Exclude`: a
     // trashed stack is on its way out of the library, not part of what
@@ -62,6 +62,23 @@ fn run_query(cat: &Catalog, text: &str) -> Result<Vec<Row>> {
         compiled.where_sql,
         TrashView::Exclude.clause("s.id")
     );
+    // The rating checkboxes are a separate, structural filter ANDed onto
+    // the compiled query rather than spliced into the visible query text --
+    // there's no single fragment to cleanly remove when the last box is
+    // unchecked, unlike a sidebar click's `splice_filter`. All boxes
+    // unchecked means no rating filter at all (every rating shown), not
+    // "match nothing".
+    let selected: Vec<i64> = (1..=5).filter(|&n| ratings[(n - 1) as usize]).collect();
+    if !selected.is_empty() {
+        let placeholders = selected.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        compiled.where_sql = format!(
+            "({}) AND COALESCE(s.rating, 0) IN ({placeholders})",
+            compiled.where_sql
+        );
+        compiled
+            .params
+            .extend(selected.into_iter().map(rusqlite::types::Value::Integer));
+    }
     let sql = compiled.select_stacks(None);
     let mut stmt = cat.conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = compiled
@@ -285,6 +302,10 @@ struct GuiApp {
     /// purpose: the next sidebar click replaces just this fragment instead
     /// of clobbering anything typed in the query box alongside it.
     applied_filter: Option<String>,
+    /// Rating checkboxes 1..=5, independent of each other and of the free-
+    /// text query -- lets "2 and 5, but nothing else" be selected in one
+    /// step, which typing `rating>=N` alone can't express.
+    rating_filter: [bool; 5],
     events: Vec<EventEntry>,
     tags: Vec<TagNode>,
     /// One entry per distinct `stack.dir` -- a flat list, not a real
@@ -319,7 +340,7 @@ impl GuiApp {
         config: Config,
         watcher: Option<watch::Watcher>,
     ) -> Self {
-        let rows = run_query(&cat, "").unwrap_or_default();
+        let rows = run_query(&cat, "", [false; 5]).unwrap_or_default();
         let theme = config.gui.theme;
         let mut app = Self {
             cat,
@@ -336,6 +357,7 @@ impl GuiApp {
             cols: 1,
             mode: Mode::Grid,
             applied_filter: None,
+            rating_filter: [false; 5],
             events: Vec::new(),
             tags: Vec::new(),
             folders: Vec::new(),
@@ -441,7 +463,7 @@ impl GuiApp {
     /// Splice a sidebar-click fragment into the query and re-run it.
     fn apply_filter(&mut self, fragment: &str) {
         self.splice_filter(fragment);
-        match run_query(&self.cat, &self.query) {
+        match run_query(&self.cat, &self.query, self.rating_filter) {
             Ok(rows) => {
                 self.rows = rows;
                 self.selected = 0;
@@ -487,7 +509,7 @@ impl GuiApp {
             )),
             Err(e) => Some(format!("rate failed: {e}")),
         };
-        if let Ok(rows) = run_query(&self.cat, &self.query) {
+        if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
             self.rows = rows;
         }
     }
@@ -583,7 +605,7 @@ impl GuiApp {
                 if was_focused
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
-                    match run_query(&self.cat, &self.query) {
+                    match run_query(&self.cat, &self.query, self.rating_filter) {
                         Ok(rows) => {
                             self.rows = rows;
                             self.selected = 0;
@@ -600,6 +622,30 @@ impl GuiApp {
                         self.rows.len(),
                         self.multi_selected.len()
                     ));
+                }
+            });
+            ui.horizontal(|ui| {
+                // Independent checkboxes rather than a single `rating>=N`
+                // typed into the query -- lets "2 and 5, nothing else" be
+                // picked in one step, which a single threshold can't
+                // express. ANDed onto the query as a separate structural
+                // filter (see `run_query`), not spliced into the query text.
+                ui.label("rating:");
+                let mut changed = false;
+                for n in 1..=5usize {
+                    changed |= ui
+                        .checkbox(&mut self.rating_filter[n - 1], n.to_string())
+                        .changed();
+                }
+                if changed {
+                    match run_query(&self.cat, &self.query, self.rating_filter) {
+                        Ok(rows) => {
+                            self.rows = rows;
+                            self.selected = 0;
+                            self.query_error = None;
+                        }
+                        Err(e) => self.query_error = Some(e.to_string()),
+                    }
                 }
             });
             ui.horizontal(|ui| {
@@ -1175,7 +1221,7 @@ impl GuiApp {
             }
         }
         if rescanned {
-            if let Ok(rows) = run_query(&self.cat, &self.query) {
+            if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
                 self.rows = rows;
             }
             self.reload_sidebar();

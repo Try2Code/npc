@@ -120,7 +120,7 @@ impl TrashView {
 /// `[`/`]` step between them and clamp at the ends (like `grid_cols`'s
 /// `+`/`-`, not wrapping) rather than jumping from Year back to Day.
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Granularity {
+pub(crate) enum Granularity {
     Day,
     Week,
     Month,
@@ -128,7 +128,7 @@ enum Granularity {
 }
 
 impl Granularity {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Granularity::Day => "day",
             Granularity::Week => "week",
@@ -137,7 +137,7 @@ impl Granularity {
         }
     }
 
-    fn coarser(self) -> Self {
+    pub(crate) fn coarser(self) -> Self {
         match self {
             Granularity::Day => Granularity::Week,
             Granularity::Week => Granularity::Month,
@@ -145,7 +145,7 @@ impl Granularity {
         }
     }
 
-    fn finer(self) -> Self {
+    pub(crate) fn finer(self) -> Self {
         match self {
             Granularity::Day | Granularity::Week => Granularity::Day,
             Granularity::Month => Granularity::Week,
@@ -157,10 +157,86 @@ impl Granularity {
 /// One bar in the timeline: a span of capture time, how many stacks fall in
 /// it, and the query fragment that selects exactly them.
 #[derive(Debug, Clone)]
-struct TimelineBucket {
-    label: String,
-    filter: String,
-    count: i64,
+pub(crate) struct TimelineBucket {
+    pub(crate) label: String,
+    pub(crate) filter: String,
+    pub(crate) count: i64,
+}
+
+/// Whole-library bucket counts at `granularity`, computed live in SQL rather
+/// than through any persisted table -- shared by `tui.rs`'s own
+/// `reload_timeline` (which layers cursor/offset bookkeeping on top) and
+/// `gui.rs`'s equivalent, so the two front ends can never disagree about
+/// what a bucket contains. See `App::reload_timeline`'s doc comment for why
+/// this is a full scan rather than an indexed lookup, and why that's fine.
+pub(crate) fn compute_timeline(
+    cat: &Catalog,
+    granularity: Granularity,
+    trash_view: TrashView,
+) -> Result<Vec<TimelineBucket>> {
+    let sql = match granularity {
+        Granularity::Day => {
+            "SELECT date(f.capture_time,'unixepoch'),
+                    date(f.capture_time,'unixepoch'),
+                    COUNT(DISTINCT f.stack_id)
+             FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
+             GROUP BY date(f.capture_time,'unixepoch')
+             ORDER BY date(f.capture_time,'unixepoch')"
+        }
+        // SQLite's 'weekday 0' modifier moves forward to the next Sunday;
+        // backing that up 6 days lands on the Monday of the same week, so
+        // this needs no date math of its own.
+        Granularity::Week => {
+            "SELECT date(f.capture_time,'unixepoch','weekday 0','-6 days'),
+                    date(f.capture_time,'unixepoch','weekday 0'),
+                    COUNT(DISTINCT f.stack_id)
+             FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
+             GROUP BY date(f.capture_time,'unixepoch','weekday 0','-6 days')
+             ORDER BY date(f.capture_time,'unixepoch','weekday 0','-6 days')"
+        }
+        Granularity::Month => {
+            "SELECT strftime('%Y-%m', f.capture_time,'unixepoch'),
+                    strftime('%Y-%m', f.capture_time,'unixepoch'),
+                    COUNT(DISTINCT f.stack_id)
+             FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
+             GROUP BY strftime('%Y-%m', f.capture_time,'unixepoch')
+             ORDER BY strftime('%Y-%m', f.capture_time,'unixepoch')"
+        }
+        Granularity::Year => {
+            "SELECT strftime('%Y', f.capture_time,'unixepoch'),
+                    strftime('%Y', f.capture_time,'unixepoch'),
+                    COUNT(DISTINCT f.stack_id)
+             FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
+             GROUP BY strftime('%Y', f.capture_time,'unixepoch')
+             ORDER BY strftime('%Y', f.capture_time,'unixepoch')"
+        }
+    };
+    let sql = sql.replace("{trash}", &trash_view.clause("f.stack_id"));
+
+    Ok(cat
+        .conn
+        .prepare(&sql)?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .filter_map(std::result::Result::ok)
+        .map(|(start, end, count)| {
+            let filter = if start == end {
+                format!("date:{start}")
+            } else {
+                format!("date:{start}..{end}")
+            };
+            TimelineBucket {
+                label: start,
+                filter,
+                count,
+            }
+        })
+        .collect())
 }
 
 #[derive(PartialEq)]
@@ -550,70 +626,7 @@ impl App {
             .get(self.timeline_cursor)
             .map(|b| b.label.clone());
 
-        let sql = match self.granularity {
-            Granularity::Day => {
-                "SELECT date(f.capture_time,'unixepoch'),
-                        date(f.capture_time,'unixepoch'),
-                        COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
-                 GROUP BY date(f.capture_time,'unixepoch')
-                 ORDER BY date(f.capture_time,'unixepoch')"
-            }
-            // SQLite's 'weekday 0' modifier moves forward to the next
-            // Sunday; backing that up 6 days lands on the Monday of the
-            // same week, so this needs no date math of its own.
-            Granularity::Week => {
-                "SELECT date(f.capture_time,'unixepoch','weekday 0','-6 days'),
-                        date(f.capture_time,'unixepoch','weekday 0'),
-                        COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
-                 GROUP BY date(f.capture_time,'unixepoch','weekday 0','-6 days')
-                 ORDER BY date(f.capture_time,'unixepoch','weekday 0','-6 days')"
-            }
-            Granularity::Month => {
-                "SELECT strftime('%Y-%m', f.capture_time,'unixepoch'),
-                        strftime('%Y-%m', f.capture_time,'unixepoch'),
-                        COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
-                 GROUP BY strftime('%Y-%m', f.capture_time,'unixepoch')
-                 ORDER BY strftime('%Y-%m', f.capture_time,'unixepoch')"
-            }
-            Granularity::Year => {
-                "SELECT strftime('%Y', f.capture_time,'unixepoch'),
-                        strftime('%Y', f.capture_time,'unixepoch'),
-                        COUNT(DISTINCT f.stack_id)
-                 FROM file f WHERE f.capture_time IS NOT NULL AND {trash}
-                 GROUP BY strftime('%Y', f.capture_time,'unixepoch')
-                 ORDER BY strftime('%Y', f.capture_time,'unixepoch')"
-            }
-        };
-        let sql = sql.replace("{trash}", &self.trash_view.clause("f.stack_id"));
-
-        self.timeline = self
-            .cat
-            .conn
-            .prepare(&sql)?
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?
-            .filter_map(Result::ok)
-            .map(|(start, end, count)| {
-                let filter = if start == end {
-                    format!("date:{start}")
-                } else {
-                    format!("date:{start}..{end}")
-                };
-                TimelineBucket {
-                    label: start,
-                    filter,
-                    count,
-                }
-            })
-            .collect();
+        self.timeline = compute_timeline(&self.cat, self.granularity, self.trash_view)?;
 
         self.timeline_cursor = previous
             .and_then(|label| self.timeline.iter().position(|b| b.label == label))

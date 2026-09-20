@@ -17,11 +17,12 @@
 // window can be in. Same justification as the equivalent allow in thumbs.rs.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use crate::action::{self, Action};
 use crate::config::{Config, Theme};
 use crate::db::Catalog;
 use crate::edit::{self, Change};
 use crate::exif;
-use crate::tui::TrashView;
+use crate::tui::{compute_timeline, Granularity, TimelineBucket, TrashView};
 use crate::watch;
 use crate::{query, thumbs, vol};
 use anyhow::{anyhow, Result};
@@ -331,6 +332,20 @@ struct GuiApp {
     /// config or failed to start -- either way, just "no automatic
     /// cataloging this session," never fatal to launching the GUI.
     watcher: Option<watch::Watcher>,
+    /// The `a` menu, ported from `tui.rs`: configured external programs
+    /// (RawTherapee, GIMP, ...) launched against the current selection.
+    /// Same `action::load()`/`action::gather()`/`action::run()` the TUI
+    /// uses, so a program configured once works from either front end.
+    actions: Vec<Action>,
+    show_actions: bool,
+    /// Whole-library bucket counts over time, independent of `query` -- a
+    /// navigation aid, same as `tui.rs`'s timeline, and computed by the
+    /// same shared `tui::compute_timeline` so the two front ends can never
+    /// disagree about what a bucket contains. No cursor/offset here: a
+    /// click fires `apply_filter` immediately, there's nothing to "have
+    /// focus" the way the TUI's keyboard-driven bar needs.
+    timeline: Vec<TimelineBucket>,
+    timeline_granularity: Granularity,
 }
 
 impl GuiApp {
@@ -364,8 +379,13 @@ impl GuiApp {
             tile_px: DEFAULT_TILE_PX,
             theme,
             tag_input: String::new(),
+            actions: action::load(),
+            show_actions: false,
+            timeline: Vec::new(),
+            timeline_granularity: Granularity::Month,
         };
         app.reload_sidebar();
+        app.reload_timeline();
         app
     }
 
@@ -441,6 +461,16 @@ impl GuiApp {
             .unwrap_or_default();
     }
 
+    /// Whole-library bucket counts at `self.timeline_granularity` -- see
+    /// `tui::compute_timeline`'s doc comment for why this is a full scan
+    /// and why that's fine. No cursor to preserve across a granularity
+    /// change here (unlike `tui.rs`'s `reload_timeline`): a click always
+    /// re-derives its filter fresh from the bucket clicked.
+    fn reload_timeline(&mut self) {
+        self.timeline = compute_timeline(&self.cat, self.timeline_granularity, TrashView::Exclude)
+            .unwrap_or_default();
+    }
+
     /// Bring a sidebar click into `query` without discarding anything typed
     /// alongside it. Ported verbatim from `tui.rs`'s method of the same
     /// name and the same comment: if the fragment from the *previous* click
@@ -485,6 +515,64 @@ impl GuiApp {
             .map(|r| r.id)
             .into_iter()
             .collect()
+    }
+
+    /// Launch a configured action against the current selection. Mirrors
+    /// `tui.rs`'s `run_action` -- same protected-root guard (a program this
+    /// one launches, e.g. RawTherapee, is not bound by *this* program's
+    /// write guard, so a protected library must never reach one), same
+    /// `action::gather`/`action::run` pair. No `online` check here, unlike
+    /// the TUI: `run()` below already refuses to open the GUI at all when
+    /// the library isn't mounted, so there's no in-session offline state to
+    /// guard against.
+    fn run_action(&mut self, key: char) {
+        let Some(a) = self
+            .actions
+            .iter()
+            .find(|a| a.key == key.to_string())
+            .cloned()
+        else {
+            self.status = Some(format!("no action bound to `{key}`"));
+            return;
+        };
+        let ids = self.targets();
+
+        for &sid in &ids {
+            let dir: String =
+                match self
+                    .cat
+                    .conn
+                    .query_row("SELECT dir FROM stack WHERE id = ?1", [sid], |r| r.get(0))
+                {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+            if self
+                .config
+                .ensure_mutable(std::path::Path::new(&dir))
+                .is_err()
+            {
+                self.status = Some(format!(
+                    "{} not launched: {} is protected, and an external editor \
+                     cannot be stopped from writing there",
+                    a.name, dir
+                ));
+                return;
+            }
+        }
+
+        let current = self.rows.get(self.selected).map(|r| r.id);
+        let sel = match action::gather(&self.cat, &ids, current, &self.query) {
+            Ok(sel) => sel,
+            Err(e) => {
+                self.status = Some(format!("{}: {e}", a.name));
+                return;
+            }
+        };
+        self.status = Some(match action::run(&a, &sel) {
+            Ok(outcome) => outcome.description,
+            Err(e) => format!("{}: {e}", a.name),
+        });
     }
 
     /// Set (or clear, for `None`) the star rating of every target. Mirrors
@@ -647,8 +735,7 @@ impl GuiApp {
                         Err(e) => self.query_error = Some(e.to_string()),
                     }
                 }
-            });
-            ui.horizontal(|ui| {
+                ui.separator();
                 ui.label("zoom:");
                 ui.add(egui::Slider::new(
                     &mut self.tile_px,
@@ -667,6 +754,11 @@ impl GuiApp {
                     };
                     ui.ctx().set_visuals(visuals_for(self.theme));
                 }
+                if ui.button("actions").clicked() {
+                    self.show_actions = true;
+                }
+                ui.separator();
+                self.draw_timeline(ui);
             });
             if let Some(err) = &self.query_error {
                 ui.colored_label(egui::Color32::RED, err);
@@ -675,6 +767,75 @@ impl GuiApp {
                 ui.label(s);
             }
         });
+    }
+
+    /// The whole-library timeline bar, ported from `tui.rs`'s keyboard-
+    /// driven bar chart -- click-driven here instead: this is a mouse-first
+    /// UI, so pointing at a bar directly replaces the TUI's focus-then-
+    /// arrow-keys dance, and there's no on-screen cursor to draw. Assumed
+    /// to be drawn as the last widget in its row (see `draw_query_bar`): it
+    /// claims whatever width remains.
+    fn draw_timeline(&mut self, ui: &mut egui::Ui) {
+        const BAR_W: f32 = 5.0;
+        const BAR_H: f32 = 28.0;
+        ui.label("timeline:");
+        if ui.small_button("-").clicked() {
+            self.timeline_granularity = self.timeline_granularity.finer();
+            self.reload_timeline();
+        }
+        ui.label(self.timeline_granularity.label());
+        if ui.small_button("+").clicked() {
+            self.timeline_granularity = self.timeline_granularity.coarser();
+            self.reload_timeline();
+        }
+        if self.timeline.is_empty() {
+            return;
+        }
+
+        let max_count = self
+            .timeline
+            .iter()
+            .map(|b| b.count)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let (rect, _resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), BAR_H),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        // Right-aligned, most-recent-first: only as many bars as fit are
+        // drawn, and they're the *last* ones in the library rather than the
+        // first, so "did today's import land" never needs scrolling to find
+        // the right edge -- there's no scrollbar here at all, unlike
+        // `tui.rs`'s `timeline_offset`.
+        let max_bars = (rect.width() / BAR_W).floor() as usize;
+        let start = self.timeline.len().saturating_sub(max_bars.max(1));
+        let mut clicked: Option<String> = None;
+        for (i, bucket) in self.timeline[start..].iter().enumerate() {
+            let x0 = rect.left() + i as f32 * BAR_W;
+            let frac = bucket.count as f32 / max_count as f32;
+            let h = (BAR_H * frac).max(1.0);
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.bottom() - h),
+                egui::pos2(x0 + BAR_W - 1.0, rect.bottom()),
+            );
+            let id = ui.id().with("timeline_bar").with(start + i);
+            let bar_resp = ui.interact(bar_rect, id, egui::Sense::click());
+            let color = if bar_resp.hovered() {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            };
+            painter.rect_filled(bar_rect, 0.0, color);
+            if bar_resp.clicked() {
+                clicked = Some(bucket.filter.clone());
+            }
+            bar_resp.on_hover_text(format!("{}: {}", bucket.label, bucket.count));
+        }
+        if let Some(fragment) = clicked {
+            self.apply_filter(&fragment);
+        }
     }
 
     /// Events / Tags / Folders, each a `CollapsingHeader` section in a left
@@ -947,6 +1108,103 @@ impl GuiApp {
             .map(|(_, n)| n);
         if let Some(n) = action {
             self.rate_selected(n);
+        }
+    }
+
+    /// The `a` menu, ported from `tui.rs`'s `show_actions` overlay: `a`
+    /// opens it (guarded by the same text-field-focus check as every other
+    /// key handler here, so typing "a" into the query box stays just
+    /// typing), Escape closes it without running anything, and any other
+    /// letter key while it's open attempts that action and closes the menu
+    /// -- the same catch-all `KeyCode::Char(c) if self.show_actions` the
+    /// TUI uses, including reporting "no action bound" for an unmapped key
+    /// rather than silently doing nothing.
+    fn handle_action_keys(&mut self, ui: &egui::Ui) {
+        const LETTERS: [(egui::Key, char); 26] = [
+            (egui::Key::A, 'a'),
+            (egui::Key::B, 'b'),
+            (egui::Key::C, 'c'),
+            (egui::Key::D, 'd'),
+            (egui::Key::E, 'e'),
+            (egui::Key::F, 'f'),
+            (egui::Key::G, 'g'),
+            (egui::Key::H, 'h'),
+            (egui::Key::I, 'i'),
+            (egui::Key::J, 'j'),
+            (egui::Key::K, 'k'),
+            (egui::Key::L, 'l'),
+            (egui::Key::M, 'm'),
+            (egui::Key::N, 'n'),
+            (egui::Key::O, 'o'),
+            (egui::Key::P, 'p'),
+            (egui::Key::Q, 'q'),
+            (egui::Key::R, 'r'),
+            (egui::Key::S, 's'),
+            (egui::Key::T, 't'),
+            (egui::Key::U, 'u'),
+            (egui::Key::V, 'v'),
+            (egui::Key::W, 'w'),
+            (egui::Key::X, 'x'),
+            (egui::Key::Y, 'y'),
+            (egui::Key::Z, 'z'),
+        ];
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        if self.show_actions {
+            let mut close = false;
+            let mut fire: Option<char> = None;
+            ui.ctx().input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    close = true;
+                }
+                if let Some((_, c)) = LETTERS.into_iter().find(|(k, _)| i.key_pressed(*k)) {
+                    fire = Some(c);
+                }
+            });
+            if let Some(c) = fire {
+                self.show_actions = false;
+                self.run_action(c);
+            } else if close {
+                self.show_actions = false;
+            }
+        } else if ui.ctx().input(|i| i.key_pressed(egui::Key::A)) {
+            self.show_actions = true;
+        }
+    }
+
+    /// The `a` menu's popup, ported from `tui.rs`'s overlay of the same
+    /// purpose: lists every configured action next to its key. Clicking a
+    /// row fires it directly -- a mouse affordance the TUI's text-only
+    /// overlay has no equivalent of -- and the keys `handle_action_keys`
+    /// handles still work while this is open.
+    fn draw_actions_menu(&mut self, ui: &mut egui::Ui) {
+        if !self.show_actions {
+            return;
+        }
+        let mut close = false;
+        let mut fire: Option<char> = None;
+        egui::Window::new("actions")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                if self.actions.is_empty() {
+                    ui.label("no actions available (none of the configured programs are on PATH)");
+                }
+                for a in &self.actions {
+                    if ui.button(format!("{}  {}", a.key, a.name)).clicked() {
+                        fire = a.key.chars().next();
+                    }
+                }
+                if ui.button("cancel").clicked() {
+                    close = true;
+                }
+            });
+        if let Some(c) = fire {
+            self.show_actions = false;
+            self.run_action(c);
+        } else if close {
+            self.show_actions = false;
         }
     }
 
@@ -1225,6 +1483,7 @@ impl GuiApp {
                 self.rows = rows;
             }
             self.reload_sidebar();
+            self.reload_timeline();
         }
     }
 }
@@ -1242,18 +1501,28 @@ impl eframe::App for GuiApp {
         self.draw_query_bar(ui);
         self.draw_sidebar(ui);
         self.draw_info_panel(ui);
+        self.handle_action_keys(ui);
         match self.mode {
             Mode::Grid => {
-                self.handle_nav_keys(ui);
-                self.handle_rating_keys(ui);
+                // While the actions menu is open, every other key is its
+                // input (see `handle_action_keys`) -- same early-exit
+                // `tui.rs`'s `on_key` does for `show_actions`, so e.g. its
+                // digit keys can't also rate the tile underneath it.
+                if !self.show_actions {
+                    self.handle_nav_keys(ui);
+                    self.handle_rating_keys(ui);
+                }
                 self.draw_grid(ui);
             }
             Mode::Single => {
-                self.handle_single_keys(ui);
-                self.handle_rating_keys(ui);
+                if !self.show_actions {
+                    self.handle_single_keys(ui);
+                    self.handle_rating_keys(ui);
+                }
                 self.draw_single(ui);
             }
         }
+        self.draw_actions_menu(ui);
         self.poll_thumbnail_generation(ui.ctx());
     }
 }

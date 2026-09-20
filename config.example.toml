@@ -106,6 +106,12 @@ cmd  = ["gimp", "{jpg}"]
 mode = "detach"
 
 [[action]]
+key  = "j"
+name = "RawTherapee (JPG)"
+cmd  = ["rawtherapee", "{jpg}"]
+mode = "detach"
+
+[[action]]
 key  = "o"
 name = "Open"
 cmd  = ["xdg-open", "{file}"]

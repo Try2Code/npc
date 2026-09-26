@@ -17,6 +17,8 @@ reaches past Rust into the operating system — and there are only three.
 | Rust dependencies | portable, nothing to do |
 | SQLite | vendored and compiled from source by `rusqlite` — nothing to install |
 | The TUI (ratatui/crossterm) | works; terminal graphics are better on macOS than Linux |
+| The GUI (`npcg`, egui/eframe/wgpu) | portable; wgpu targets Metal natively, no protocol to negotiate at all |
+| The background watcher (`notify`) | portable (FSEvents backend) but **verify, don't assume** — see §8 |
 | **Exiv2** | needs installing, and `pkg-config` needs to find it |
 | **`src/vol.rs`** | **the real work** — 74 of its 167 lines are Linux-only |
 | `check`, `fetch-test-data` | two GNU-only commands to replace |
@@ -264,7 +266,43 @@ to find the right value before writing it into the config.
 Asking for more forces a full-resolution decode per frame, which is a 6x
 slowdown for no visible gain.
 
-## 7. Order of work
+## 7. The GUI (`npcg`)
+
+Nothing here needs porting the way `vol.rs` does — `npcg` draws its own
+window via `wgpu`, which targets Metal on macOS directly, so there is no
+kitty/sixel-style protocol negotiation to redo and no equivalent of
+`npc term` to run first. Once `vol.rs` (§3) is ported, `npcg` gets it for
+free: it calls the same `vol::identify`, the same `action.rs`, the same
+`Config::path()`. Two things specific to it are worth checking rather than
+assuming, in the spirit of §3's own "verify it" section:
+
+- **The background watcher's behavior under FSEvents.** `watch.rs`'s
+  directory-creation race fix (arming a rescan on `EventKind::Create
+  (CreateKind::Folder)` for the directory *itself*, not its parent — see
+  the doc comment on `qualifying_dir`) was confirmed against `notify`'s
+  **inotify** backend specifically, by reading its source and by a
+  dedicated integration test. FSEvents coalesces and delays events
+  differently (it is directory-granularity by design, and can report a
+  batch of changes well after they happened), so that specific test
+  (`a_subdirectory_created_after_the_watcher_starts_is_still_caught`) needs
+  rerunning on macOS, not assumed to pass because it passes on Linux — this
+  project has been bitten before by assuming one platform's event semantics
+  apply to another's (see `vol.rs`'s own history in §3, and CLAUDE.md's
+  "measure rather than reason about performance").
+- **The default `Open` action's `xdg-open` is Linux-only.** macOS has no
+  `xdg-open`; the equivalent is `open`. `action::load()`'s `on_path()` check
+  already makes this a silent no-op rather than a crash (the action simply
+  does not appear in the menu), but it is worth fixing in config rather than
+  leaving the menu one entry short:
+  ```toml
+  [[action]]
+  key  = "o"
+  name = "Open"
+  cmd  = ["open", "{file}"]
+  mode = "detach"
+  ```
+
+## 8. Order of work
 
 1. Install prerequisites; confirm `pkg-config --modversion exiv2` and
    `have_xmptoolkit=1`.
@@ -277,6 +315,11 @@ slowdown for no visible gain.
 7. Fix `check` and `fetch-test-data` for BSD tools.
 8. Verify against a real removable drive, **including ejected**.
 9. `npc term`, then the TUI, in one of the image-capable terminals.
+10. `cargo build --release --bin npcg`; rerun
+    `a_subdirectory_created_after_the_watcher_starts_is_still_caught` (and
+    the rest of `tests/watch_integration.rs`) to confirm FSEvents still
+    catches the same race inotify does (§7) -- do not assume it from the
+    Linux result.
 
 Steps 1–4 are an hour. Step 5 is the port. Step 8 is the one that will find
 the bug.

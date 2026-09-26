@@ -14,6 +14,11 @@ npc find 'beach rating>=4'     # select
 npc tui                        # browse
 ```
 
+A native GUI (`npcg`) covers the same core -- grid/single view, tagging,
+rating, the query language, a clickable timeline, the same action menu -- for
+anyone who would rather point and click. The TUI remains the primary,
+more complete interface; see [The browser](#the-browser).
+
 **Written entirely by an AI agent, with no manual coding.** If that is why you
 are here, [How this was built](#how-this-was-built) is the honest account and
 comes first.
@@ -191,10 +196,15 @@ and export presets:
 library = "~/Pictures"                      # used when no root is given
 protected_roots = ["/media/me/Archive"]     # never written to, ever
 
+export_dir = "~/Pictures/graded"             # default -o/--out for `npc export`
+
 [thumbs]
 grid_px = 1280      # long edge for grid tiles
 view_px = 1620      # match your RAW's preview tier; higher is much slower
 quality = 80
+
+[watch]
+enabled = true      # auto-catalog new files that appear while tui/npcg is open
 
 [[action]]                                  # what the `a` menu launches
 key  = "r"
@@ -213,7 +223,7 @@ cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 |---|---|
 | `scan` `find` `tags` | build the catalog and query it |
 | `tag` `rate` `mark` `set` `rotate` | edit metadata, written to sidecars |
-| `tui` | the browser: list, grid, single-image |
+| `tui` / `npcg` | the browser (terminal / native GUI): list, grid, single-image |
 | `import` `dupes` `trash` `untrash` | ingest from a card, find copies, reversible delete |
 | `export` `exec` `thumbs` | resized copies, run an action, pre-warm thumbnails |
 | `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state |
@@ -271,6 +281,12 @@ stacks) turns the page automatically. Every text prompt (`/`, `t`, `T`, `i`)
 supports normal line editing: arrow keys, Home/End, and readline's
 `ctrl-a/e/b/f/k/u/w`.
 
+`npcg` covers the same ground with the mouse: a sidebar (events, tags,
+folders) to filter by, five rating checkboxes instead of typing
+`rating>=N`, a clickable timeline bar in place of the TUI's keyboard-driven
+one, and the same configured action menu. Not ported: the pan/zoom-drag-crop
+single view, RAW/JPG member cycling, and undo -- those stay TUI-only.
+
 ## What it will not do
 
 - **Edit pixels.** Crop, colour and retouching belong in RawTherapee, which
@@ -290,16 +306,26 @@ themselves say so rather than failing obscurely.
 ## Coverage
 
 ```
-stack.rs   97%   query.rs   93%   edit.rs    92%   export.rs  91%
-import.rs  89%   doctor.rs  89%   trash.rs   89%   scan.rs    81%
-tui.rs     79%   thumbs.rs  79%   vol.rs     80%   action.rs  65%
-                                              TOTAL 84% regions
+stack.rs   97%   query.rs   94%   edit.rs    91%   export.rs  92%
+import.rs  93%   doctor.rs  84%   trash.rs   89%   scan.rs    86%
+tui.rs     82%   watch.rs   93%   vol.rs     81%   action.rs  64%
+gui.rs     14%   bin/npcg.rs 0%
+                                              TOTAL 79% regions
 ```
 
 The C++ shim is **not** in that number. Rust coverage does not cross the FFI
 boundary, so `meta/mod.rs` reads as covered while `shim.cc` — the file that
 actually writes to disk — is measured by nothing. It is covered behaviourally
 instead, by the invariant tests, which is the coverage that matters for it.
+
+`gui.rs` and `bin/npcg.rs` pull the total down the same way: `tui.rs` gets
+its interaction logic tested headlessly and its rendering tested through
+ratatui's `TestBackend`, but egui has no equivalent of feeding it synthetic
+frames and asserting on the result, so only `gui.rs`'s pure-function logic
+(tag-tree grouping, month bucketing) has automated tests — the drawing and
+event-handling code is verified the same way `tui.rs`'s testing notes
+describe for a real kitty terminal: by running it, against the real library,
+by hand.
 
 ## Portability
 

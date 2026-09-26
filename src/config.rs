@@ -179,12 +179,22 @@ pub struct Config {
     /// rebuildable, so relocating it costs a rescan and nothing else.
     #[serde(default)]
     pub catalog_dir: Option<PathBuf>,
+    /// Default destination for `npc export`, used when `-o`/`--out` is not
+    /// given on the command line. Same "one central place instead of typing
+    /// it every time" role `library` plays for `--root`.
+    #[serde(default)]
+    pub export_dir: Option<PathBuf>,
 }
 
 impl Config {
     /// The configured library, with `~` expanded.
     pub fn library_root(&self) -> Option<PathBuf> {
         self.library.as_deref().map(expand_home)
+    }
+
+    /// The configured default export destination, with `~` expanded.
+    pub fn default_export_dir(&self) -> Option<PathBuf> {
+        self.export_dir.as_deref().map(expand_home)
     }
 
     /// Where catalogs are kept, honouring `catalog_dir` if it is set.
@@ -335,6 +345,21 @@ mod tests {
         assert_eq!(
             c.library_root(),
             Some(PathBuf::from(home).join("Pictures/library"))
+        );
+    }
+
+    #[test]
+    fn export_dir_defaults_to_none_and_expands_home() {
+        assert!(Config::default().default_export_dir().is_none());
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let c = Config {
+            export_dir: Some(PathBuf::from("~/Pictures/graded")),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.default_export_dir(),
+            Some(PathBuf::from(home).join("Pictures/graded"))
         );
     }
 

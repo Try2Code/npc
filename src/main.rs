@@ -178,9 +178,10 @@ enum Cmd {
         /// Which stacks
         #[arg(short = 'q', long)]
         query: Option<String>,
-        /// Where the copies go. Must be outside the library.
+        /// Where the copies go. Must be outside the library. Falls back to
+        /// `export_dir` in config.toml when not given.
         #[arg(short = 'o', long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
         #[arg(long)]
         root: Option<PathBuf>,
         /// Long edge in pixels
@@ -410,6 +411,23 @@ fn library(explicit: Option<&Path>) -> Result<PathBuf> {
     anyhow::bail!(
         "no library given. Pass --root <path>, or set one in {}:\n\n    \
          library = \"~/Pictures\"",
+        npc::config::Config::path().display()
+    )
+}
+
+fn export_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(o) = explicit {
+        return Ok(o.to_path_buf());
+    }
+    if let Some(o) = npc::config::Config::load()
+        .unwrap_or_default()
+        .default_export_dir()
+    {
+        return Ok(o);
+    }
+    anyhow::bail!(
+        "no export destination given. Pass -o/--out <path>, or set one in {}:\n\n    \
+         export_dir = \"~/Pictures/graded\"",
         npc::config::Config::path().display()
     )
 }
@@ -1629,6 +1647,7 @@ fn main() -> Result<()> {
 
             let config = npc::config::Config::load()?;
             let root = library(root.as_deref())?;
+            let out = export_dir(out.as_deref())?;
 
             let cat = require_online(&root)?;
             let target = Target {

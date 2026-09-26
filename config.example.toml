@@ -19,6 +19,10 @@
 # `npc scan --full`, so relocating this costs a rescan and nothing more.
 #catalog_dir = "~/photo-catalogs"
 
+# Default destination for `npc export`, used when -o/--out is not given on
+# the command line -- one central place instead of typing it every time.
+#export_dir = "~/Pictures/graded"
+
 # Thumbnail sizing -- the right values depend on your screen and your
 # camera's RAW preview tiers, which the program cannot see and you can.
 [thumbs]

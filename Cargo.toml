@@ -1,6 +1,6 @@
 [package]
 name = "npc"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
 

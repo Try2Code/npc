@@ -88,7 +88,7 @@ impl Watcher {
 /// (`import::date_path()`'s `YYYY/MM/DD` convention) and the trash. Neither
 /// is ever written to by hand -- trash operations in particular move files
 /// *into* `.trash`, which would otherwise look exactly like a new import.
-fn is_reserved_top_level(name: &str) -> bool {
+pub(crate) fn is_reserved_top_level(name: &str) -> bool {
     name == crate::trash::TRASH_DIR || (name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -96,7 +96,15 @@ fn is_reserved_top_level(name: &str) -> bool {
 /// top-level directory of `library_root`. A path outside `library_root`
 /// entirely (shouldn't happen; `notify` only reports what it's watching)
 /// is conservatively treated as not excluded.
-fn is_excluded(library_root: &Path, path: &Path, extra: &[String]) -> bool {
+///
+/// Shared with `export::check_target`: the dated import tree and `.trash`
+/// are the only parts of the library `npc import`/trash operations ever
+/// write to by themselves, so they're the only parts a *different* writer
+/// (an export preset, another process) risks colliding with. Everywhere
+/// else -- `export/`, or any other subtree -- is exactly what the watcher
+/// exists to pick up automatically, so `export` writing there is the
+/// intended pipeline, not a hazard to refuse.
+pub(crate) fn is_excluded(library_root: &Path, path: &Path, extra: &[String]) -> bool {
     let Ok(rel) = path.strip_prefix(library_root) else {
         return false;
     };

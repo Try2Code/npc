@@ -20,6 +20,7 @@
 
 use crate::config::Config;
 use crate::db::Catalog;
+use crate::watch;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -104,9 +105,19 @@ fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<ExportSource>> {
     }
 }
 
-/// Refuse to export into a library. Writing copies next to originals is how a
-/// library grows files nobody meant to keep, and the resized copy would be
-/// picked up by the next scan as though it were a shot.
+/// Refuse to export into the one part of the library that's actually
+/// reserved: the dated import tree (`import`'s own `YYYY/MM/DD` convention)
+/// and `.trash`. Those are the only places *npc itself* writes new stacks
+/// into by itself, so they're the only places a different writer risks
+/// colliding with -- landing a copy in `2026/08/09` would be indistinguishable
+/// from a real import, and landing one in `.trash` would look like something
+/// on its way out rather than in.
+///
+/// Everywhere else in the library -- `export/`, or any other subtree -- is
+/// deliberately *not* refused: that's exactly what the background watcher
+/// (`watch.rs`) exists to pick up automatically, and reusing its own
+/// `is_excluded` here means the two features can never disagree about what
+/// counts as reserved.
 pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()> {
     config.ensure_mutable(target)?;
 
@@ -116,10 +127,12 @@ pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()
     let l = library
         .canonicalize()
         .unwrap_or_else(|_| library.to_path_buf());
-    if t.starts_with(&l) {
+    if watch::is_excluded(&l, &t, &config.watch.exclude) {
         bail!(
-            "refusing to export into {} -- it is inside the library at {}.\n\
-             The copies would be scanned back in as though they were shots.",
+            "refusing to export into {} -- it is inside the dated import tree \
+             or trash under {}.\n\
+             Those are reserved for npc's own writes; anywhere else in the \
+             library (export/, or any other subtree) is fine.",
             target.display(),
             library.display()
         );
@@ -288,15 +301,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exporting_into_the_library_is_refused() {
+    fn exporting_outside_the_dated_tree_and_trash_is_allowed() {
         let lib = tempfile::tempdir().unwrap();
-        let inside = lib.path().join("exports");
         let outside = tempfile::tempdir().unwrap();
         let cfg = Config::default();
 
-        assert!(check_target(&inside, lib.path(), &cfg).is_err());
-        assert!(check_target(lib.path(), lib.path(), &cfg).is_err());
+        // A subfolder anywhere in the library that isn't the dated import
+        // tree or trash -- exactly the export-into-the-library pipeline the
+        // watcher exists to pick up (a spektra/RawTherapee preset writing
+        // into `export/spektra`, say).
+        assert!(check_target(&lib.path().join("export/spektra"), lib.path(), &cfg).is_ok());
+        // The bare library root itself: also not a reserved top-level name,
+        // symmetric with how the watcher would treat a loose file dropped
+        // there.
+        assert!(check_target(lib.path(), lib.path(), &cfg).is_ok());
         assert!(check_target(outside.path(), lib.path(), &cfg).is_ok());
+    }
+
+    #[test]
+    fn exporting_into_the_dated_import_tree_or_trash_is_refused() {
+        let lib = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+
+        assert!(check_target(&lib.path().join("2026/08/09"), lib.path(), &cfg).is_err());
+        assert!(check_target(&lib.path().join(".trash"), lib.path(), &cfg).is_err());
     }
 
     #[test]

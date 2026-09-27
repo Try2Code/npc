@@ -1611,7 +1611,15 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
         });
 
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_icon(icon.unwrap_or_default()),
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(icon.unwrap_or_default())
+            // `with_icon` alone does nothing on Wayland: there is no
+            // protocol for an app to hand the compositor its own window
+            // icon (unlike X11's _NET_WM_ICON). GNOME/Mutter looks the
+            // icon up via this app_id, matched against a `.desktop`
+            // file's own name -- see that file's Icon= key for the actual
+            // installed icon.
+            .with_app_id("npcg"),
         ..Default::default()
     };
 

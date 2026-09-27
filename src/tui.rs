@@ -270,6 +270,23 @@ pub struct App {
     root: PathBuf,
 
     query: String,
+    /// Rating checkboxes, Shotwell-style: `Ctrl+1`..`Ctrl+5` toggles the
+    /// corresponding entry independently, letting "2 and 5, nothing else"
+    /// be selected in one step, which typing `rating>=N` alone can't
+    /// express. Unlike `gui.rs`'s own `rating_filter` (a hidden structural
+    /// AND onto the compiled query, shown via checkboxes), the TUI has no
+    /// checkbox widget to show that state in -- so this is spliced
+    /// directly into the visible `query` text instead (an `(rating=2 or
+    /// rating=5)` fragment, tracked and replaced the same way
+    /// `applied_filter` tracks a sidebar click), and this array exists
+    /// purely to know what to rebuild that fragment into on the next
+    /// toggle, not to filter anything itself.
+    rating_filter: [bool; 5],
+    /// The exact `rating=N` / `(rating=N or ...)` fragment last spliced
+    /// into `query` by `toggle_rating_filter` -- separate from
+    /// `applied_filter` (a sidebar/timeline click) so the two can't clobber
+    /// each other's tracking.
+    rating_query_fragment: Option<String>,
     rows: Vec<Row>,
     total: usize,
     offset: usize,
@@ -403,6 +420,8 @@ impl App {
             actions: action::load(),
             root,
             query: String::new(),
+            rating_filter: [false; 5],
+            rating_query_fragment: None,
             rows: Vec::new(),
             total: 0,
             offset: 0,
@@ -555,6 +574,51 @@ impl App {
         self.reload_sidebar()?;
         self.reload_timeline()?;
         Ok(())
+    }
+
+    /// `Ctrl+1`..`Ctrl+5`: flip one rating checkbox, splice the resulting
+    /// `rating=N` / `(rating=A or rating=B)` fragment into the visible
+    /// query, and reload. `n` is 1-based, matching the key pressed.
+    fn toggle_rating_filter(&mut self, n: usize) -> Result<()> {
+        self.rating_filter[n - 1] = !self.rating_filter[n - 1];
+        let selected: Vec<usize> = (1..=5).filter(|&i| self.rating_filter[i - 1]).collect();
+        let new_fragment = match selected.as_slice() {
+            [] => String::new(),
+            [only] => format!("rating={only}"),
+            many => format!(
+                "({})",
+                many.iter()
+                    .map(|n| format!("rating={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+        };
+
+        // The new fragment is always prepended at the front (below), so
+        // removing the old one is either an exact match (it was the whole
+        // query) or a `<fragment> and ` prefix -- same "only touch it if
+        // it's still there verbatim" rule `splice_filter` uses for a
+        // sidebar/timeline pick.
+        if let Some(prior) = self.rating_query_fragment.take() {
+            if let Some(rest) = self.query.strip_prefix(&format!("{prior} and ")) {
+                self.query = rest.to_string();
+            } else if self.query == prior {
+                self.query.clear();
+            }
+        }
+
+        if new_fragment.is_empty() {
+            self.rating_query_fragment = None;
+        } else {
+            self.query = if self.query.trim().is_empty() {
+                new_fragment.clone()
+            } else {
+                format!("{new_fragment} and {}", self.query)
+            };
+            self.rating_query_fragment = Some(new_fragment);
+        }
+
+        self.reload()
     }
 
     fn reload_sidebar(&mut self) -> Result<()> {
@@ -1097,6 +1161,10 @@ impl App {
                 self.input_cursor = 0;
             }
 
+            KeyCode::Char(c @ '1'..='5') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let n = c.to_digit(10).unwrap() as usize;
+                self.toggle_rating_filter(n)?;
+            }
             KeyCode::Char(c @ '0'..='5') => {
                 let n = i64::from(c.to_digit(10).unwrap());
                 let value = if n == 0 { None } else { Some(n) };
@@ -2333,8 +2401,30 @@ pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
 
+    // Without this, `Ctrl+1`..`Ctrl+5` (the rating-filter shortcut) arrive
+    // indistinguishable from a bare `1`..`5` on most terminals: there is no
+    // legacy escape sequence for Ctrl+digit the way there is for
+    // Ctrl+letter, so the modifier is simply lost. Only terminals
+    // implementing this protocol (kitty among them) can report it at all,
+    // hence the capability check rather than assuming it.
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        crossterm::execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if keyboard_enhanced {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
         previous(info);
@@ -2397,6 +2487,12 @@ pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
         Ok(())
     })();
 
+    if keyboard_enhanced {
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        )?;
+    }
     disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -2460,6 +2556,10 @@ mod tests {
     fn press_code(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
     }
+    fn press_ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            .unwrap();
+    }
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
             press(app, c);
@@ -2472,10 +2572,6 @@ mod tests {
         for c in s.chars() {
             press(app, c);
         }
-    }
-    fn press_ctrl(app: &mut App, c: char) {
-        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-            .unwrap();
     }
 
     #[test]
@@ -3320,6 +3416,72 @@ mod tests {
         press(&mut app, '5');
         assert_eq!(app.rows[1].rating, Some(5));
         assert!(dir.path().join("2026/08/09/750_0002.xmp").exists());
+    }
+
+    /// `Ctrl+N` toggles a rating checkbox and filters; plain `N` still rates
+    /// the cursor row, unaffected -- the two must never both fire from the
+    /// same keypress.
+    #[test]
+    fn ctrl_digit_toggles_a_rating_filter_independently_of_rating_the_cursor() {
+        let (_dir, mut app) = app();
+        press(&mut app, '2'); // rate row 0
+        press_code(&mut app, KeyCode::Down);
+        press(&mut app, '5'); // rate row 1
+        assert_eq!(app.rows.len(), 3, "all 3 stacks visible with no filter");
+
+        press_ctrl(&mut app, '2');
+        assert!(app.rating_filter[1]);
+        assert_eq!(app.query, "rating=2", "spliced into the visible query");
+        assert_eq!(app.rows.len(), 1, "only the rating=2 stack should show");
+        assert_eq!(app.rows[0].rating, Some(2));
+
+        press_ctrl(&mut app, '5');
+        assert_eq!(app.query, "(rating=2 or rating=5)");
+        assert_eq!(
+            app.rows.len(),
+            2,
+            "rating=2 or rating=5 should both show once both are checked"
+        );
+
+        press_ctrl(&mut app, '2');
+        assert!(!app.rating_filter[1]);
+        assert_eq!(app.query, "rating=5");
+        assert_eq!(app.rows.len(), 1, "only the rating=5 stack should remain");
+        assert_eq!(app.rows[0].rating, Some(5));
+
+        press_ctrl(&mut app, '5');
+        assert_eq!(app.query, "", "clearing every box clears the fragment too");
+        assert_eq!(
+            app.rows.len(),
+            3,
+            "clearing every box shows everything again"
+        );
+    }
+
+    /// A rating fragment spliced in by `Ctrl+N` must not clobber, or be
+    /// clobbered by, text the user typed by hand -- same coexistence
+    /// `splice_filter` already gives a sidebar click alongside `/`.
+    #[test]
+    fn rating_filter_coexists_with_hand_typed_query_text() {
+        let (_dir, mut app) = app();
+        press(&mut app, '2');
+        press_code(&mut app, KeyCode::Down);
+        press(&mut app, '5');
+        press(&mut app, '/');
+        type_str(&mut app, "beach");
+
+        press_ctrl(&mut app, '2');
+        assert_eq!(app.query, "rating=2 and beach");
+
+        press_ctrl(&mut app, '5');
+        assert_eq!(app.query, "(rating=2 or rating=5) and beach");
+
+        press_ctrl(&mut app, '2');
+        press_ctrl(&mut app, '5');
+        assert_eq!(
+            app.query, "beach",
+            "clearing every box leaves the hand-typed text untouched"
+        );
     }
 
     /// The grid tile shows only stars, so the status area is the only place

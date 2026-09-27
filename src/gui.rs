@@ -602,6 +602,25 @@ impl GuiApp {
         }
     }
 
+    /// `Ctrl+1`..`Ctrl+5` flips the same array the checkboxes edit directly
+    /// -- shared with their `.changed()` handler in `draw_query_bar` so a
+    /// keypress and a click can never disagree about what happens next.
+    fn toggle_rating_filter(&mut self, n: usize) {
+        self.rating_filter[n - 1] = !self.rating_filter[n - 1];
+        self.refresh_rows_after_rating_filter_change();
+    }
+
+    fn refresh_rows_after_rating_filter_change(&mut self) {
+        match run_query(&self.cat, &self.query, self.rating_filter) {
+            Ok(rows) => {
+                self.rows = rows;
+                self.selected = 0;
+                self.query_error = None;
+            }
+            Err(e) => self.query_error = Some(e.to_string()),
+        }
+    }
+
     /// Comma-separated tag names, same convention as `tui.rs`'s `t`/`T`
     /// prompts: split, trim, drop anything empty. Applies to every target
     /// (the batch selection, or just the cursor when nothing is batched).
@@ -726,14 +745,7 @@ impl GuiApp {
                         .changed();
                 }
                 if changed {
-                    match run_query(&self.cat, &self.query, self.rating_filter) {
-                        Ok(rows) => {
-                            self.rows = rows;
-                            self.selected = 0;
-                            self.query_error = None;
-                        }
-                        Err(e) => self.query_error = Some(e.to_string()),
-                    }
+                    self.refresh_rows_after_rating_filter_change();
                 }
                 ui.separator();
                 ui.label("zoom:");
@@ -1099,12 +1111,41 @@ impl GuiApp {
             (egui::Key::Num4, Some(4)),
             (egui::Key::Num5, Some(5)),
         ];
+        const FILTER_KEYS: [(egui::Key, usize); 5] = [
+            (egui::Key::Num1, 1),
+            (egui::Key::Num2, 2),
+            (egui::Key::Num3, 3),
+            (egui::Key::Num4, 4),
+            (egui::Key::Num5, 5),
+        ];
         if ui.ctx().text_edit_focused() {
+            return;
+        }
+        // `Ctrl+1`..`Ctrl+5` toggle a rating checkbox (Shotwell's
+        // convention); the plain digit below rates the current selection.
+        // Checked first and mutually exclusive via the `else`, since a
+        // physical `Ctrl+3` keypress is still `key_pressed(Num3) == true`
+        // regardless of the held modifier -- without this split it would
+        // fire both.
+        let ctrl_action = ui.ctx().input(|i| {
+            if i.modifiers.ctrl {
+                FILTER_KEYS.into_iter().find(|(k, _)| i.key_pressed(*k))
+            } else {
+                None
+            }
+        });
+        if let Some((_, n)) = ctrl_action {
+            self.toggle_rating_filter(n);
             return;
         }
         let action = ui
             .ctx()
-            .input(|i| KEYS.into_iter().find(|(k, _)| i.key_pressed(*k)))
+            .input(|i| {
+                if i.modifiers.ctrl {
+                    return None;
+                }
+                KEYS.into_iter().find(|(k, _)| i.key_pressed(*k))
+            })
             .map(|(_, n)| n);
         if let Some(n) = action {
             self.rate_selected(n);
@@ -1580,6 +1621,45 @@ mod tests {
         }
     }
 
+    /// A three-stack library on disk, ratings pre-set, so the rating filter
+    /// has something real to narrow -- mirrors `tui.rs`'s own `app()` test
+    /// fixture.
+    fn app() -> (tempfile::TempDir, GuiApp) {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026/08/09");
+        std::fs::create_dir_all(&day).unwrap();
+        for n in 1..=3 {
+            std::fs::write(day.join(format!("750_000{n}.NEF")), format!("raw{n}")).unwrap();
+        }
+        let mut cat = Catalog::open_memory().unwrap();
+        crate::scan::scan(&mut cat, dir.path(), true).unwrap();
+        let ids: Vec<i64> = cat
+            .conn
+            .prepare("SELECT id FROM stack ORDER BY base")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[ids[0]],
+            &[Change::SetRating(Some(2))],
+            &Config::default(),
+        )
+        .unwrap();
+        edit::apply(
+            &mut cat,
+            &[ids[1]],
+            &[Change::SetRating(Some(5))],
+            &Config::default(),
+        )
+        .unwrap();
+        let cache = thumbs::Cache::new("gui-test-rating-filter").unwrap();
+        let app = GuiApp::new(cat, cache, Config::default(), None);
+        (dir, app)
+    }
+
     #[test]
     fn month_keys_render_as_a_name_and_year() {
         assert_eq!(month_label("2026-08"), "August 2026");
@@ -1668,5 +1748,39 @@ mod tests {
             .collect();
         assert!(paths.contains(&"Trips/Paris"));
         assert!(paths.contains(&"Family/Paris"));
+    }
+
+    /// `toggle_rating_filter` is what both the checkbox click and the
+    /// `Ctrl+N` shortcut call -- this exercises the shared logic directly,
+    /// same reasoning `handle_rating_keys`'s doc comment gives for why the
+    /// two must go through one path rather than duplicating it.
+    #[test]
+    fn toggle_rating_filter_narrows_and_widens_the_rows() {
+        let (_dir, mut app) = app();
+        assert_eq!(app.rows.len(), 3, "no filter set yet");
+
+        app.toggle_rating_filter(2);
+        assert!(app.rating_filter[1]);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].rating, Some(2));
+
+        app.toggle_rating_filter(5);
+        assert_eq!(
+            app.rows.len(),
+            2,
+            "rating=2 or rating=5 should both show once both are checked"
+        );
+
+        app.toggle_rating_filter(2);
+        assert!(!app.rating_filter[1]);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].rating, Some(5));
+
+        app.toggle_rating_filter(5);
+        assert_eq!(
+            app.rows.len(),
+            3,
+            "clearing every box shows everything again"
+        );
     }
 }

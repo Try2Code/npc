@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 const MIN_TILE_PX: f32 = 64.0;
 const MAX_TILE_PX: f32 = 1000.0;
 const DEFAULT_TILE_PX: f32 = 160.0;
+/// Bounds on `single_zoom`, the multiplier on top of fit-to-window.
+const MIN_SINGLE_ZOOM: f32 = 0.1;
+const MAX_SINGLE_ZOOM: f32 = 20.0;
 
 struct Row {
     id: i64,
@@ -319,6 +322,18 @@ struct GuiApp {
     /// already-loaded texture is drawn -- the GPU scales it for free, so no
     /// new cache entries or thumbnail regeneration happen as this changes.
     tile_px: f32,
+    /// Single view's own zoom, RawTherapee-style: the mouse wheel zooms in
+    /// and out anchored at the cursor (see `draw_single`'s zoom math),
+    /// multiplying the base fit-to-window scale. `1.0` is "fit", matching
+    /// what the view already showed before this existed. Keyed to
+    /// `single_zoom_stack` so navigating to a different stack resets it,
+    /// the same "zoom resets on navigation" rule `tui.rs` already applies
+    /// to its own single view.
+    single_zoom: f32,
+    /// Screen-space offset from center, adjusted alongside `single_zoom`
+    /// to keep the point under the cursor fixed as it changes.
+    single_pan: egui::Vec2,
+    single_zoom_stack: Option<i64>,
     /// This session's theme; toggling flips it and re-applies
     /// `egui::Visuals` immediately, but never writes back to config.toml --
     /// nothing in this tool writes its own config file, and the user chose
@@ -377,6 +392,9 @@ impl GuiApp {
             tags: Vec::new(),
             folders: Vec::new(),
             tile_px: DEFAULT_TILE_PX,
+            single_zoom: 1.0,
+            single_pan: egui::Vec2::ZERO,
+            single_zoom_stack: None,
             theme,
             tag_input: String::new(),
             actions: action::load(),
@@ -1461,24 +1479,75 @@ impl GuiApp {
                 ui.label("no image source for this stack");
                 return;
             };
+
+            if self.single_zoom_stack != Some(id) {
+                self.single_zoom = 1.0;
+                self.single_pan = egui::Vec2::ZERO;
+                self.single_zoom_stack = Some(id);
+            }
+
             let ctx = ui.ctx().clone();
-            // `Size::View`, not `Size::Full` -- matching `tui.rs`'s own
-            // *default* single view. `Full` is a `min_dim` past any real
-            // sensor's long edge, so it forces the largest preview tier
-            // available (measured elsewhere in this project at ~140ms/frame,
-            // vs. `View`'s ~24ms) -- worth paying when the TUI's `+` key
-            // explicitly asks to zoom in further, not on every single-view
-            // open. This GUI has no such zoom escalation (yet), so it should
-            // default to the tier the TUI itself defaults to, not the one it
-            // reserves for an explicit zoom request.
+            // `Size::View` by default -- matching `tui.rs`'s own default
+            // single view, and cheap (~24ms/frame vs `Full`'s ~140ms,
+            // measured elsewhere in this project). Escalates to `Full`
+            // once actually zoomed in past fit, same "only pay for it on an
+            // explicit zoom-in" rule the TUI's own `+` key follows -- past
+            // that point `View`'s ~1620px tier is the thing visibly running
+            // out of resolution, not a cost worth avoiding.
+            let size_tier = if self.single_zoom > 1.01 {
+                thumbs::Size::Full
+            } else {
+                thumbs::Size::View
+            };
             match self
                 .cache
-                .get(&src, thumbs::Size::View)
+                .get(&src, size_tier)
                 .and_then(|path| self.texture_for(&ctx, &path))
             {
                 Some(tex) => {
                     let avail = ui.available_size();
-                    ui.add(egui::Image::new(&tex).max_size(avail).shrink_to_fit());
+                    let (viewport, response) =
+                        ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+
+                    let tex_size = tex.size_vec2();
+                    let fit_scale =
+                        (viewport.width() / tex_size.x).min(viewport.height() / tex_size.y);
+                    let scale = fit_scale * self.single_zoom;
+                    let old_center = viewport.center() + self.single_pan;
+
+                    // Mouse-wheel zoom anchored at the cursor, RawTherapee-
+                    // style: convert the pointer to a fixed point in
+                    // image-space first, then solve for the pan that keeps
+                    // that same point under the pointer at the new scale,
+                    // rather than zooming toward the viewport's center.
+                    if let Some(pointer) = response.hover_pos() {
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            let new_zoom = (self.single_zoom * (scroll * 0.002).exp())
+                                .clamp(MIN_SINGLE_ZOOM, MAX_SINGLE_ZOOM);
+                            let new_scale = fit_scale * new_zoom;
+                            let ratio = new_scale / scale;
+                            let new_center = pointer + (old_center - pointer) * ratio;
+                            self.single_pan = new_center - viewport.center();
+                            self.single_zoom = new_zoom;
+                        }
+                    }
+                    if response.dragged() {
+                        self.single_pan += response.drag_delta();
+                    }
+
+                    // Recompute after a possible zoom/drag this frame, so
+                    // the image drawn below is never one frame stale.
+                    let scale = fit_scale * self.single_zoom;
+                    let center = viewport.center() + self.single_pan;
+                    let image_rect = egui::Rect::from_center_size(center, tex_size * scale);
+
+                    ui.painter_at(viewport).image(
+                        tex.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
                 }
                 None => {
                     ui.label("loading image...");

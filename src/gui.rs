@@ -1594,9 +1594,30 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
     // or the watcher itself erroring) is never fatal to launching the GUI.
     let watcher = watch::Watcher::spawn(root.to_path_buf(), &config).unwrap_or(None);
 
+    // Embedded at compile time -- see assets/icon-h2-3x3-real-emoji.svg for
+    // the source and README.md's "Icon" section for the required Twemoji
+    // attribution. A decode failure here (never expected; it's our own
+    // checked-in asset) just means no icon, not a launch failure.
+    let icon = image::load_from_memory(include_bytes!("../assets/npcg-icon.png"))
+        .ok()
+        .map(|img| {
+            let img = img.to_rgba8();
+            let (width, height) = img.dimensions();
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
+        });
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_icon(icon.unwrap_or_default()),
+        ..Default::default()
+    };
+
     eframe::run_native(
         "npcg",
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(visuals_for(theme));
             Ok(Box::new(GuiApp::new(cat, cache, config, watcher)))

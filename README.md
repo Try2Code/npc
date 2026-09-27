@@ -42,6 +42,7 @@ comes first.
 - [Coverage](#coverage)
 - [Portability](#portability)
 - [Development](#development)
+- [Icon](#icon)
 
 ## How this was built
 
@@ -384,3 +385,12 @@ so. `NPC_ALLOW_MISSING_TEST_DATA=1` acknowledges it if you only want to build.
 
 See `CLAUDE.md` for design decisions worth not re-deriving, and `PLAN.md` for
 the original design plus a record of where it turned out to be wrong.
+
+## Icon
+
+`assets/icon-h2-3x3-real-emoji.svg` embeds nine [Twemoji](https://github.com/twitter/twemoji)
+graphics (mountain, cherry blossom, apple, dancer, person, tree, family,
+cityscape at dusk, camera) directly, as base64-encoded PNGs, rather than
+redrawing them. Twemoji graphics are © 2020 Twitter, Inc and contributors,
+licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/);
+this notice is that license's attribution requirement.

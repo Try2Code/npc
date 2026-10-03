@@ -935,6 +935,19 @@ impl App {
         })
     }
 
+    /// Same file as `current_label`, but the real on-disk path rather than
+    /// one relative to the library root -- for the single view's info panel,
+    /// which has room for it and is where "where is this on disk" belongs,
+    /// unlike the width-constrained status line `current_label` feeds.
+    fn current_full_path(&self) -> Option<String> {
+        let row = self.rows.get(self.cursor)?;
+        let members = self.current_members();
+        let filename = members
+            .get(self.member.min(members.len().saturating_sub(1)))
+            .map_or_else(|| row.base.clone(), |(name, _)| name.clone());
+        Some(format!("{}/{filename}", row.dir))
+    }
+
     /// Shooting data for the file under the cursor.
     fn current_exif(&self) -> Option<Exif> {
         let row = self.rows.get(self.cursor)?;
@@ -1326,6 +1339,15 @@ impl App {
             KeyCode::Char('r') => {
                 let dropped = self.clear_images();
                 self.status = format!("re-sent {dropped} image(s) to the terminal");
+            }
+            KeyCode::Char('y') => {
+                self.status = match self.current_full_path() {
+                    Some(path) => match copy_to_clipboard(&path) {
+                        Ok(()) => format!("copied {path}"),
+                        Err(e) => format!("copy failed: {e}"),
+                    },
+                    None => "nothing to copy".into(),
+                };
             }
             KeyCode::Char('u') => self.undo()?,
             KeyCode::Char('w') => {
@@ -2222,7 +2244,7 @@ impl App {
             );
         }
 
-        if let (Some(area), Some(e)) = (panel, exif.as_ref()) {
+        if let Some(area) = panel {
             let label = |k: &str, v: String| {
                 Line::from(vec![
                     Span::styled(
@@ -2232,63 +2254,77 @@ impl App {
                     Span::styled(v, Style::default().fg(self.config.colors.accent)),
                 ])
             };
+            let path_line = self.current_full_path().map(|p| {
+                Line::from(Span::styled(
+                    p,
+                    Style::default().fg(self.config.colors.muted),
+                ))
+            });
             let mut lines = Vec::new();
-            if portrait {
-                // Stacked: one field per line, room to spare.
-                if let Some(t) = e.captured {
-                    lines.push(label("", format_datetime(t)));
+            if let Some(e) = exif.as_ref() {
+                if portrait {
+                    // Stacked: one field per line, room to spare.
+                    if let Some(t) = e.captured {
+                        lines.push(label("", format_datetime(t)));
+                        lines.push(Line::from(""));
+                    }
+                    if let Some(x) = e.exposure.filter(|x| *x > 0.0) {
+                        lines.push(label("S", format_shutter(x)));
+                    }
+                    if let Some(x) = e.fnumber.filter(|x| *x > 0.0) {
+                        lines.push(label("A", format!("f/{x:.1}")));
+                    }
+                    if let Some(x) = e.iso.filter(|x| *x > 0) {
+                        lines.push(label("I", format!("{x}")));
+                    }
+                    if let Some(x) = e.bias {
+                        lines.push(label("EV", format_ev(x)));
+                    }
+                    if let Some(x) = e.focal.filter(|x| *x > 0.0) {
+                        lines.push(label("", format!("{x:.0}mm")));
+                    }
+                    lines.push(Line::from(""));
+                    if !e.lens.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            e.lens.clone(),
+                            Style::default().fg(self.config.colors.muted),
+                        )));
+                    }
+                    if !e.camera.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            e.camera.clone(),
+                            Style::default().fg(self.config.colors.muted),
+                        )));
+                    }
+                } else {
+                    // One row across, under a landscape frame.
+                    lines.push(Line::from(Span::styled(
+                        e.line(),
+                        Style::default().fg(self.config.colors.accent),
+                    )));
+                    let mut tail = String::new();
+                    if !e.lens.is_empty() {
+                        tail.push_str(&e.lens);
+                    }
+                    if !e.camera.is_empty() {
+                        if !tail.is_empty() {
+                            tail.push_str("   ");
+                        }
+                        tail.push_str(&e.camera);
+                    }
+                    if !tail.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            tail,
+                            Style::default().fg(self.config.colors.muted),
+                        )));
+                    }
+                }
+            }
+            if let Some(path_line) = path_line {
+                if !lines.is_empty() {
                     lines.push(Line::from(""));
                 }
-                if let Some(x) = e.exposure.filter(|x| *x > 0.0) {
-                    lines.push(label("S", format_shutter(x)));
-                }
-                if let Some(x) = e.fnumber.filter(|x| *x > 0.0) {
-                    lines.push(label("A", format!("f/{x:.1}")));
-                }
-                if let Some(x) = e.iso.filter(|x| *x > 0) {
-                    lines.push(label("I", format!("{x}")));
-                }
-                if let Some(x) = e.bias {
-                    lines.push(label("EV", format_ev(x)));
-                }
-                if let Some(x) = e.focal.filter(|x| *x > 0.0) {
-                    lines.push(label("", format!("{x:.0}mm")));
-                }
-                lines.push(Line::from(""));
-                if !e.lens.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        e.lens.clone(),
-                        Style::default().fg(self.config.colors.muted),
-                    )));
-                }
-                if !e.camera.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        e.camera.clone(),
-                        Style::default().fg(self.config.colors.muted),
-                    )));
-                }
-            } else {
-                // One row across, under a landscape frame.
-                lines.push(Line::from(Span::styled(
-                    e.line(),
-                    Style::default().fg(self.config.colors.accent),
-                )));
-                let mut tail = String::new();
-                if !e.lens.is_empty() {
-                    tail.push_str(&e.lens);
-                }
-                if !e.camera.is_empty() {
-                    if !tail.is_empty() {
-                        tail.push_str("   ");
-                    }
-                    tail.push_str(&e.camera);
-                }
-                if !tail.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        tail,
-                        Style::default().fg(self.config.colors.muted),
-                    )));
-                }
+                lines.push(path_line);
             }
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         }
@@ -2347,9 +2383,9 @@ const HELP: &str = "\
  - +                  crop out / in past full res (single view; arrows pan)
 
  a                    actions menu
- r                    re-send images to the terminal (if one still renders
-                      blank; scrolling and resizing already do this on their
-                      own where it's needed)
+ r                    re-send images if one renders blank (scrolling/resizing
+                      already do this on their own where it's needed)
+ y                    copy the full path of the current file to the clipboard
  w                    flush pending sidecars
  u                    undo last edit
  q                    quit
@@ -2368,6 +2404,50 @@ fn timeline_bar_style(is_cursor: bool, bar: Color, accent: Color) -> Style {
     } else {
         Style::default().fg(bar)
     }
+}
+
+/// Copies `text` to the system clipboard via OSC 52 -- the terminal-level
+/// clipboard escape sequence kitty, iTerm2, alacritty, wezterm and others
+/// already implement, so no clipboard crate is needed for one key's worth of
+/// a feature. Writes straight to stdout alongside ratatui's own output,
+/// the same way `scan.rs`'s neighbors already send raw escape sequences
+/// (`EnterAlternateScreen` etc.) through `crossterm::execute!`; an
+/// out-of-band control sequence like this one does not disturb the cell
+/// buffer ratatui is otherwise managing.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    write!(
+        std::io::stdout(),
+        "\x1b]52;c;{}\x07",
+        base64_encode(text.as_bytes())
+    )?;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+/// A minimal standard-alphabet, padded base64 encoder. OSC 52's payload is
+/// the only thing in this project that needs one; pulling in a crate for a
+/// dozen lines of bit arithmetic would be one more dependency than the
+/// feature is worth.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0b11) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(match b1 {
+            Some(b1) => ALPHABET[(((b1 & 0b1111) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char,
+            None => '=',
+        });
+        out.push(match b2 {
+            Some(b2) => ALPHABET[(b2 & 0b11_1111) as usize] as char,
+            None => '=',
+        });
+    }
+    out
 }
 
 fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
@@ -3534,6 +3614,36 @@ mod tests {
         assert!(label.starts_with("2026/08/09/"), "got {label}");
     }
 
+    /// `y` copies this, not `current_label`'s root-relative one -- "where is
+    /// this on disk" needs the real path, same reasoning as the single
+    /// view's info panel.
+    #[test]
+    fn current_full_path_is_absolute() {
+        let (dir, app) = app();
+        let path = app.current_full_path().unwrap();
+        assert!(path.starts_with(dir.path().to_str().unwrap()), "got {path}");
+        assert!(path.contains("750_0001"));
+    }
+
+    #[test]
+    fn y_copies_the_full_path_and_reports_it_in_the_status() {
+        let (_d, mut app) = app();
+        press(&mut app, 'y');
+        assert!(app.status.starts_with("copied "), "got {}", app.status);
+        assert!(app.status.contains("750_0001"));
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
     #[test]
     fn tags_appear_next_to_the_filename() {
         let (_d, mut app) = app();
@@ -3558,6 +3668,23 @@ mod tests {
         for want in ["S 1/400", "A f/4.5", "I 2500", "EV -0.7"] {
             assert!(screen.contains(want), "`{want}` missing:\n{screen}");
         }
+    }
+
+    /// The single view's info panel is where "where is this on disk" lives
+    /// (room for a full path, unlike the width-constrained status line) --
+    /// shown even when there's no EXIF to go with it.
+    #[test]
+    fn the_single_view_panel_shows_the_full_path() {
+        let (_d, mut app) = app();
+        while app.view != View::Single {
+            press_code(&mut app, KeyCode::Tab);
+        }
+        let screen = render(&mut app, 120, 40);
+        let path = app.current_full_path().unwrap();
+        assert!(
+            screen.contains(&path),
+            "panel missing the full path:\n{screen}"
+        );
     }
 
     /// Enter and Esc are a zoom pair: one key each way, rather than cycling

@@ -27,6 +27,7 @@ use crate::watch;
 use crate::{query, thumbs, vol};
 use anyhow::{anyhow, Result};
 use eframe::egui;
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -99,6 +100,41 @@ fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5]) -> Result<Vec<Row>> 
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// The on-disk path of a stack's primary member -- raw preferred over a
+/// derived jpg, the same priority `tui.rs`'s own `current_members` ordering
+/// uses -- for the info panel, so the photo can be found in another file
+/// browser without reconstructing it from the library root by hand.
+fn full_path(cat: &Catalog, id: i64) -> Option<String> {
+    cat.conn
+        .query_row(
+            "SELECT s.dir || '/' || f.name FROM stack s JOIN file f ON f.stack_id = s.id
+             WHERE s.id = ?1 AND f.present = 1
+             ORDER BY CASE f.role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END, f.name
+             LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+}
+
+/// Sets both `CLIPBOARD` (Ctrl+V) and `PRIMARY` (middle-click paste) to
+/// `text`. `egui::Context::copy_text` only ever reaches the former (it goes
+/// through `egui-winit`'s own `Clipboard`, which has no notion of the X11
+/// primary selection at all), so this bypasses it and talks to `arboard`
+/// directly -- the same crate `egui-winit` itself uses, already in the
+/// dependency tree. A fresh connection per call, not reused: this is a rare,
+/// explicit user action, not a per-frame cost.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use arboard::{LinuxClipboardKind, SetExtLinux};
+    let mut cb = arboard::Clipboard::new()?;
+    cb.set_text(text.to_string())?;
+    cb.set()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text(text.to_string())?;
+    Ok(())
 }
 
 /// One row of the Events sidebar section: a named event, or a bare day when
@@ -284,6 +320,17 @@ struct GuiApp {
     /// purpose, same as the TUI: building a batch across more than one
     /// query, then editing it in one step, is the point.
     multi_selected: std::collections::HashSet<i64>,
+    /// The fixed end of a Shift-click range: set on a plain click, left
+    /// alone by Ctrl/Shift-click so repeated Shift-clicks all extend from
+    /// the same starting tile rather than the last one clicked -- the
+    /// standard file-manager convention.
+    range_anchor: usize,
+    /// Sends the grid's scroll position to follow `selected` exactly once,
+    /// consumed by `draw_grid` the next time it runs. Arrow-key navigation
+    /// sets this; mouse clicks and the wheel do not, since the viewport
+    /// should only jump when the keyboard moved the selection somewhere not
+    /// already visible, never fight a scroll the user is doing by hand.
+    scroll_to_selected: bool,
     /// Cache-file path -> uploaded GPU texture. Unlike the TUI's
     /// `decoded`/`images`/`last_rect` three-way split (needed because a
     /// kitty placement is bound to a screen rect and must be rebuilt
@@ -383,6 +430,8 @@ impl GuiApp {
             rows,
             selected: 0,
             multi_selected: std::collections::HashSet::new(),
+            range_anchor: 0,
+            scroll_to_selected: false,
             textures: HashMap::new(),
             cols: 1,
             mode: Mode::Grid,
@@ -626,6 +675,38 @@ impl GuiApp {
     fn toggle_rating_filter(&mut self, n: usize) {
         self.rating_filter[n - 1] = !self.rating_filter[n - 1];
         self.refresh_rows_after_rating_filter_change();
+    }
+
+    /// What a grid-tile click does, pulled out of `draw_grid`'s rendering
+    /// closure so it is exercised directly rather than through a simulated
+    /// `egui::Response` -- same reasoning as `toggle_rating_filter`.
+    ///
+    /// Plain click: fresh single selection, same file-manager convention
+    /// `tui.rs` has no equivalent of (the TUI has no mouse). Ctrl/Cmd-click:
+    /// toggles `i` into or out of the batch without touching the rest of it.
+    /// Shift-click: replaces the batch with everything between the fixed
+    /// `range_anchor` and `i`, inclusive -- a plain or Ctrl-click moves the
+    /// anchor to the clicked tile, but a Shift-click deliberately does not,
+    /// so repeated Shift-clicks all extend from the same starting tile
+    /// rather than the last one clicked.
+    fn handle_grid_click(&mut self, i: usize, id: i64, ctrl: bool, shift: bool) {
+        if shift {
+            let (lo, hi) = (self.range_anchor.min(i), self.range_anchor.max(i));
+            self.multi_selected = (lo..=hi)
+                .filter_map(|j| self.rows.get(j).map(|r| r.id))
+                .collect();
+            self.selected = i;
+        } else if ctrl {
+            if !self.multi_selected.remove(&id) {
+                self.multi_selected.insert(id);
+            }
+            self.selected = i;
+            self.range_anchor = i;
+        } else {
+            self.multi_selected.clear();
+            self.selected = i;
+            self.range_anchor = i;
+        }
     }
 
     fn refresh_rows_after_rating_filter_change(&mut self) {
@@ -965,6 +1046,16 @@ impl GuiApp {
                 return;
             };
             ui.heading("Info");
+            if let Some(path) = full_path(&self.cat, id) {
+                ui.horizontal(|ui| {
+                    ui.label(&path);
+                    if ui.small_button("copy").clicked() {
+                        if let Err(e) = copy_to_clipboard(&path) {
+                            self.status = Some(format!("copy failed: {e}"));
+                        }
+                    }
+                });
+            }
             if let Some(e) = exif::for_stack(&self.cat, id) {
                 if !e.camera.is_empty() {
                     ui.label(&e.camera);
@@ -1282,18 +1373,23 @@ impl GuiApp {
         // Up/Down need an explicit scroll request.
         let mut scroll_by = 0.0f32;
         let mut toggle_current = false;
+        let mut moved = false;
         ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
                 self.selected += 1;
+                moved = true;
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.selected = self.selected.saturating_sub(1);
+                moved = true;
             }
             if i.key_pressed(egui::Key::ArrowDown) {
                 self.selected = (self.selected + cols).min(self.rows.len().saturating_sub(1));
+                moved = true;
             }
             if i.key_pressed(egui::Key::ArrowUp) {
                 self.selected = self.selected.saturating_sub(cols);
+                moved = true;
             }
             if i.key_pressed(egui::Key::Enter) && !self.rows.is_empty() {
                 self.mode = Mode::Single;
@@ -1308,6 +1404,10 @@ impl GuiApp {
                 scroll_by += 3.0 * (self.tile_px + 8.0);
             }
         });
+        if moved {
+            self.range_anchor = self.selected;
+            self.scroll_to_selected = true;
+        }
         if toggle_current {
             if let Some(id) = self.rows.get(self.selected).map(|r| r.id) {
                 if !self.multi_selected.remove(&id) {
@@ -1354,7 +1454,24 @@ impl GuiApp {
             let row_height = tile_px + ui.spacing().item_spacing.y + label_height;
             let grid_rows = self.rows.len().div_ceil(cols.max(1));
             let mut open_single = false;
-            egui::ScrollArea::vertical().show_rows(ui, row_height, grid_rows, |ui, visible| {
+            // `show_rows` only ever builds the tiles it reports as visible,
+            // so a not-yet-drawn row has no `Response` for
+            // `scroll_to_me` to act on -- the usual trick for scrolling a
+            // virtualized list to an arbitrary row instead sets the
+            // viewport's offset directly, before asking which rows are
+            // visible. Only set when the keyboard just moved the selection
+            // (`scroll_to_selected`, consumed here); any other frame leaves
+            // the scroll area's own remembered offset alone, so this never
+            // fights a scroll the user is doing by hand.
+            let mut area = egui::ScrollArea::vertical();
+            if self.scroll_to_selected {
+                let viewport_height = ui.available_height();
+                let row_top = (self.selected / cols.max(1)) as f32 * row_height;
+                let centered = (row_top - (viewport_height - row_height) / 2.0).max(0.0);
+                area = area.vertical_scroll_offset(centered);
+                self.scroll_to_selected = false;
+            }
+            area.show_rows(ui, row_height, grid_rows, |ui, visible| {
                 // Only the grid-rows egui actually reports as scrolled into
                 // view are drawn -- and, critically, only for those does
                 // `texture_for` ever run. Every stack matching the current
@@ -1419,24 +1536,17 @@ impl GuiApp {
                                 };
                                 if resp.double_clicked() {
                                     self.selected = i;
+                                    self.range_anchor = i;
                                     self.multi_selected.clear();
                                     open_single = true;
                                 } else if resp.clicked() {
-                                    // Ctrl/Cmd-click toggles this tile into
-                                    // or out of the batch selection without
-                                    // disturbing the rest of it -- a plain
-                                    // click starts a fresh single selection,
-                                    // the common file-manager convention.
-                                    let extend =
-                                        ui.input(|inp| inp.modifiers.ctrl || inp.modifiers.command);
-                                    if extend {
-                                        if !self.multi_selected.remove(&id) {
-                                            self.multi_selected.insert(id);
-                                        }
-                                    } else {
-                                        self.multi_selected.clear();
-                                    }
-                                    self.selected = i;
+                                    let (ctrl, shift) = ui.input(|inp| {
+                                        (
+                                            inp.modifiers.ctrl || inp.modifiers.command,
+                                            inp.modifiers.shift,
+                                        )
+                                    });
+                                    self.handle_grid_click(i, id, ctrl, shift);
                                 }
                                 let stars = "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
                                 ui.label(stars);
@@ -1684,11 +1794,25 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
             .with_icon(icon.unwrap_or_default())
             // `with_icon` alone does nothing on Wayland: there is no
             // protocol for an app to hand the compositor its own window
-            // icon (unlike X11's _NET_WM_ICON). GNOME/Mutter looks the
-            // icon up via this app_id, matched against a `.desktop`
+            // icon (unlike X11's _NET_WM_ICON, which `with_icon` sets
+            // directly and unconditionally). GNOME/Mutter looks the icon
+            // up via this app_id instead, matched against a `.desktop`
             // file's own name -- see that file's Icon= key for the actual
-            // installed icon.
+            // installed icon. Harmless to also set now that X11 is forced
+            // below, in case that ever changes back.
             .with_app_id("npcg"),
+        // Forced rather than left to winit's own Wayland-first autodetection
+        // (real here, since `WAYLAND_DISPLAY` is normally set): this
+        // project's own measurement found `egui-winit`'s native-Wayland
+        // clipboard path (`smithay-clipboard`) silently does nothing on this
+        // compositor -- no error anywhere, `Response::scroll_to_me`-style
+        // "it just didn't happen". `arboard`'s X11 path (reached once
+        // winit hands it an X11/XWayland display instead) was confirmed
+        // working end-to-end (`xclip -o` read back exactly what was copied).
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        })),
         ..Default::default()
     };
 
@@ -1880,5 +2004,75 @@ mod tests {
             3,
             "clearing every box shows everything again"
         );
+    }
+
+    /// The info panel's path is absolute, unlike the grid/single-view label
+    /// elsewhere in this project (`tui.rs`'s own `current_label`, kept
+    /// relative so it fits a terminal line) -- this is the one place meant
+    /// to answer "where is this on disk" without the library root in hand.
+    #[test]
+    fn full_path_is_absolute_and_names_the_file() {
+        let (dir, app) = app();
+        let path = full_path(&app.cat, app.rows[0].id).unwrap();
+        assert!(path.starts_with(dir.path().to_str().unwrap()), "got {path}");
+        // The fixture names really are uppercase -- this is asserting the
+        // fixture's own naming, not classifying a real extension case-sensitively.
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "checking the fixture's literal name, not classifying a role"
+        )]
+        {
+            assert!(path.ends_with(".NEF"), "got {path}");
+        }
+    }
+
+    #[test]
+    fn shift_click_selects_the_inclusive_range_from_the_anchor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.handle_grid_click(0, ids[0], false, false);
+        app.handle_grid_click(2, ids[2], false, true);
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.multi_selected, ids.iter().copied().collect());
+    }
+
+    /// A plain or Ctrl-click moves the anchor; a Shift-click must not, or a
+    /// second Shift-click would extend from wherever the first one landed
+    /// instead of the original starting tile.
+    #[test]
+    fn a_second_shift_click_still_extends_from_the_original_anchor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.handle_grid_click(0, ids[0], false, false);
+        app.handle_grid_click(2, ids[2], false, true);
+        app.handle_grid_click(1, ids[1], false, true);
+        assert_eq!(
+            app.multi_selected,
+            [ids[0], ids[1]].into_iter().collect(),
+            "anchor should still be tile 0, not tile 2 from the previous shift-click"
+        );
+    }
+
+    #[test]
+    fn ctrl_click_toggles_without_clearing_the_rest() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.handle_grid_click(0, ids[0], true, false);
+        app.handle_grid_click(1, ids[1], true, false);
+        assert_eq!(app.multi_selected, [ids[0], ids[1]].into_iter().collect());
+
+        app.handle_grid_click(0, ids[0], true, false);
+        assert_eq!(app.multi_selected, [ids[1]].into_iter().collect());
+    }
+
+    #[test]
+    fn a_plain_click_clears_the_batch_and_resets_the_anchor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.handle_grid_click(0, ids[0], true, false);
+        app.handle_grid_click(2, ids[2], false, false);
+        assert!(app.multi_selected.is_empty());
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.range_anchor, 2);
     }
 }

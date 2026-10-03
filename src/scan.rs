@@ -9,6 +9,7 @@ use crate::meta;
 use crate::stack::{classify, Role};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt;
@@ -52,32 +53,60 @@ pub(crate) fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> 
 
 /// When a brand-new stack carries no rating of its own (no sidecar, no
 /// embedded EXIF rating), look for another stack elsewhere in the library
-/// sharing its basename that already has one -- the usual case being an
+/// that is a version of something already rated -- the usual case being an
 /// edited export the watcher just cataloged (`watch.rs`'s own doc comment:
 /// "a file dropped anywhere under the watched tree becomes its own
-/// independent stack"), which keeps the original's filename stem but starts
-/// with none of its metadata. Rate the originals first, then edit, is this
-/// project's own stated workflow, so this is "inherit, don't start from
-/// zero" for a file that is -- by name -- a version of something already
-/// rated, not an attempt to keep the two in sync afterward: a rating given
-/// to either one later never touches the other.
+/// independent stack"), which starts with none of the original's metadata
+/// of its own. Rate the originals first, then edit, is this project's own
+/// stated workflow, so this is "inherit, don't start from zero" for a file
+/// that is a version of something already rated, not an attempt to keep the
+/// two in sync afterward: a rating given to either one later never touches
+/// the other.
 ///
-/// Prefers a candidate inside the dated import tree (`import`'s own
-/// `YYYY/MM/DD` convention) when more than one same-named stack exists
-/// elsewhere, since that is unambiguously "the original" rather than some
-/// other export of it.
+/// Two ways to recognize "a version of", tried in order:
+///
+/// 1. **Camera identity** -- `serial` + `shutter_count`, the exact pair
+///    `import.rs`'s own Tier A merge-target matching already trusts.
+///    Confirmed against a real export rather than assumed: RawTherapee and
+///    spektra both preserve the source RAW's maker-note identity in the JPG
+///    they write, even when the filename itself does not survive untouched
+///    (`750_9954.NEF` exported as `750_9954_spektra.jpg`). This is the
+///    robust path -- it does not care what the export tool named the file.
+/// 2. **Basename**, exact or as a prefix of the new stack's own basename cut
+///    at a `_`/`-` boundary (`750_9954_spektra` extends `750_9954`) -- the
+///    fallback for a camera with no shutter-count EXIF, or an export tool
+///    that strips maker notes entirely (confirmed on a real export: a second
+///    `spektra` preset ran with maker notes stripped, landing here).
+///
+/// Both this stack's own identity/capture_time and each candidate's are read
+/// from `file`, not from this scan's freshly-parsed metadata -- the row was
+/// already inserted/updated earlier in this same transaction, so this also
+/// catches a stack that was cataloged before its true original existed and
+/// is only now being reconsidered on a later, otherwise-unchanged rescan.
+///
+/// Within either path, more than one candidate is a real, confirmed failure
+/// mode, not a hypothetical: this camera's file numbering recycles roughly
+/// twice a year, so a basename alone can match several *unrelated* shoots
+/// months apart, each already carrying its own, different, legitimate
+/// rating. A same-second `capture_time` against this stack's own is checked
+/// first -- proof the candidate is the same moment, not just the same
+/// recycled number -- then a candidate inside the dated import tree
+/// (`import`'s own `YYYY/MM/DD` convention), then whichever came back first.
+///
+/// `capture_time` is weaker evidence than identity and deliberately never
+/// promoted above it: it comes from the camera's clock, which a user can
+/// reset or let drift, where `shutter_count` is a hardware count of
+/// actuations that nothing short of deliberate tampering moves. It is only
+/// reached here after identity has already failed to find a match, and a
+/// wrong guess only mis-copies a rating -- visible and correctable, not the
+/// kind of silent merge `import.rs` guards with an actual pixel check before
+/// trusting this same field.
 fn find_inherited_rating(
-    stmt: &mut rusqlite::Statement,
+    tx: &rusqlite::Transaction,
     root: &Path,
     base: &str,
     exclude_id: i64,
 ) -> Result<Option<i32>> {
-    let candidates: Vec<(String, i32)> = stmt
-        .query_map(rusqlite::params![base, exclude_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-
     let is_dated = |dir: &str| {
         Path::new(dir)
             .strip_prefix(root)
@@ -88,12 +117,77 @@ fn find_inherited_rating(
                 name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit())
             })
     };
+    let capture_time: Option<i64> = tx
+        .query_row(
+            "SELECT capture_time FROM file
+             WHERE stack_id = ?1 AND capture_time IS NOT NULL LIMIT 1",
+            rusqlite::params![exclude_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let pick = |candidates: Vec<(String, i32, Option<i64>)>| {
+        capture_time
+            .and_then(|t| candidates.iter().find(|(_, _, ct)| *ct == Some(t)))
+            .or_else(|| candidates.iter().find(|(dir, _, _)| is_dated(dir)))
+            .or_else(|| candidates.first())
+            .map(|(_, rating, _)| *rating)
+    };
 
-    Ok(candidates
-        .iter()
-        .find(|(dir, _)| is_dated(dir))
-        .or_else(|| candidates.first())
-        .map(|(_, rating)| *rating))
+    let identity: Option<(String, u32)> = tx
+        .query_row(
+            "SELECT serial, shutter_count FROM file
+             WHERE stack_id = ?1 AND serial != '' AND shutter_count != 0 LIMIT 1",
+            rusqlite::params![exclude_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((serial, shutter_count)) = identity {
+        let candidates: Vec<(String, i32, Option<i64>)> = tx
+            .prepare(
+                "SELECT DISTINCT s.dir, s.rating,
+                        (SELECT MIN(f2.capture_time) FROM file f2
+                         WHERE f2.stack_id = s.id AND f2.capture_time IS NOT NULL)
+                 FROM file f JOIN stack s ON s.id = f.stack_id
+                 WHERE f.serial = ?1 AND f.shutter_count = ?2
+                   AND s.id != ?3 AND s.rating IS NOT NULL",
+            )?
+            .query_map(rusqlite::params![serial, shutter_count, exclude_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        if let Some(rating) = pick(candidates) {
+            return Ok(Some(rating));
+        }
+    }
+
+    // Basename fallback: the new stack's own base, then each of its
+    // underscore/hyphen-separated prefixes, longest first, as an exact
+    // match against another stack's base.
+    let mut stmt = tx.prepare(
+        "SELECT s.dir, s.rating,
+                (SELECT MIN(f2.capture_time) FROM file f2
+                 WHERE f2.stack_id = s.id AND f2.capture_time IS NOT NULL)
+         FROM stack s WHERE s.base = ?1 AND s.id != ?2 AND s.rating IS NOT NULL",
+    )?;
+    let mut cuts: Vec<usize> = base
+        .char_indices()
+        .filter(|&(_, c)| c == '_' || c == '-')
+        .map(|(i, _)| i)
+        .collect();
+    cuts.push(base.len());
+    cuts.sort_unstable_by(|a, b| b.cmp(a));
+
+    for cut in cuts {
+        let candidates: Vec<(String, i32, Option<i64>)> = stmt
+            .query_map(rusqlite::params![&base[..cut], exclude_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        if let Some(rating) = pick(candidates) {
+            return Ok(Some(rating));
+        }
+    }
+    Ok(None)
 }
 
 /// Union embedded tags across every member that had one, case-insensitively,
@@ -343,10 +437,6 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         let mut seed_stack = tx.prepare("UPDATE stack SET rating = ?2, dirty = 1 WHERE id = ?1")?;
         let mut ins_pending =
             tx.prepare("INSERT OR REPLACE INTO pending (stack_id, queued_at) VALUES (?1, ?2)")?;
-        let mut sel_inherit_rating = tx.prepare(
-            "SELECT dir, rating FROM stack WHERE base = ?1 AND id != ?2 AND rating IS NOT NULL",
-        )?;
-
         for ((dir, base), members) in &stacks {
             let sid: i64 = ins_stack.query_row(rusqlite::params![dir, base], |r| r.get(0))?;
 
@@ -415,7 +505,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
             if !has_sidecar && existing_rating.is_none() && existing_tags == 0 {
                 let mut rating = combine_rating(raw_rating, jpg_rating);
                 let inherited = rating.is_none()
-                    && match find_inherited_rating(&mut sel_inherit_rating, root, base, sid)? {
+                    && match find_inherited_rating(&tx, root, base, sid)? {
                         found @ Some(_) => {
                             rating = found;
                             true
@@ -843,6 +933,199 @@ mod tests {
             new_rating,
             Some(5),
             "should inherit from the dated-tree original, not the other export"
+        );
+    }
+
+    /// The real bug: `spektra` renames `750_9954.NEF` to `750_9954_spektra.jpg`
+    /// on export, so the basename match alone finds nothing. Fixture bytes
+    /// carry no real EXIF, so this stamps `file.serial`/`shutter_count`
+    /// directly after scanning -- the same synthetic-EXIF-value pattern used
+    /// elsewhere in this suite -- to prove identity is tried even when the
+    /// filename has a suffix appended.
+    #[test]
+    fn a_renamed_export_inherits_the_rating_via_camera_identity_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("2026/01/01");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("750_9954.NEF"), "raw").unwrap();
+        let export_dir = dir.path().join("export/color");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("750_9954_spektra.jpg"), "jpg").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let original_id: i64 = cat
+            .conn
+            .query_row("SELECT id FROM stack WHERE base = '750_9954'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE file SET serial = '6094708', shutter_count = 67177
+                 WHERE stack_id IN (
+                     SELECT id FROM stack WHERE base IN ('750_9954', '750_9954_spektra')
+                 )",
+                [],
+            )
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[original_id],
+            &[Change::SetRating(Some(2))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(stats.inherited_rating, 1);
+
+        let inherited: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE base = '750_9954_spektra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inherited, Some(2));
+    }
+
+    /// Camera identity is unavailable (no maker notes in these fixture bytes,
+    /// same as a non-Nikon body or an export tool that strips them) but the
+    /// renamed export's basename still extends the original's at a `_`
+    /// boundary -- the fallback path must still find it.
+    #[test]
+    fn a_renamed_export_inherits_the_rating_via_basename_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("2026/01/01");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("750_9954.NEF"), "raw").unwrap();
+        let export_dir = dir.path().join("export/color");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("750_9954_spektra.jpg"), "jpg").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let original_id: i64 = cat
+            .conn
+            .query_row("SELECT id FROM stack WHERE base = '750_9954'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[original_id],
+            &[Change::SetRating(Some(3))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(stats.inherited_rating, 1);
+
+        let inherited: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE base = '750_9954_spektra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inherited, Some(3));
+    }
+
+    /// The real bug behind `750_9943`: this camera's own file-numbering
+    /// recycles, so the same basename shows up on unrelated shoots months
+    /// apart, each already carrying its own real rating. A basename-only
+    /// match would grab whichever candidate the query happened to return
+    /// first; this proves the export's own `capture_time` -- which an
+    /// export tool preserves even when maker notes are stripped -- picks
+    /// the genuinely matching shoot instead.
+    #[test]
+    fn basename_fallback_prefers_the_candidate_with_a_matching_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_shoot_dir = dir.path().join("2025/04/26");
+        std::fs::create_dir_all(&old_shoot_dir).unwrap();
+        std::fs::write(old_shoot_dir.join("750_9943.NEF"), "raw-old").unwrap();
+        let new_shoot_dir = dir.path().join("2026/10/03");
+        std::fs::create_dir_all(&new_shoot_dir).unwrap();
+        std::fs::write(new_shoot_dir.join("750_9943.NEF"), "raw-new").unwrap();
+        let export_dir = dir.path().join("export/color");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("750_9943.jpg"), "jpg").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let old_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [old_shoot_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [new_shoot_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[old_id],
+            &[Change::SetRating(Some(1))],
+            &Config::default(),
+        )
+        .unwrap();
+        edit::apply(
+            &mut cat,
+            &[new_id],
+            &[Change::SetRating(Some(2))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        cat.conn
+            .execute(
+                "UPDATE file SET capture_time = 1745689767 WHERE stack_id = ?1",
+                [old_id],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE file SET capture_time = 1791019975 WHERE stack_id = ?1",
+                [new_id],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE file SET capture_time = 1791019975
+                 WHERE stack_id IN (SELECT id FROM stack WHERE dir = ?1)",
+                [export_dir.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(stats.inherited_rating, 1);
+
+        let inherited: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE dir = ?1",
+                [export_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inherited,
+            Some(2),
+            "should match the same-moment shoot, not an unrelated one sharing the recycled number"
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "npc"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
 
@@ -28,6 +28,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 ratatui-image = "4"
 eframe = "0.36.1"
 egui = "0.36.1"
+env_logger = "0.11"
+arboard = "3"
+winit = "0.30"
 
 [build-dependencies]
 cxx-build = "1.0"

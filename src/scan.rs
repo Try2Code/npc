@@ -30,6 +30,13 @@ pub struct ScanStats {
     /// similar tools write these into the file itself). Seeded into the
     /// catalog and marked dirty; `npc sync` writes the sidecar.
     pub seeded_from_embedded: usize,
+    /// Stacks that had no rating, no tags, and no embedded rating either,
+    /// but share a basename with an already-rated stack elsewhere in the
+    /// library -- the usual case being an edited export the watcher just
+    /// cataloged. Seeded with that rating and marked dirty, same as
+    /// `seeded_from_embedded`; kept separate only so the two sources are
+    /// distinguishable in a report.
+    pub inherited_rating: usize,
     pub errors: Vec<String>,
 }
 
@@ -41,6 +48,52 @@ pub(crate) fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> 
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
+}
+
+/// When a brand-new stack carries no rating of its own (no sidecar, no
+/// embedded EXIF rating), look for another stack elsewhere in the library
+/// sharing its basename that already has one -- the usual case being an
+/// edited export the watcher just cataloged (`watch.rs`'s own doc comment:
+/// "a file dropped anywhere under the watched tree becomes its own
+/// independent stack"), which keeps the original's filename stem but starts
+/// with none of its metadata. Rate the originals first, then edit, is this
+/// project's own stated workflow, so this is "inherit, don't start from
+/// zero" for a file that is -- by name -- a version of something already
+/// rated, not an attempt to keep the two in sync afterward: a rating given
+/// to either one later never touches the other.
+///
+/// Prefers a candidate inside the dated import tree (`import`'s own
+/// `YYYY/MM/DD` convention) when more than one same-named stack exists
+/// elsewhere, since that is unambiguously "the original" rather than some
+/// other export of it.
+fn find_inherited_rating(
+    stmt: &mut rusqlite::Statement,
+    root: &Path,
+    base: &str,
+    exclude_id: i64,
+) -> Result<Option<i32>> {
+    let candidates: Vec<(String, i32)> = stmt
+        .query_map(rusqlite::params![base, exclude_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let is_dated = |dir: &str| {
+        Path::new(dir)
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .is_some_and(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+
+    Ok(candidates
+        .iter()
+        .find(|(dir, _)| is_dated(dir))
+        .or_else(|| candidates.first())
+        .map(|(_, rating)| *rating))
 }
 
 /// Union embedded tags across every member that had one, case-insensitively,
@@ -290,6 +343,9 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
         let mut seed_stack = tx.prepare("UPDATE stack SET rating = ?2, dirty = 1 WHERE id = ?1")?;
         let mut ins_pending =
             tx.prepare("INSERT OR REPLACE INTO pending (stack_id, queued_at) VALUES (?1, ?2)")?;
+        let mut sel_inherit_rating = tx.prepare(
+            "SELECT dir, rating FROM stack WHERE base = ?1 AND id != ?2 AND rating IS NOT NULL",
+        )?;
 
         for ((dir, base), members) in &stacks {
             let sid: i64 = ins_stack.query_row(rusqlite::params![dir, base], |r| r.get(0))?;
@@ -357,7 +413,15 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
             let (existing_rating, existing_tags): (Option<i64>, i64) =
                 stack_state.query_row(rusqlite::params![sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
             if !has_sidecar && existing_rating.is_none() && existing_tags == 0 {
-                let rating = combine_rating(raw_rating, jpg_rating);
+                let mut rating = combine_rating(raw_rating, jpg_rating);
+                let inherited = rating.is_none()
+                    && match find_inherited_rating(&mut sel_inherit_rating, root, base, sid)? {
+                        found @ Some(_) => {
+                            rating = found;
+                            true
+                        }
+                        None => false,
+                    };
                 let tags = union_embedded_tags(embedded_tags.into_iter());
                 if rating.is_some() || !tags.is_empty() {
                     seed_stack.execute(rusqlite::params![sid, rating.map(i64::from)])?;
@@ -367,7 +431,11 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
                         ins_stack_tag.execute(rusqlite::params![sid, tid])?;
                     }
                     ins_pending.execute(rusqlite::params![sid, now_secs()])?;
-                    stats.seeded_from_embedded += 1;
+                    if inherited {
+                        stats.inherited_rating += 1;
+                    } else {
+                        stats.seeded_from_embedded += 1;
+                    }
                 }
             }
         }
@@ -583,5 +651,198 @@ mod tests {
     fn no_embedded_tags_anywhere_is_an_empty_union() {
         let tags = union_embedded_tags(std::iter::empty());
         assert!(tags.is_empty());
+    }
+
+    use crate::config::Config;
+    use crate::edit::{self, Change};
+
+    /// The exact workflow this feature exists for: rate the originals
+    /// first, edit later. A RawTherapee/spektra export keeps the source's
+    /// filename stem but starts with none of its metadata -- it should
+    /// inherit the rating already given to the original, not start unrated.
+    #[test]
+    fn a_new_stack_inherits_the_rating_of_a_same_named_stack_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("2026/01/01");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("750_0001.NEF"), "raw").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let original_id: i64 = cat
+            .conn
+            .query_row("SELECT id FROM stack WHERE base = '750_0001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[original_id],
+            &[Change::SetRating(Some(4))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        // The edited export appears later, elsewhere in the library -- no
+        // sidecar, no embedded rating of its own (fixture bytes carry none).
+        let export_dir = dir.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("750_0001.JPG"), "jpg").unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(stats.inherited_rating, 1);
+
+        let inherited: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE dir = ?1 AND base = '750_0001'",
+                [export_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inherited, Some(4));
+
+        // Inheritance is one-way and one-time: the original's own rating is
+        // never touched by cataloging the export.
+        let original_rating: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE id = ?1",
+                [original_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_rating, Some(4));
+    }
+
+    /// "I might give them a different rating later" -- a rating the user set
+    /// by hand, however it got there, must never be clobbered by a later
+    /// rescan just because a same-named stack elsewhere also has one.
+    #[test]
+    fn a_stacks_own_rating_is_never_overwritten_by_inheritance() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("2026/01/01");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("750_0001.NEF"), "raw").unwrap();
+        let export_dir = dir.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("750_0001.JPG"), "jpg").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let original_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [original_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let export_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [export_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        edit::apply(
+            &mut cat,
+            &[export_id],
+            &[Change::SetRating(Some(2))],
+            &Config::default(),
+        )
+        .unwrap();
+        edit::apply(
+            &mut cat,
+            &[original_id],
+            &[Change::SetRating(Some(5))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(
+            stats.inherited_rating, 0,
+            "the export already had its own rating"
+        );
+
+        let export_rating: Option<i64> = cat
+            .conn
+            .query_row("SELECT rating FROM stack WHERE id = ?1", [export_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(export_rating, Some(2));
+    }
+
+    /// Two same-named stacks could exist outside the dated tree too (two
+    /// different exports of the same shot). The one actually inside it is
+    /// unambiguously "the original" and must win the tie-break.
+    #[test]
+    fn inheritance_prefers_a_candidate_inside_the_dated_import_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_dir = dir.path().join("2026/01/01");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("750_0001.NEF"), "raw").unwrap();
+        let other_export_dir = dir.path().join("export/a");
+        std::fs::create_dir_all(&other_export_dir).unwrap();
+        std::fs::write(other_export_dir.join("750_0001.JPG"), "jpg-a").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let original_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [original_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_export_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [other_export_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[original_id],
+            &[Change::SetRating(Some(5))],
+            &Config::default(),
+        )
+        .unwrap();
+        edit::apply(
+            &mut cat,
+            &[other_export_id],
+            &[Change::SetRating(Some(1))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let new_export_dir = dir.path().join("export/b");
+        std::fs::create_dir_all(&new_export_dir).unwrap();
+        std::fs::write(new_export_dir.join("750_0001.JPG"), "jpg-b").unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let new_rating: Option<i64> = cat
+            .conn
+            .query_row(
+                "SELECT rating FROM stack WHERE dir = ?1",
+                [new_export_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_rating,
+            Some(5),
+            "should inherit from the dated-tree original, not the other export"
+        );
     }
 }

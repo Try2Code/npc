@@ -606,6 +606,12 @@ fn main() -> Result<()> {
                     stats.seeded_from_embedded
                 );
             }
+            if stats.inherited_rating > 0 {
+                println!(
+                    "  inherited   {} stack(s) rated from a same-named stack elsewhere (run `npc sync` to write sidecars)",
+                    stats.inherited_rating
+                );
+            }
             if stats.vanished > 0 {
                 println!(
                     "  vanished    {} (marked absent, tags kept)",

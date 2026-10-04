@@ -22,6 +22,7 @@ use crate::config::{Config, Theme};
 use crate::db::Catalog;
 use crate::edit::{self, Change};
 use crate::exif;
+use crate::export;
 use crate::tui::{compute_timeline, Granularity, TimelineBucket, TrashView};
 use crate::watch;
 use crate::{query, thumbs, vol};
@@ -305,6 +306,10 @@ struct GuiApp {
     cat: Catalog,
     cache: thumbs::Cache,
     config: Config,
+    /// The library root, needed only for `export::export`'s reserved-path
+    /// check (it refuses a target inside the dated import tree or trash).
+    /// Nothing else here needs it -- every other query goes through `cat`.
+    root: PathBuf,
     query: String,
     query_error: Option<String>,
     /// Feedback from the last rating edit -- separate from `query_error`,
@@ -372,15 +377,18 @@ struct GuiApp {
     /// Single view's own zoom, RawTherapee-style: the mouse wheel zooms in
     /// and out anchored at the cursor (see `draw_single`'s zoom math),
     /// multiplying the base fit-to-window scale. `1.0` is "fit", matching
-    /// what the view already showed before this existed. Keyed to
-    /// `single_zoom_stack` so navigating to a different stack resets it,
-    /// the same "zoom resets on navigation" rule `tui.rs` already applies
-    /// to its own single view.
+    /// what the view already showed before this existed.
+    ///
+    /// Deliberately *not* reset by prev/next (unlike `tui.rs`'s own single
+    /// view, which does reset on navigation): checking the same detail
+    /// across a burst of near-identical frames means the zoom and pan should
+    /// follow you from frame to frame, not snap back to fit on every arrow
+    /// press. Escape is the explicit reset instead -- see `handle_single_keys`.
     single_zoom: f32,
     /// Screen-space offset from center, adjusted alongside `single_zoom`
-    /// to keep the point under the cursor fixed as it changes.
+    /// to keep the point under the cursor fixed as it changes. Persists
+    /// across navigation for the same reason `single_zoom` does.
     single_pan: egui::Vec2,
-    single_zoom_stack: Option<i64>,
     /// This session's theme; toggling flips it and re-applies
     /// `egui::Visuals` immediately, but never writes back to config.toml --
     /// nothing in this tool writes its own config file, and the user chose
@@ -390,6 +398,11 @@ struct GuiApp {
     /// selection change -- typing a tag, then clicking a different tile
     /// before pressing Enter, keeps the draft rather than silently losing it.
     tag_input: String,
+    /// The batch panel's "remove tag" field -- separate from `tag_input` so
+    /// typing a tag to add and a tag to remove don't fight over one buffer.
+    /// A batch has no single tag list to show per-tag "x" buttons next to
+    /// (unlike the single-photo panel), so removal here is by typed name.
+    remove_tag_input: String,
     /// Background library watcher (see `watch.rs`). `None` when disabled in
     /// config or failed to start -- either way, just "no automatic
     /// cataloging this session," never fatal to launching the GUI.
@@ -400,6 +413,15 @@ struct GuiApp {
     /// uses, so a program configured once works from either front end.
     actions: Vec<Action>,
     show_actions: bool,
+    /// The `e` menu: a quick, no-external-tool resize+reencode (2000px long
+    /// edge, quality 75 -- deliberately lower than `export`'s own 95 default,
+    /// since this is for sharing/web rather than an archival copy) plus
+    /// whichever `[[export]]` presets are configured, same `export::presets`
+    /// the CLI's `--list-presets` reads. Listed together so both live behind
+    /// one key, the same reasoning the `a` menu already settled on for
+    /// external programs.
+    export_presets: Vec<export::Preset>,
+    show_export: bool,
     /// Whole-library bucket counts over time, independent of `query` -- a
     /// navigation aid, same as `tui.rs`'s timeline, and computed by the
     /// same shared `tui::compute_timeline` so the two front ends can never
@@ -416,6 +438,7 @@ impl GuiApp {
         cache: thumbs::Cache,
         config: Config,
         watcher: Option<watch::Watcher>,
+        root: PathBuf,
     ) -> Self {
         let rows = run_query(&cat, "", [false; 5]).unwrap_or_default();
         let theme = config.gui.theme;
@@ -423,6 +446,7 @@ impl GuiApp {
             cat,
             cache,
             config,
+            root,
             query: String::new(),
             query_error: None,
             status: None,
@@ -443,11 +467,13 @@ impl GuiApp {
             tile_px: DEFAULT_TILE_PX,
             single_zoom: 1.0,
             single_pan: egui::Vec2::ZERO,
-            single_zoom_stack: None,
             theme,
             tag_input: String::new(),
+            remove_tag_input: String::new(),
             actions: action::load(),
             show_actions: false,
+            export_presets: export::presets(),
+            show_export: false,
             timeline: Vec::new(),
             timeline_granularity: Granularity::Month,
         };
@@ -642,6 +668,66 @@ impl GuiApp {
         });
     }
 
+    /// `n == 0` is the built-in quick resize (2000px, quality 75, no
+    /// external tool -- see `export_presets`'s own doc comment for why that
+    /// quality is lower than `export::DEFAULT_QUALITY`); `n >= 1` indexes
+    /// `export_presets[n - 1]`. Each kind gets its own subdirectory under
+    /// `export_dir` (named "web" for the quick resize, or the preset's own
+    /// name) rather than sharing one flat directory the way the CLI's
+    /// `--out` does -- the CLI leaves collision-avoidance to whoever picks
+    /// `--out`, but this menu has no path field for the user to vary it by
+    /// hand, and two kinds sharing a directory would silently overwrite each
+    /// other's same-named output.
+    fn run_export(&mut self, n: usize) {
+        let Some(base) = self.config.default_export_dir() else {
+            self.status = Some(format!(
+                "no export destination set. Add export_dir to {}",
+                Config::path().display()
+            ));
+            return;
+        };
+        let ids = self.targets();
+        if ids.is_empty() {
+            self.status = Some("nothing selected".into());
+            return;
+        }
+        let (kind, preset) = if n == 0 {
+            ("web", None)
+        } else {
+            let Some(p) = self.export_presets.get(n - 1) else {
+                self.status = Some(format!("no export option {n}"));
+                return;
+            };
+            (p.name.as_str(), Some(p))
+        };
+        let target = base.join(kind);
+        let opts = export::Options {
+            long_edge: 2000,
+            quality: 75,
+            keep_structure: false,
+            strip: false,
+            preset,
+            dry_run: false,
+        };
+        self.status = Some(
+            match export::export(&self.cat, &ids, &target, &self.root, &self.config, &opts) {
+                Ok(stats) => {
+                    let errors = if stats.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} error(s))", stats.errors.len())
+                    };
+                    format!(
+                        "exported {} stack(s) -> {}{errors}",
+                        stats.written,
+                        target.display()
+                    )
+                }
+                Err(e) => format!("export failed: {e}"),
+            },
+        );
+    }
+
     /// Set (or clear, for `None`) the star rating of every target. Mirrors
     /// `tui.rs`'s rating keys: same `edit::apply` + `edit::flush` pair, then
     /// a full reload from the catalog rather than an optimistic local
@@ -691,11 +777,7 @@ impl GuiApp {
     /// rather than the last one clicked.
     fn handle_grid_click(&mut self, i: usize, id: i64, ctrl: bool, shift: bool) {
         if shift {
-            let (lo, hi) = (self.range_anchor.min(i), self.range_anchor.max(i));
-            self.multi_selected = (lo..=hi)
-                .filter_map(|j| self.rows.get(j).map(|r| r.id))
-                .collect();
-            self.selected = i;
+            self.select_range(i);
         } else if ctrl {
             if !self.multi_selected.remove(&id) {
                 self.multi_selected.insert(id);
@@ -707,6 +789,52 @@ impl GuiApp {
             self.selected = i;
             self.range_anchor = i;
         }
+    }
+
+    /// Selects the inclusive range between the fixed `range_anchor` and
+    /// `to`, replacing the batch -- the one definition of "select this
+    /// range" a Shift-click and Shift+Arrow-key extension both defer to, so
+    /// they can never silently disagree about it.
+    fn select_range(&mut self, to: usize) {
+        let (lo, hi) = (self.range_anchor.min(to), self.range_anchor.max(to));
+        self.multi_selected = (lo..=hi)
+            .filter_map(|j| self.rows.get(j).map(|r| r.id))
+            .collect();
+        self.selected = to;
+    }
+
+    /// What an arrow-key move (the cursor already at `to`) does to the batch
+    /// selection -- pulled out of `handle_nav_keys`'s input-reading closure
+    /// for direct testing, same reasoning as `handle_grid_click`. `extend`
+    /// (Shift held) grows the batch via `select_range` from the fixed
+    /// anchor; otherwise it collapses to a single selection at `to`, the
+    /// same outcome a plain click already has, so the cursor is never left
+    /// sitting outside a stale-looking batch.
+    fn arrow_move(&mut self, to: usize, extend: bool) {
+        if extend {
+            self.select_range(to);
+        } else {
+            self.multi_selected.clear();
+            self.selected = to;
+            self.range_anchor = to;
+        }
+        self.scroll_to_selected = true;
+    }
+
+    /// Escape: cancel the batch without otherwise moving anything.
+    fn clear_selection(&mut self) {
+        self.multi_selected.clear();
+        self.range_anchor = self.selected;
+    }
+
+    /// Single view's explicit zoom reset -- prev/next deliberately leave
+    /// `single_zoom`/`single_pan` alone (see their doc comments), so this is
+    /// the only way back to fit-to-window short of scrolling out by hand.
+    /// Shared by Escape and the "<- grid" button, so leaving the view either
+    /// way starts the next visit fresh.
+    fn reset_zoom(&mut self) {
+        self.single_zoom = 1.0;
+        self.single_pan = egui::Vec2::ZERO;
     }
 
     fn refresh_rows_after_rating_filter_change(&mut self) {
@@ -1197,6 +1325,22 @@ impl GuiApp {
                     self.tag_input.clear();
                 }
             });
+
+            ui.label("Remove tag (applies to all selected)");
+            ui.horizontal(|ui| {
+                let tag_id = ui.make_persistent_id("gui_tag_input_batch_remove");
+                let was_focused = ui.memory(|m| m.has_focus(tag_id));
+                ui.add(egui::TextEdit::singleline(&mut self.remove_tag_input).id(tag_id));
+                let submitted = was_focused
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                if (ui.button("remove").clicked() || submitted)
+                    && !self.remove_tag_input.trim().is_empty()
+                {
+                    let name = self.remove_tag_input.trim().to_string();
+                    self.remove_tag_from_selected(&name);
+                    self.remove_tag_input.clear();
+                }
+            });
         });
     }
 
@@ -1318,8 +1462,53 @@ impl GuiApp {
             } else if close {
                 self.show_actions = false;
             }
-        } else if ui.ctx().input(|i| i.key_pressed(egui::Key::A)) {
+        } else if !self.show_export && ui.ctx().input(|i| i.key_pressed(egui::Key::A)) {
             self.show_actions = true;
+        }
+    }
+
+    /// `e` menu: same open/close/dispatch shape as `handle_action_keys`, but
+    /// by position (1 = quick web, 2.. = `export_presets` in config order)
+    /// rather than a configured letter, since a preset carries no key of its
+    /// own. Mutually exclusive with the actions menu -- each one's "open"
+    /// branch checks the other isn't already up, the same way `show_actions`
+    /// already suppresses `handle_nav_keys`/`handle_rating_keys` in `ui()`,
+    /// so `e` can never simultaneously fire an `[[action]]` keyed `e` and
+    /// open this menu.
+    fn handle_export_keys(&mut self, ui: &egui::Ui) {
+        const DIGITS: [(egui::Key, usize); 9] = [
+            (egui::Key::Num1, 0),
+            (egui::Key::Num2, 1),
+            (egui::Key::Num3, 2),
+            (egui::Key::Num4, 3),
+            (egui::Key::Num5, 4),
+            (egui::Key::Num6, 5),
+            (egui::Key::Num7, 6),
+            (egui::Key::Num8, 7),
+            (egui::Key::Num9, 8),
+        ];
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        if self.show_export {
+            let mut close = false;
+            let mut fire: Option<usize> = None;
+            ui.ctx().input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    close = true;
+                }
+                if let Some((_, n)) = DIGITS.into_iter().find(|(k, _)| i.key_pressed(*k)) {
+                    fire = Some(n);
+                }
+            });
+            if let Some(n) = fire {
+                self.show_export = false;
+                self.run_export(n);
+            } else if close {
+                self.show_export = false;
+            }
+        } else if !self.show_actions && ui.ctx().input(|i| i.key_pressed(egui::Key::E)) {
+            self.show_export = true;
         }
     }
 
@@ -1358,12 +1547,52 @@ impl GuiApp {
         }
     }
 
+    /// The `e` menu's popup, same shape as `draw_actions_menu`: one button
+    /// per option, numbered to match what `handle_export_keys` reads.
+    fn draw_export_menu(&mut self, ui: &mut egui::Ui) {
+        if !self.show_export {
+            return;
+        }
+        let mut close = false;
+        let mut fire: Option<usize> = None;
+        egui::Window::new("export")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                if ui.button("1  Quick web (2000px, quality 75)").clicked() {
+                    fire = Some(0);
+                }
+                for (i, p) in self.export_presets.iter().enumerate() {
+                    if ui.button(format!("{}  {}", i + 2, p.name)).clicked() {
+                        fire = Some(i + 1);
+                    }
+                }
+                if ui.button("cancel").clicked() {
+                    close = true;
+                }
+            });
+        if let Some(n) = fire {
+            self.show_export = false;
+            self.run_export(n);
+        } else if close {
+            self.show_export = false;
+        }
+    }
+
     /// Arrow/Page keys move the grid selection or scroll, and Space toggles
     /// the tile under the cursor into or out of the batch selection (the
     /// keyboard equivalent of Ctrl/Cmd-click in the grid) -- but the query
     /// box is a text field, and Left/Right/digits are how you edit text in
     /// it. Without this guard, typing e.g. `rating>=3` into the query would
     /// also move the selection and rate the current tile.
+    ///
+    /// Shift held during an arrow key extends the batch via `select_range`
+    /// the same way a Shift-click does, from the same fixed anchor -- a
+    /// plain arrow press afterward collapses back to a single selection
+    /// (resetting the anchor to wherever it lands), matching what a plain
+    /// click already does, so the cursor is never left sitting outside a
+    /// stale-looking batch. Escape cancels the batch outright without
+    /// otherwise moving anything, independent of either kind of arrow move.
     fn handle_nav_keys(&mut self, ui: &egui::Ui) {
         if ui.ctx().text_edit_focused() {
             return;
@@ -1374,28 +1603,38 @@ impl GuiApp {
         let mut scroll_by = 0.0f32;
         let mut toggle_current = false;
         let mut moved = false;
+        let mut extend = false;
+        let mut clear_selection = false;
         ui.ctx().input(|i| {
+            let shift = i.modifiers.shift;
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
                 self.selected += 1;
                 moved = true;
+                extend = shift;
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.selected = self.selected.saturating_sub(1);
                 moved = true;
+                extend = shift;
             }
             if i.key_pressed(egui::Key::ArrowDown) {
                 self.selected = (self.selected + cols).min(self.rows.len().saturating_sub(1));
                 moved = true;
+                extend = shift;
             }
             if i.key_pressed(egui::Key::ArrowUp) {
                 self.selected = self.selected.saturating_sub(cols);
                 moved = true;
+                extend = shift;
             }
             if i.key_pressed(egui::Key::Enter) && !self.rows.is_empty() {
                 self.mode = Mode::Single;
             }
             if i.key_pressed(egui::Key::Space) {
                 toggle_current = true;
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                clear_selection = true;
             }
             if i.key_pressed(egui::Key::PageDown) {
                 scroll_by -= 3.0 * (self.tile_px + 8.0);
@@ -1405,8 +1644,7 @@ impl GuiApp {
             }
         });
         if moved {
-            self.range_anchor = self.selected;
-            self.scroll_to_selected = true;
+            self.arrow_move(self.selected, extend);
         }
         if toggle_current {
             if let Some(id) = self.rows.get(self.selected).map(|r| r.id) {
@@ -1414,6 +1652,9 @@ impl GuiApp {
                     self.multi_selected.insert(id);
                 }
             }
+        }
+        if clear_selection {
+            self.clear_selection();
         }
         if scroll_by != 0.0 {
             ui.scroll_with_delta(egui::Vec2::new(0.0, scroll_by));
@@ -1430,6 +1671,7 @@ impl GuiApp {
         ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 self.mode = Mode::Grid;
+                self.reset_zoom();
             }
             if i.key_pressed(egui::Key::ArrowRight) && self.selected + 1 < self.rows.len() {
                 self.selected += 1;
@@ -1570,6 +1812,7 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 if ui.button("\u{2190} grid").clicked() {
                     self.mode = Mode::Grid;
+                    self.reset_zoom();
                 }
                 if ui.button("prev").clicked() {
                     self.selected = self.selected.saturating_sub(1);
@@ -1589,12 +1832,6 @@ impl GuiApp {
                 ui.label("no image source for this stack");
                 return;
             };
-
-            if self.single_zoom_stack != Some(id) {
-                self.single_zoom = 1.0;
-                self.single_pan = egui::Vec2::ZERO;
-                self.single_zoom_stack = Some(id);
-            }
 
             let ctx = ui.ctx().clone();
             // `Size::View` by default -- matching `tui.rs`'s own default
@@ -1722,20 +1959,22 @@ impl eframe::App for GuiApp {
         self.draw_sidebar(ui);
         self.draw_info_panel(ui);
         self.handle_action_keys(ui);
+        self.handle_export_keys(ui);
         match self.mode {
             Mode::Grid => {
-                // While the actions menu is open, every other key is its
-                // input (see `handle_action_keys`) -- same early-exit
-                // `tui.rs`'s `on_key` does for `show_actions`, so e.g. its
-                // digit keys can't also rate the tile underneath it.
-                if !self.show_actions {
+                // While the actions or export menu is open, every other key
+                // is its input (see `handle_action_keys`/`handle_export_keys`)
+                // -- same early-exit `tui.rs`'s `on_key` does for
+                // `show_actions`, so e.g. its digit keys can't also rate the
+                // tile underneath it.
+                if !self.show_actions && !self.show_export {
                     self.handle_nav_keys(ui);
                     self.handle_rating_keys(ui);
                 }
                 self.draw_grid(ui);
             }
             Mode::Single => {
-                if !self.show_actions {
+                if !self.show_actions && !self.show_export {
                     self.handle_single_keys(ui);
                     self.handle_rating_keys(ui);
                 }
@@ -1743,6 +1982,7 @@ impl eframe::App for GuiApp {
             }
         }
         self.draw_actions_menu(ui);
+        self.draw_export_menu(ui);
         self.poll_thumbnail_generation(ui.ctx());
     }
 }
@@ -1816,12 +2056,13 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
         ..Default::default()
     };
 
+    let root = root.to_path_buf();
     eframe::run_native(
         "npcg",
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(visuals_for(theme));
-            Ok(Box::new(GuiApp::new(cat, cache, config, watcher)))
+            Ok(Box::new(GuiApp::new(cat, cache, config, watcher, root)))
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
@@ -1878,7 +2119,13 @@ mod tests {
         )
         .unwrap();
         let cache = thumbs::Cache::new("gui-test-rating-filter").unwrap();
-        let app = GuiApp::new(cat, cache, Config::default(), None);
+        let app = GuiApp::new(
+            cat,
+            cache,
+            Config::default(),
+            None,
+            dir.path().to_path_buf(),
+        );
         (dir, app)
     }
 
@@ -2074,5 +2321,148 @@ mod tests {
         assert!(app.multi_selected.is_empty());
         assert_eq!(app.selected, 2);
         assert_eq!(app.range_anchor, 2);
+    }
+
+    #[test]
+    fn an_out_of_range_export_option_is_reported() {
+        let (_d, mut app) = app();
+        let out = tempfile::tempdir().unwrap();
+        app.config.export_dir = Some(out.path().to_path_buf());
+        app.run_export(5);
+        assert_eq!(app.status.as_deref(), Some("no export option 5"));
+    }
+
+    /// `cp` stands in for a real preset command, same reasoning as
+    /// `export.rs`'s own `a_preset_is_invoked_and_its_output_required` --
+    /// this exercises the dispatch and subdirectory naming, not image
+    /// decoding (the fixture's NEF bytes are not a real photograph).
+    #[test]
+    fn a_preset_export_writes_into_a_subdirectory_named_after_it() {
+        let (_d, mut app) = app();
+        let out = tempfile::tempdir().unwrap();
+        app.config.export_dir = Some(out.path().to_path_buf());
+        app.export_presets = vec![export::Preset {
+            name: "copy".into(),
+            cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
+            ext: "jpg".into(),
+        }];
+        app.run_export(1);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("exported 1 "),
+            "got {:?}",
+            app.status
+        );
+        assert!(out.path().join("copy/750_0001.jpg").exists());
+    }
+
+    #[test]
+    fn shift_arrow_extends_the_batch_from_the_fixed_anchor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.range_anchor = 0;
+        app.arrow_move(2, true);
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.multi_selected, ids.iter().copied().collect());
+
+        // A second Shift-move from the same anchor, not from where the
+        // first one landed.
+        app.arrow_move(1, true);
+        assert_eq!(
+            app.multi_selected,
+            [ids[0], ids[1]].into_iter().collect(),
+            "should still extend from tile 0, not tile 2"
+        );
+    }
+
+    #[test]
+    fn a_plain_arrow_move_collapses_the_batch_and_resets_the_anchor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.multi_selected = ids.iter().copied().collect();
+        app.arrow_move(1, false);
+        assert!(app.multi_selected.is_empty());
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.range_anchor, 1);
+    }
+
+    #[test]
+    fn escape_clears_the_batch_without_moving_the_cursor() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.multi_selected = ids.iter().copied().collect();
+        app.selected = 2;
+        app.clear_selection();
+        assert!(app.multi_selected.is_empty());
+        assert_eq!(app.selected, 2, "escape must not move the cursor");
+        assert_eq!(app.range_anchor, 2);
+    }
+
+    /// The batch panel's "remove tag" field has no per-tag list to click --
+    /// it applies a typed name to every selected stack, so a stack that
+    /// never had the tag is an unaffected no-op, not an error.
+    #[test]
+    fn remove_tag_from_selected_strips_it_from_every_target_in_the_batch() {
+        let (_d, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        edit::apply(
+            &mut app.cat,
+            &[ids[0], ids[1]],
+            &[Change::AddTags(vec!["beach".into()])],
+            &Config::default(),
+        )
+        .unwrap();
+        app.multi_selected = [ids[0], ids[1]].into_iter().collect();
+
+        app.remove_tag_from_selected("beach");
+
+        for &id in &ids[..2] {
+            let tags: Vec<String> = app
+                .cat
+                .conn
+                .prepare(
+                    "SELECT t.name FROM tag t JOIN stack_tag st ON st.tag_id = t.id
+                     WHERE st.stack_id = ?1",
+                )
+                .unwrap()
+                .query_map([id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(tags.is_empty(), "tag survived on stack {id}: {tags:?}");
+        }
+    }
+
+    /// Checking the same detail across a burst means the zoom must survive
+    /// moving to the next frame -- nothing in `handle_single_keys` or the
+    /// prev/next buttons touches `single_zoom`/`single_pan` any more, unlike
+    /// the removed per-stack auto-reset this replaced. `reset_zoom` (Escape,
+    /// or the "<- grid" button) is the only way back to fit-to-window.
+    #[test]
+    fn zoom_survives_navigation_and_only_resets_explicitly() {
+        let (_d, mut app) = app();
+        app.single_zoom = 2.5;
+        app.single_pan = egui::Vec2::new(10.0, -5.0);
+
+        app.selected = 1;
+        // Values set directly above, not computed -- an exact comparison is
+        // correct here, same reasoning as thumbs.rs's own float_cmp allow.
+        #[allow(clippy::float_cmp, reason = "values set directly above, not computed")]
+        {
+            assert_eq!(app.single_zoom, 2.5);
+            assert_eq!(app.single_pan, egui::Vec2::new(10.0, -5.0));
+        }
+
+        app.reset_zoom();
+        #[allow(
+            clippy::float_cmp,
+            reason = "comparing against reset_zoom's own literal constants"
+        )]
+        {
+            assert_eq!(app.single_zoom, 1.0);
+            assert_eq!(app.single_pan, egui::Vec2::ZERO);
+        }
     }
 }

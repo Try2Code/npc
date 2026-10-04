@@ -192,9 +192,16 @@ impl Config {
         self.library.as_deref().map(expand_home)
     }
 
-    /// The configured default export destination, with `~` expanded.
+    /// The configured default export destination, with `~` expanded -- or,
+    /// when `export_dir` is not set at all, `$HOME/Pictures/export`. The
+    /// GUI's `e` menu has no path field to set one by hand, so without this
+    /// every export there would need `config.toml` touched first; the CLI's
+    /// `npc export` gets the same fallback for the same reason one default
+    /// should mean one thing everywhere, not two slightly different ones.
     pub fn default_export_dir(&self) -> Option<PathBuf> {
-        self.export_dir.as_deref().map(expand_home)
+        self.export_dir.as_deref().map(expand_home).or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures/export"))
+        })
     }
 
     /// Where catalogs are kept, honouring `catalog_dir` if it is set.
@@ -349,10 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn export_dir_defaults_to_none_and_expands_home() {
-        assert!(Config::default().default_export_dir().is_none());
-
+    fn export_dir_falls_back_to_home_pictures_export_and_expands_home() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        assert_eq!(
+            Config::default().default_export_dir(),
+            Some(PathBuf::from(&home).join("Pictures/export")),
+            "unset export_dir should fall back to $HOME/Pictures/export"
+        );
+
         let c = Config {
             export_dir: Some(PathBuf::from("~/Pictures/graded")),
             ..Default::default()

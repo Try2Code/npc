@@ -532,6 +532,23 @@ fn stars(rating: Option<i64>) -> String {
     format!("{}{}", "*".repeat(n), " ".repeat(5 - n))
 }
 
+/// A fixed-width `[####----]` bar for `npc import`'s copy phase -- plain
+/// ASCII and a hand-rolled fill rather than a progress-bar crate, the same
+/// "a dozen lines doesn't need a dependency" call this project already made
+/// for `tui.rs`'s base64 encoder. `frac` is clamped so a rounding wobble at
+/// 100% (`bytes_so_far` can briefly exceed `total_bytes` by a few bytes of
+/// container overhead) never prints a bar wider than `width`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "frac is clamped to [0,1] and width is a handful of characters; \
+              this never approaches a range where the cast loses anything"
+)]
+fn progress_bar(frac: f64, width: usize) -> String {
+    let filled = ((frac.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1005,6 +1022,7 @@ fn main() -> Result<()> {
             // trusted as-is, which is far faster but carries that same risk
             // if something outside npc touched the library meanwhile.
             let mut cat = if rescan {
+                println!("scanning {}...", root.display());
                 let (scan_stats, cat) = scan::scan_root(&root, false)?;
                 println!(
                     "catalog: {} stacks ({} new/changed)",
@@ -1036,6 +1054,7 @@ fn main() -> Result<()> {
             let mut touched_dirs: std::collections::HashSet<PathBuf> =
                 std::collections::HashSet::new();
             for source in &sources {
+                println!("scanning {}...", source.display());
                 let plans = npc::import::plan(&cat, source, &root, verify_content)?;
                 let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
                 let fresh = plans.len() - dupes;
@@ -1138,8 +1157,15 @@ fn main() -> Result<()> {
                             } else {
                                 touched_dirs.insert(stack.dest_dir.clone());
                                 bytes_so_far += bytes;
+                                let frac = if total_bytes > 0 {
+                                    bytes_so_far as f64 / total_bytes as f64
+                                } else {
+                                    1.0
+                                };
                                 print!(
-                                    "\rcopying {index}/{total} stacks, {:.1}/{:.1} GB",
+                                    "\r{} {:3.0}%  {index}/{total} stacks  {:.1}/{:.1} GB\x1b[K",
+                                    progress_bar(frac, 30),
+                                    frac * 100.0,
                                     bytes_so_far as f64 / 1e9,
                                     total_bytes as f64 / 1e9
                                 );
@@ -1796,5 +1822,16 @@ mod tests {
 
         let ids = stack_ids_in_dirs(&cat, &std::collections::HashSet::new()).unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn progress_bar_fills_proportionally_and_never_overflows_its_width() {
+        assert_eq!(progress_bar(0.0, 10), "[----------]");
+        assert_eq!(progress_bar(1.0, 10), "[##########]");
+        assert_eq!(progress_bar(0.5, 10), "[#####-----]");
+        // A size total that undercounts by a few bytes (container overhead)
+        // must not print a bar wider than requested.
+        assert_eq!(progress_bar(1.2, 10), "[##########]");
+        assert_eq!(progress_bar(-0.1, 10), "[----------]");
     }
 }

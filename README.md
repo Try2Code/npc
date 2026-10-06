@@ -179,13 +179,22 @@ and rescans in 0.07.
 ## Requirements
 
 - Linux, `libexiv2-dev` (0.27 or 0.28), a C++17 compiler, Rust
-- **kitty** (or any terminal with the kitty graphics protocol) for thumbnails.
-  Sixel terminals work but band visibly on photographs; everything else falls
-  back to unreadable half-blocks.
+- **kitty** (or any terminal with the kitty graphics protocol) for the TUI's
+  thumbnails. Sixel terminals work but band visibly on photographs;
+  everything else falls back to unreadable half-blocks. `npcg` has no
+  terminal requirement -- it draws through the GPU instead.
 
 ```
-cargo build --release          # target/release/npc
+cargo build --release          # target/release/{npc,npcg}
+cargo install --path .         # both into ~/.cargo/bin (or $CARGO_INSTALL_ROOT)
 ```
+
+Nothing beyond the above is needed to build `npcg` too: its windowing and
+GPU code (`eframe`/`winit`/`wgpu`) is pure Rust and talks to whatever X11 or
+Wayland display and GPU driver (Vulkan, or OpenGL as a fallback) your desktop
+already has at runtime, rather than linking against their development
+headers at build time -- confirmed by `ldd` on the built binary, which shows
+nothing beyond `libexiv2` and the C++ runtime.
 
 ## Configuration
 
@@ -230,6 +239,23 @@ cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 | `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state |
 
 `npc find --help-syntax` documents the query language.
+
+`tag`, `rate`, `mark`, `rotate`, `set` and `exec` all take the same target:
+either `-q '<query>'`, or one or more explicit paths to act on directly. An
+explicit path can be any present member -- RAW or JPG, with or without the
+extension -- since only the stack it belongs to matters; the directory part
+has to match exactly what's in the catalog, which is the library's
+**absolute** path, not one relative to wherever you're running `npc` from. A
+query is almost always the more convenient choice day to day. Both forms
+refuse to run with neither given, rather than silently acting on the whole
+library:
+
+```
+npc tag add beach -q 'date=2026-08-09'
+npc rate 4 /media/me/Archive/2026/08/09/750_0001.NEF
+npc rate - -q 'name~750_0001'            # - clears a rating; 0 is a real one
+npc tag add beach -q 'date=2026-08-09' --dry-run
+```
 
 `npc import` with no path detects mounted cards (any mount with a top-level
 `DCIM` folder) and prompts you to pick one or more; `npc import <path>`

@@ -42,6 +42,8 @@ const MAX_SINGLE_ZOOM: f32 = 20.0;
 struct Row {
     id: i64,
     rating: Option<i64>,
+    flag: bool,
+    reject: bool,
 }
 
 /// No SQL-level cap: a single day of a real library was measured at just
@@ -97,6 +99,8 @@ fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5]) -> Result<Vec<Row>> 
             Ok(Row {
                 id: r.get(0)?,
                 rating: r.get(3)?,
+                flag: r.get(4)?,
+                reject: r.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -302,6 +306,12 @@ enum Mode {
     Single,
 }
 
+// A single immediate-mode app-state blob naturally accumulates independent
+// UI toggles (show_actions, show_export, online, ...) that have nothing to
+// do with each other -- splitting them into a bitflags type or sub-structs
+// here would be ceremony standing between the field and the one place it's
+// read, not a real grouping.
+#[allow(clippy::struct_excessive_bools)]
 struct GuiApp {
     cat: Catalog,
     cache: thumbs::Cache,
@@ -407,6 +417,13 @@ struct GuiApp {
     /// config or failed to start -- either way, just "no automatic
     /// cataloging this session," never fatal to launching the GUI.
     watcher: Option<watch::Watcher>,
+    /// Whether the library's volume is actually mounted right now, exactly
+    /// `tui.rs`'s own `online` field. The catalog lives on this machine, not
+    /// the drive (README's "Offline" section), so browsing cached
+    /// thumbnails, tagging and rating all still work without it -- only
+    /// generating a thumbnail that was never cached, launching an external
+    /// editor, and exporting actually need the files themselves.
+    online: bool,
     /// The `a` menu, ported from `tui.rs`: configured external programs
     /// (RawTherapee, GIMP, ...) launched against the current selection.
     /// Same `action::load()`/`action::gather()`/`action::run()` the TUI
@@ -439,6 +456,7 @@ impl GuiApp {
         config: Config,
         watcher: Option<watch::Watcher>,
         root: PathBuf,
+        online: bool,
     ) -> Self {
         let rows = run_query(&cat, "", [false; 5]).unwrap_or_default();
         let theme = config.gui.theme;
@@ -451,6 +469,7 @@ impl GuiApp {
             query_error: None,
             status: None,
             watcher,
+            online,
             rows,
             selected: 0,
             multi_selected: std::collections::HashSet::new(),
@@ -628,6 +647,13 @@ impl GuiApp {
             self.status = Some(format!("no action bound to `{key}`"));
             return;
         };
+        if !self.online {
+            self.status = Some(format!(
+                "{} not launched: the library is not mounted",
+                a.name
+            ));
+            return;
+        }
         let ids = self.targets();
 
         for &sid in &ids {
@@ -679,6 +705,10 @@ impl GuiApp {
     /// hand, and two kinds sharing a directory would silently overwrite each
     /// other's same-named output.
     fn run_export(&mut self, n: usize) {
+        if !self.online {
+            self.status = Some("export not available: the library is not mounted".into());
+            return;
+        }
         let Some(base) = self.config.default_export_dir() else {
             self.status = Some(format!(
                 "no export destination set. Add export_dir to {}",
@@ -749,6 +779,34 @@ impl GuiApp {
                 stats.sidecars_written
             )),
             Err(e) => Some(format!("rate failed: {e}")),
+        };
+        if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
+            self.rows = rows;
+        }
+    }
+
+    /// Flag (pick), reject, or clear both marks for every target -- mirrors
+    /// `tui.rs`'s `f`/`x`/`c` keys exactly, right down to letting `edit.rs`'s
+    /// own `SetFlag`/`SetReject` handling enforce that the two are mutually
+    /// exclusive (setting one clears the other at the SQL layer, not here).
+    /// Same `edit::apply` + `edit::flush` + full-reload shape as
+    /// `rate_selected`.
+    fn mark_selected(&mut self, changes: &[Change], verb: &str) {
+        let ids = self.targets();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = edit::apply(&mut self.cat, &ids, changes, &self.config) {
+            self.status = Some(format!("{verb} failed: {e}"));
+            return;
+        }
+        self.status = match edit::flush(&mut self.cat, &self.config) {
+            Ok(stats) => Some(format!(
+                "{verb}: {} stack(s), {} sidecar(s) written",
+                ids.len(),
+                stats.sidecars_written
+            )),
+            Err(e) => Some(format!("{verb} failed: {e}")),
         };
         if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
             self.rows = rows;
@@ -909,6 +967,22 @@ impl GuiApp {
     fn draw_query_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
+                if !self.online {
+                    let pending: i64 = self
+                        .cat
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap_or(0);
+                    let text = if pending > 0 {
+                        format!("OFFLINE - {pending} pending")
+                    } else {
+                        "OFFLINE".to_string()
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 40), text);
+                    ui.separator();
+                }
                 ui.label("query:");
                 // Neither documented "submit on Enter" idiom actually works
                 // for this, both confirmed directly against egui's own
@@ -1168,6 +1242,7 @@ impl GuiApp {
         }
         let id = self.rows.get(self.selected).map(|r| r.id);
         let rating = self.rows.get(self.selected).and_then(|r| r.rating);
+        let marks = self.rows.get(self.selected).map(|r| (r.flag, r.reject));
         egui::Panel::right("info").show(ui, |ui| {
             let Some(id) = id else {
                 ui.label("no photo selected");
@@ -1221,6 +1296,19 @@ impl GuiApp {
                     if ui.selectable_label(n <= stars, "*").clicked() {
                         self.rate_selected(if n == stars { None } else { Some(n) });
                     }
+                }
+            });
+
+            ui.label("Mark");
+            ui.horizontal(|ui| {
+                let (flag, reject) = marks.unwrap_or((false, false));
+                // Toggles on click, same as `handle_mark_keys`' `` ` ``/`x`
+                // and the rating stars just above.
+                if ui.selectable_label(flag, "flag").clicked() {
+                    self.mark_selected(&[Change::SetFlag(!flag)], "flag");
+                }
+                if ui.selectable_label(reject, "reject").clicked() {
+                    self.mark_selected(&[Change::SetReject(!reject)], "reject");
                 }
             });
 
@@ -1307,6 +1395,22 @@ impl GuiApp {
                 }
                 if ui.small_button("clear").clicked() {
                     self.rate_selected(None);
+                }
+            });
+
+            ui.label("Mark (applies to all selected)");
+            ui.horizontal(|ui| {
+                if ui.button("flag").clicked() {
+                    self.mark_selected(&[Change::SetFlag(true)], "flag");
+                }
+                if ui.button("reject").clicked() {
+                    self.mark_selected(&[Change::SetReject(true)], "reject");
+                }
+                if ui.button("clear").clicked() {
+                    self.mark_selected(
+                        &[Change::SetFlag(false), Change::SetReject(false)],
+                        "clear",
+                    );
                 }
             });
 
@@ -1402,6 +1506,48 @@ impl GuiApp {
             .map(|(_, n)| n);
         if let Some(n) = action {
             self.rate_selected(n);
+        }
+    }
+
+    /// Flag/reject/clear. Bound to `` ` ``/`x`/`c` rather than `tui.rs`'s
+    /// `f`/`x`/`c` -- flag sits next to the `1`-`5` rating keys on the same
+    /// row of the keyboard instead, specifically because a culling pass
+    /// alternates star-rating and pick/reject constantly and the two want to
+    /// be reachable without moving off that row.
+    ///
+    /// Unlike `tui.rs` (a plain "set", always `true`, with `c` as the only
+    /// way back to neutral), `` ` `` and `x` here toggle off again on a
+    /// second press of the same key -- matching the mouse buttons in the
+    /// info panel, which already toggle off on a second click for the same
+    /// reason the rating stars do. `c` still exists for "both off in one
+    /// press regardless of current state", e.g. moving straight from
+    /// rejected to flagged.
+    fn handle_mark_keys(&mut self, ui: &egui::Ui) {
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        let action = ui.ctx().input(|i| {
+            if i.key_pressed(egui::Key::Backtick) {
+                Some("flag")
+            } else if i.key_pressed(egui::Key::X) {
+                Some("reject")
+            } else if i.key_pressed(egui::Key::C) {
+                Some("clear")
+            } else {
+                None
+            }
+        });
+        let (flag, reject) = self
+            .rows
+            .get(self.selected)
+            .map_or((false, false), |r| (r.flag, r.reject));
+        match action {
+            Some("flag") => self.mark_selected(&[Change::SetFlag(!flag)], "flag"),
+            Some("reject") => self.mark_selected(&[Change::SetReject(!reject)], "reject"),
+            Some("clear") => {
+                self.mark_selected(&[Change::SetFlag(false), Change::SetReject(false)], "clear");
+            }
+            _ => {}
         }
     }
 
@@ -1736,6 +1882,7 @@ impl GuiApp {
                         for i in idx..(idx + cols).min(self.rows.len()) {
                             let id = self.rows[i].id;
                             let rating = self.rows[i].rating;
+                            let (flag, reject) = (self.rows[i].flag, self.rows[i].reject);
                             let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
                                 continue;
                             };
@@ -1791,7 +1938,14 @@ impl GuiApp {
                                     self.handle_grid_click(i, id, ctrl, shift);
                                 }
                                 let stars = "*".repeat(rating.unwrap_or(0).clamp(0, 5) as usize);
-                                ui.label(stars);
+                                let mark = if flag {
+                                    " F"
+                                } else if reject {
+                                    " X"
+                                } else {
+                                    ""
+                                };
+                                ui.label(format!("{stars}{mark}"));
                             });
                         }
                     });
@@ -1958,6 +2112,18 @@ impl eframe::App for GuiApp {
         self.draw_query_bar(ui);
         self.draw_sidebar(ui);
         self.draw_info_panel(ui);
+        // Snapshotted *before* either handler runs, not re-read after: both
+        // handlers can flip their own flag to `false` within this same call
+        // (a digit/letter that both dispatches and closes the menu), and the
+        // menu's own key is still "pressed" for the rest of this frame --
+        // egui's `key_pressed` isn't consumed just because one handler acted
+        // on it. Gating on the post-call value let that identical keypress
+        // fall through into `handle_rating_keys` this same frame: closing
+        // the export menu with `1` also rated the tile `1` star, silently
+        // overwriting whatever rating it already had. Reproduced live and
+        // confirmed by a real user before this fix.
+        let actions_was_open = self.show_actions;
+        let export_was_open = self.show_export;
         self.handle_action_keys(ui);
         self.handle_export_keys(ui);
         match self.mode {
@@ -1967,16 +2133,18 @@ impl eframe::App for GuiApp {
                 // -- same early-exit `tui.rs`'s `on_key` does for
                 // `show_actions`, so e.g. its digit keys can't also rate the
                 // tile underneath it.
-                if !self.show_actions && !self.show_export {
+                if !actions_was_open && !export_was_open {
                     self.handle_nav_keys(ui);
                     self.handle_rating_keys(ui);
+                    self.handle_mark_keys(ui);
                 }
                 self.draw_grid(ui);
             }
             Mode::Single => {
-                if !self.show_actions && !self.show_export {
+                if !actions_was_open && !export_was_open {
                     self.handle_single_keys(ui);
                     self.handle_rating_keys(ui);
+                    self.handle_mark_keys(ui);
                 }
                 self.draw_single(ui);
             }
@@ -1998,20 +2166,33 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
     // falls back to the hardcoded 1280px default -- see thumbs::configure.
     thumbs::configure(&config.thumbs);
 
+    // The catalog lives on this machine, not the drive (README's "Offline"
+    // section) -- browsing cached thumbnails, tagging and rating all still
+    // work without it, matching `tui.rs`'s own offline mode exactly rather
+    // than refusing to launch at all.
     let (cat, online) = Catalog::open_for_root(root)?;
-    if !online {
-        return Err(anyhow!(
-            "{} is not mounted; the GUI needs the files themselves",
-            root.display()
-        ));
-    }
-
-    let v = vol::identify(root)?;
-    let cache = thumbs::Cache::new(&v.uuid)?;
+    // `vol::identify` needs the path to actually resolve to a mounted
+    // filesystem, which is exactly what's missing offline -- the catalog's
+    // own `volume` table remembers the UUID the cache was built under
+    // regardless, so thumbnails already on disk are still found by it.
+    let cache_uuid = if online {
+        vol::identify(root)?.uuid
+    } else {
+        cat.conn
+            .query_row("SELECT vol_uuid FROM volume LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default()
+    };
+    let cache = thumbs::Cache::new(&cache_uuid)?;
     let theme = config.gui.theme;
-    // Already confirmed online above; a failure here (disabled in config,
-    // or the watcher itself erroring) is never fatal to launching the GUI.
-    let watcher = watch::Watcher::spawn(root.to_path_buf(), &config).unwrap_or(None);
+    // The watcher needs the real filesystem, same precondition as
+    // generating a thumbnail that was never cached -- offline, there is
+    // nothing to watch. A failure to start otherwise (disabled in config, or
+    // the watcher itself erroring) is never fatal to launching the GUI.
+    let watcher = if online {
+        watch::Watcher::spawn(root.to_path_buf(), &config).unwrap_or(None)
+    } else {
+        None
+    };
 
     // Embedded at compile time -- see assets/icon-h2-3x3-real-emoji.svg for
     // the source and README.md's "Icon" section for the required Twemoji
@@ -2062,7 +2243,9 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(visuals_for(theme));
-            Ok(Box::new(GuiApp::new(cat, cache, config, watcher, root)))
+            Ok(Box::new(GuiApp::new(
+                cat, cache, config, watcher, root, online,
+            )))
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
@@ -2125,6 +2308,7 @@ mod tests {
             Config::default(),
             None,
             dir.path().to_path_buf(),
+            true,
         );
         (dir, app)
     }
@@ -2464,5 +2648,87 @@ mod tests {
             assert_eq!(app.single_zoom, 1.0);
             assert_eq!(app.single_pan, egui::Vec2::ZERO);
         }
+    }
+
+    /// `mark_selected` must agree with `tui.rs`'s own mutual-exclusivity
+    /// guarantee (enforced in `edit.rs`, not here): flagging a rejected
+    /// stack clears the reject, and vice versa.
+    #[test]
+    fn flag_and_reject_are_mutually_exclusive() {
+        let (_dir, mut app) = app();
+        app.mark_selected(&[Change::SetReject(true)], "reject");
+        assert_eq!((app.rows[0].flag, app.rows[0].reject), (false, true));
+
+        app.mark_selected(&[Change::SetFlag(true)], "flag");
+        assert_eq!(
+            (app.rows[0].flag, app.rows[0].reject),
+            (true, false),
+            "flagging should clear the prior reject"
+        );
+    }
+
+    #[test]
+    fn clearing_marks_resets_both() {
+        let (_dir, mut app) = app();
+        app.mark_selected(&[Change::SetFlag(true)], "flag");
+        assert!(app.rows[0].flag);
+
+        app.mark_selected(&[Change::SetFlag(false), Change::SetReject(false)], "clear");
+        assert_eq!((app.rows[0].flag, app.rows[0].reject), (false, false));
+    }
+
+    /// `mark_selected` goes through `self.targets()`, same as `rate_selected`
+    /// -- a non-empty `multi_selected` means every selected stack, not just
+    /// the cursor.
+    #[test]
+    fn mark_selected_applies_to_the_whole_batch() {
+        let (_dir, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        app.multi_selected = [ids[0], ids[1]].into_iter().collect();
+
+        app.mark_selected(&[Change::SetFlag(true)], "flag");
+
+        assert!(app.rows[0].flag);
+        assert!(app.rows[1].flag);
+        assert!(
+            !app.rows[2].flag,
+            "the unselected third stack must be untouched"
+        );
+    }
+
+    /// Launching an external editor against a file that may not exist is
+    /// exactly what `tui.rs`'s own `online` guard exists to refuse -- same
+    /// message, same reasoning.
+    #[test]
+    fn run_action_refuses_while_offline() {
+        let (_dir, mut app) = app();
+        app.online = false;
+        app.actions = vec![Action {
+            key: "z".into(),
+            name: "Test Editor".into(),
+            cmd: vec!["true".into()],
+            mode: action::Mode::Detach,
+            shell: false,
+        }];
+        app.run_action('z');
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Test Editor not launched: the library is not mounted")
+        );
+    }
+
+    /// Export reads the original pixels, so it needs the drive exactly the
+    /// same way an external editor does.
+    #[test]
+    fn run_export_refuses_while_offline() {
+        let (_dir, mut app) = app();
+        let out = tempfile::tempdir().unwrap();
+        app.config.export_dir = Some(out.path().to_path_buf());
+        app.online = false;
+        app.run_export(0);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("export not available: the library is not mounted")
+        );
     }
 }

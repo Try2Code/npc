@@ -314,8 +314,8 @@ supports normal line editing: arrow keys, Home/End, and readline's
 `npcg` covers the same ground with the mouse: a sidebar (events, tags,
 folders) to filter by, five rating checkboxes instead of typing
 `rating>=N`, a clickable timeline bar in place of the TUI's keyboard-driven
-one, and the same configured action menu. Not ported: the pan/zoom-drag-crop
-single view, RAW/JPG member cycling, and undo -- those stay TUI-only.
+one, and the same configured action menu. Not ported: RAW/JPG member
+cycling and undo -- those stay TUI-only.
 
 ## What it will not do
 

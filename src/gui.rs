@@ -417,6 +417,11 @@ struct GuiApp {
     /// config or failed to start -- either way, just "no automatic
     /// cataloging this session," never fatal to launching the GUI.
     watcher: Option<watch::Watcher>,
+    /// Writes queued sidecars while input pauses; see `edit::Writer`.
+    writer: edit::Writer,
+    /// The window was asked to close while sidecars were still queued: keep
+    /// running, writing them as fast as possible, and close once they're done.
+    closing: bool,
     /// Whether the library's volume is actually mounted right now, exactly
     /// `tui.rs`'s own `online` field. The catalog lives on this machine, not
     /// the drive (README's "Offline" section), so browsing cached
@@ -469,6 +474,8 @@ impl GuiApp {
             query_error: None,
             status: None,
             watcher,
+            writer: edit::Writer::default(),
+            closing: false,
             online,
             rows,
             selected: 0,
@@ -654,6 +661,12 @@ impl GuiApp {
             ));
             return;
         }
+        // An external editor reads files, not the catalog: write anything
+        // still queued first, so it sees the current rating and tags.
+        if let Err(e) = edit::flush(&mut self.cat, &self.config) {
+            self.status = Some(format!("{}: writing sidecars first: {e}", a.name));
+            return;
+        }
         let ids = self.targets();
 
         for &sid in &ids {
@@ -758,40 +771,29 @@ impl GuiApp {
         );
     }
 
-    /// Set (or clear, for `None`) the star rating of every target. Mirrors
-    /// `tui.rs`'s rating keys: same `edit::apply` + `edit::flush` pair, then
-    /// a full reload from the catalog rather than an optimistic local
-    /// update, so the grid never shows a rating that failed to write. No
-    /// undo stack here yet -- `tui.rs` has one; out of scope for this cut.
+    /// Set (or clear, for `None`) the star rating of every target. Only the
+    /// catalog changes here (0.05 ms); the sidecar is written by `writer`
+    /// once input pauses -- writing it and reloading the whole result list
+    /// on every key measured ~200 ms on a 95k-stack library, which is what
+    /// made fast rating lag. The rated rows update in place and stay in view
+    /// even if they no longer match a rating filter, until the query or
+    /// filter changes. No undo stack here yet -- `tui.rs` has one.
     fn rate_selected(&mut self, n: Option<i64>) {
-        let ids = self.targets();
-        if ids.is_empty() {
-            return;
-        }
-        if let Err(e) = edit::apply(&mut self.cat, &ids, &[Change::SetRating(n)], &self.config) {
-            self.status = Some(format!("rate failed: {e}"));
-            return;
-        }
-        self.status = match edit::flush(&mut self.cat, &self.config) {
-            Ok(stats) => Some(format!(
-                "rated {} stack(s): {} sidecar(s) written",
-                ids.len(),
-                stats.sidecars_written
-            )),
-            Err(e) => Some(format!("rate failed: {e}")),
-        };
-        if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
-            self.rows = rows;
-        }
+        self.edit_selected(&[Change::SetRating(n)], "rated");
     }
 
     /// Flag (pick), reject, or clear both marks for every target -- mirrors
     /// `tui.rs`'s `f`/`x`/`c` keys exactly, right down to letting `edit.rs`'s
     /// own `SetFlag`/`SetReject` handling enforce that the two are mutually
     /// exclusive (setting one clears the other at the SQL layer, not here).
-    /// Same `edit::apply` + `edit::flush` + full-reload shape as
-    /// `rate_selected`.
     fn mark_selected(&mut self, changes: &[Change], verb: &str) {
+        self.edit_selected(changes, verb);
+    }
+
+    /// Apply `changes` to every target in the catalog, queue the sidecars
+    /// for `writer`, and refresh just those rows from the catalog -- what it
+    /// actually stored, not an optimistic guess.
+    fn edit_selected(&mut self, changes: &[Change], verb: &str) {
         let ids = self.targets();
         if ids.is_empty() {
             return;
@@ -800,16 +802,22 @@ impl GuiApp {
             self.status = Some(format!("{verb} failed: {e}"));
             return;
         }
-        self.status = match edit::flush(&mut self.cat, &self.config) {
-            Ok(stats) => Some(format!(
-                "{verb}: {} stack(s), {} sidecar(s) written",
-                ids.len(),
-                stats.sidecars_written
-            )),
-            Err(e) => Some(format!("{verb} failed: {e}")),
-        };
-        if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
-            self.rows = rows;
+        self.writer.edited(&ids);
+        self.refresh_rows(&ids);
+        self.status = Some(format!("{verb} {} stack(s)", ids.len()));
+    }
+
+    fn refresh_rows(&mut self, ids: &[i64]) {
+        for row in self.rows.iter_mut().filter(|r| ids.contains(&r.id)) {
+            if let Ok((rating, flag, reject)) = self.cat.conn.query_row(
+                "SELECT rating, flag, reject FROM stack WHERE id = ?1",
+                [row.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ) {
+                row.rating = rating;
+                row.flag = flag;
+                row.reject = reject;
+            }
         }
     }
 
@@ -937,13 +945,8 @@ impl GuiApp {
             self.status = Some(format!("tag failed: {e}"));
             return;
         }
-        self.status = match edit::flush(&mut self.cat, &self.config) {
-            Ok(stats) => Some(format!(
-                "tagged: {} sidecar(s) written",
-                stats.sidecars_written
-            )),
-            Err(e) => Some(format!("tag failed: {e}")),
-        };
+        self.writer.edited(ids);
+        self.status = Some(format!("tagged {} stack(s)", ids.len()));
         self.reload_sidebar();
     }
 
@@ -967,22 +970,8 @@ impl GuiApp {
     fn draw_query_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if !self.online {
-                    let pending: i64 = self
-                        .cat
-                        .conn
-                        .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| {
-                            r.get(0)
-                        })
-                        .unwrap_or(0);
-                    let text = if pending > 0 {
-                        format!("OFFLINE - {pending} pending")
-                    } else {
-                        "OFFLINE".to_string()
-                    };
-                    ui.colored_label(egui::Color32::from_rgb(230, 170, 40), text);
-                    ui.separator();
-                }
+                self.draw_write_state(ui);
+                ui.separator();
                 ui.label("query:");
                 // Neither documented "submit on Enter" idiom actually works
                 // for this, both confirmed directly against egui's own
@@ -2152,6 +2141,128 @@ impl eframe::App for GuiApp {
         self.draw_actions_menu(ui);
         self.draw_export_menu(ui);
         self.poll_thumbnail_generation(ui.ctx());
+        // Last, so an edit made this frame already counts as "not idle".
+        self.drive_writer(ui.ctx());
+    }
+}
+
+/// What the query bar's badge says about the sidecar queue.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteState {
+    /// Nothing queued: every edit is on disk.
+    Saved,
+    /// Queued, waiting for input to pause.
+    Waiting(i64),
+    /// Input paused: writing now.
+    Writing(i64),
+    /// Window close held until these are written.
+    Closing(i64),
+    /// Drive not mounted: queued in the catalog until it is.
+    Offline(i64),
+}
+
+impl GuiApp {
+    fn write_state(&self) -> WriteState {
+        let queued = edit::queued(&self.cat).unwrap_or(0);
+        let todo = queued - i64::try_from(self.writer.stuck()).unwrap_or(0);
+        if !self.online {
+            WriteState::Offline(queued)
+        } else if todo <= 0 {
+            WriteState::Saved
+        } else if self.closing {
+            WriteState::Closing(todo)
+        } else if self.writer.is_idle() {
+            WriteState::Writing(todo)
+        } else {
+            WriteState::Waiting(todo)
+        }
+    }
+
+    fn draw_write_state(&self, ui: &mut egui::Ui) {
+        let amber = egui::Color32::from_rgb(230, 170, 40);
+        let green = egui::Color32::from_rgb(90, 170, 90);
+        let red = egui::Color32::from_rgb(220, 80, 60);
+        match self.write_state() {
+            WriteState::Saved => {
+                ui.colored_label(green, "saved")
+                    .on_hover_text("Every rating, mark and tag is written to its sidecar.");
+            }
+            WriteState::Waiting(n) => {
+                ui.colored_label(amber, format!("{n} to write"))
+                    .on_hover_text(
+                        "Changes are in the catalog; their sidecars are written \
+                     once you pause. Closing the window waits for them.",
+                    );
+            }
+            WriteState::Writing(n) => {
+                ui.spinner();
+                ui.colored_label(amber, format!("writing {n}"));
+            }
+            WriteState::Closing(n) => {
+                ui.spinner();
+                ui.colored_label(amber, format!("saving {n} before closing"));
+            }
+            WriteState::Offline(n) => {
+                let text = if n > 0 {
+                    format!("OFFLINE - {n} queued")
+                } else {
+                    "OFFLINE".to_string()
+                };
+                ui.colored_label(amber, text).on_hover_text(
+                    "The library drive isn't mounted. Changes stay queued in \
+                     the catalog and are written the next time it is.",
+                );
+            }
+        }
+        let stuck = self.writer.stuck();
+        if stuck > 0 && self.online {
+            ui.colored_label(red, format!("{stuck} can't be written"))
+                .on_hover_text(
+                    "Their folder is missing or protected. They stay queued in \
+                 the catalog; editing one tries it again, `npc sync` retries all.",
+                );
+        }
+    }
+
+    /// Sidecars the writer could still write: queued, drive mounted, and not
+    /// stuck (folder gone, protected).
+    fn writable(&self) -> bool {
+        let queued = edit::queued(&self.cat).unwrap_or(0);
+        self.online && queued > i64::try_from(self.writer.stuck()).unwrap_or(i64::MAX)
+    }
+
+    /// Writes queued sidecars while input pauses, and holds a window close
+    /// until nothing writable is left. Offline there is nothing to write to:
+    /// the close goes through and the queue waits in the catalog.
+    fn drive_writer(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.writable() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = true;
+        }
+        if !self.writable() {
+            if self.closing {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        if !self.closing && !self.writer.is_idle() {
+            ctx.request_repaint_after(self.writer.until_idle());
+            return;
+        }
+        // Idle: one ~65 ms write per frame, so a key pressed meanwhile waits
+        // at most one write. Closing: several per frame, progress still shown.
+        let budget = if self.closing { 8 } else { 1 };
+        for _ in 0..budget {
+            match self.writer.step(&mut self.cat, &self.config) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    self.status = Some(format!("writing sidecars: {e}"));
+                    break;
+                }
+            }
+        }
+        ctx.request_repaint();
     }
 }
 
@@ -2715,6 +2826,123 @@ mod tests {
             app.status.as_deref(),
             Some("Test Editor not launched: the library is not mounted")
         );
+    }
+
+    fn sidecar_of(app: &GuiApp, dir: &Path, id: i64) -> std::path::PathBuf {
+        let base: String = app
+            .cat
+            .conn
+            .query_row("SELECT base FROM stack WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        dir.join("2026/08/09").join(format!("{base}.xmp"))
+    }
+
+    /// A rating key is a catalog update only: the row changes in place, the
+    /// sidecar waits for the idle writer, and the badge tracks the queue.
+    #[test]
+    fn rating_queues_the_sidecar_and_the_idle_writer_writes_it() {
+        let (dir, mut app) = app();
+        edit::flush(&mut app.cat, &Config::default()).unwrap();
+        assert_eq!(app.write_state(), WriteState::Saved);
+
+        let id = app.rows[0].id;
+        let sidecar = sidecar_of(&app, dir.path(), id);
+        let before = std::fs::read(&sidecar).ok();
+        app.rate_selected(Some(4));
+        assert_eq!(app.rows[0].rating, Some(4), "updated in place");
+        assert_eq!(
+            std::fs::read(&sidecar).ok(),
+            before,
+            "nothing written on the key"
+        );
+        assert_eq!(app.write_state(), WriteState::Waiting(1));
+
+        app.writer.idle_after = std::time::Duration::ZERO;
+        assert_eq!(app.write_state(), WriteState::Writing(1));
+        assert!(app.writer.step(&mut app.cat, &Config::default()).unwrap());
+        assert_eq!(app.write_state(), WriteState::Saved);
+        assert_ne!(std::fs::read(&sidecar).ok(), before, "written once idle");
+    }
+
+    /// Rated under a rating filter, a photo stays in view with its new
+    /// rating -- fast culling never shifts the selection under you -- until
+    /// the filter or query changes.
+    #[test]
+    fn a_rated_photo_stays_in_view_until_the_filter_changes() {
+        let (_dir, mut app) = app();
+        app.rating_filter = [false, false, false, false, true];
+        app.refresh_rows_after_rating_filter_change();
+        assert_eq!(app.rows.len(), 1);
+
+        app.rate_selected(Some(1));
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].rating, Some(1));
+
+        app.refresh_rows_after_rating_filter_change();
+        assert!(app.rows.is_empty());
+    }
+
+    fn frame(app: &mut GuiApp, ctx: &egui::Context, close: bool) -> Vec<egui::ViewportCommand> {
+        let mut input = egui::RawInput::default();
+        if close {
+            input.viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            );
+        }
+        let out = ctx.run_ui(input, |ui| app.drive_writer(ui.ctx()));
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// Closing the window with sidecars still queued is held -- even mid
+    /// rating, before the idle pause -- until they're all written; then the
+    /// window closes itself.
+    #[test]
+    fn closing_waits_until_every_queued_sidecar_is_written() {
+        let (_dir, mut app) = app();
+        let ctx = egui::Context::default();
+        app.rate_selected(Some(3));
+        assert!(edit::queued(&app.cat).unwrap() > 0);
+
+        let first = frame(&mut app, &ctx, true);
+        assert!(first.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(
+            app.write_state(),
+            WriteState::Closing(_) | WriteState::Saved
+        ));
+
+        let mut closed = false;
+        for _ in 0..10 {
+            if frame(&mut app, &ctx, false).contains(&egui::ViewportCommand::Close) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the window never closed itself");
+        assert_eq!(
+            edit::queued(&app.cat).unwrap(),
+            0,
+            "closed with writes outstanding"
+        );
+    }
+
+    /// Offline there's nothing to write to: the queue waits in the catalog
+    /// and a close goes straight through.
+    #[test]
+    fn offline_a_close_is_not_held() {
+        let (_dir, mut app) = app();
+        let ctx = egui::Context::default();
+        app.online = false;
+        app.rate_selected(Some(3));
+        assert!(matches!(app.write_state(), WriteState::Offline(n) if n > 0));
+        let cmds = frame(&mut app, &ctx, true);
+        assert!(!cmds.contains(&egui::ViewportCommand::CancelClose));
     }
 
     /// Export reads the original pixels, so it needs the drive exactly the

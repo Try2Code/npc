@@ -330,6 +330,11 @@ pub struct App {
     show_actions: bool,
     undo: Vec<UndoStep>,
     quit: bool,
+    /// Writes queued sidecars while keys pause; see `edit::Writer`.
+    writer: edit::Writer,
+    /// `q` was pressed with sidecars still queued: keep running, writing
+    /// them flat out, and exit once none are left.
+    closing: bool,
 
     view: View,
     cache: Option<thumbs::Cache>,
@@ -447,6 +452,8 @@ impl App {
             show_actions: false,
             undo: Vec::new(),
             quit: false,
+            writer: edit::Writer::default(),
+            closing: false,
             view: View::List,
             cache: None,
             watcher: None,
@@ -1012,6 +1019,82 @@ impl App {
         Ok(out)
     }
 
+    /// Sidecars the writer could still write: queued, drive mounted, and not
+    /// stuck (folder gone, protected).
+    fn writable(&self) -> bool {
+        let queued = edit::queued(&self.cat).unwrap_or(0);
+        self.online && queued > i64::try_from(self.writer.stuck()).unwrap_or(i64::MAX)
+    }
+
+    /// Write queued sidecars once keys have paused, or flat out after `q`.
+    /// Returns how long the event loop may wait for a key before calling
+    /// again: zero while there's writing to do.
+    fn drive_writer(&mut self) -> Duration {
+        const POLL: Duration = Duration::from_millis(120);
+        if self.quit && self.writable() {
+            self.closing = true;
+        }
+        if !self.writable() {
+            return POLL;
+        }
+        if !self.closing && !self.writer.is_idle() {
+            return self.writer.until_idle().min(POLL);
+        }
+        // Idle: one ~65 ms write per pass, so a key pressed meanwhile waits
+        // at most one write. Quitting: several per pass, progress still drawn.
+        let budget = if self.closing { 8 } else { 1 };
+        for _ in 0..budget {
+            match self.writer.step(&mut self.cat, &self.config) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    self.status = format!("writing sidecars: {e}");
+                    break;
+                }
+            }
+        }
+        Duration::ZERO
+    }
+
+    /// `q` was pressed and nothing writable is left. Offline there is nothing
+    /// to write to: the queue waits in the catalog for next time.
+    fn may_exit(&self) -> bool {
+        self.quit && !self.writable()
+    }
+
+    /// The status line's report on the sidecar queue, and whether it's
+    /// something to notice (vs. the quiet "saved").
+    fn write_badge(&self) -> (String, bool) {
+        let queued = edit::queued(&self.cat).unwrap_or(0);
+        let stuck = self.writer.stuck();
+        let todo = queued - i64::try_from(stuck).unwrap_or(0);
+        let mut text = if !self.online {
+            if queued > 0 {
+                format!("OFFLINE - {queued} queued")
+            } else {
+                "OFFLINE".to_string()
+            }
+        } else if todo <= 0 {
+            "saved".to_string()
+        } else if self.closing {
+            format!("saving {todo} before quitting")
+        } else if self.writer.is_idle() {
+            format!("writing {todo}")
+        } else {
+            format!("{todo} to write")
+        };
+        if stuck > 0 && self.online {
+            text = format!("{text}, {stuck} can't be written");
+        }
+        let notable = !self.online || todo > 0 || stuck > 0;
+        (format!("  {text}  "), notable)
+    }
+
+    /// Apply an edit to the catalog only (0.05 ms) and queue the sidecars
+    /// for `writer`, which writes them once keys pause -- writing on every
+    /// key (~65 ms each, plus a reload) is what made fast rating lag. The
+    /// edited rows are re-read in place, so they stay in view until the
+    /// query changes, same as npcg.
     fn edit(&mut self, changes: &[Change], label: &str) -> Result<()> {
         let ids = self.targets();
         if ids.is_empty() {
@@ -1027,7 +1110,7 @@ impl App {
                 return Ok(());
             }
         }
-        let stats = edit::flush(&mut self.cat, &self.config)?;
+        self.writer.edited(&ids);
 
         self.undo.push(UndoStep {
             label: label.to_string(),
@@ -1037,16 +1120,44 @@ impl App {
             self.undo.remove(0);
         }
 
-        self.status = if stats.errors.is_empty() {
-            format!(
-                "{label}: {} stack(s), {} sidecar(s) written",
-                ids.len(),
-                stats.sidecars_written
+        self.status = format!("{label}: {} stack(s)", ids.len());
+        self.refresh_rows(&ids)?;
+        if changes.iter().any(|c| {
+            matches!(
+                c,
+                Change::AddTags(_) | Change::RemoveTags(_) | Change::ClearTags
             )
-        } else {
-            format!("{label}: {}", stats.errors[0])
-        };
-        self.reload()
+        }) {
+            self.reload_sidebar()?;
+        }
+        Ok(())
+    }
+
+    /// Re-read edited rows from the catalog in place -- what it stored, not a
+    /// guess -- without re-running the query.
+    fn refresh_rows(&mut self, ids: &[i64]) -> Result<()> {
+        for row in self.rows.iter_mut().filter(|r| ids.contains(&r.id)) {
+            let (rating, flag, reject): (Option<i64>, i64, i64) = self.cat.conn.query_row(
+                "SELECT rating, flag, reject FROM stack WHERE id = ?1",
+                [row.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            row.rating = rating;
+            row.flag = flag == 1;
+            row.reject = reject == 1;
+            row.tags = self
+                .cat
+                .conn
+                .prepare(
+                    "SELECT t.name FROM tag t JOIN stack_tag st ON st.tag_id = t.id
+                     WHERE st.stack_id = ?1 ORDER BY t.name",
+                )?
+                .query_map([row.id], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+        Ok(())
     }
 
     fn undo(&mut self) -> Result<()> {
@@ -1054,6 +1165,7 @@ impl App {
             self.status = "nothing to undo".into();
             return Ok(());
         };
+        let mut ids = Vec::new();
         for (id, tags, rating, flag, reject) in &step.prior {
             let changes = vec![
                 Change::ClearTags,
@@ -1063,10 +1175,12 @@ impl App {
                 Change::SetReject(*reject),
             ];
             edit::apply(&mut self.cat, &[*id], &changes, &self.config)?;
+            ids.push(*id);
         }
-        edit::flush(&mut self.cat, &self.config)?;
+        self.writer.edited(&ids);
         self.status = format!("undid: {}", step.label);
-        self.reload()
+        self.refresh_rows(&ids)?;
+        self.reload_sidebar()
     }
 
     // --- input -----------------------------------------------------------
@@ -1661,6 +1775,10 @@ impl App {
             }
         }
 
+        // An external editor reads files, not the catalog: write anything
+        // still queued first, so it sees the current rating and tags.
+        edit::flush(&mut self.cat, &self.config)?;
+
         let current = self.rows.get(self.cursor).map(|r| r.id);
         let sel = action::gather(&self.cat, &ids, current, &self.query)?;
 
@@ -1747,32 +1865,18 @@ impl App {
         } else {
             format!(" {}/{} ", self.cursor + 1, self.rows.len())
         };
-        let pending: i64 = self
-            .cat
-            .conn
-            .query_row("SELECT COUNT(*) FROM stack WHERE dirty = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0);
-        let offline_badge = if self.online {
-            String::new()
-        } else {
-            format!(
-                "  OFFLINE{}  ",
-                if pending > 0 {
-                    format!(" - {pending} pending")
-                } else {
-                    String::new()
-                }
-            )
-        };
+        let (write_badge, notable) = self.write_badge();
 
         let identity = Line::from(vec![
             Span::styled(
-                offline_badge,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(self.config.colors.accent),
+                write_badge,
+                if notable {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(self.config.colors.accent)
+                } else {
+                    Style::default().fg(self.config.colors.muted)
+                },
             ),
             Span::styled(
                 if self.query.is_empty() {
@@ -2521,9 +2625,13 @@ pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
         loop {
             terminal.draw(|f| app.draw(f))?;
 
+            // Between keys: write queued sidecars once keys pause, flat out
+            // after `q`. Zero wait while there's writing left to do.
+            let wait = app.drive_writer();
+
             // Poll rather than block: thumbnails finish on a worker thread and
             // the frame they belong to has to be redrawn when they land.
-            if event::poll(Duration::from_millis(120))? {
+            if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind == event::KeyEventKind::Press {
@@ -2560,7 +2668,7 @@ pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
                     let _ = app.reload();
                 }
             }
-            if app.quit {
+            if app.may_exit() {
                 break;
             }
         }
@@ -2754,14 +2862,61 @@ mod tests {
         assert!(app.selected.is_empty());
     }
 
+    /// What the event loop does between keys once they pause: run the
+    /// writer until nothing writable is left.
+    fn drain(app: &mut App) {
+        app.writer.idle_after = Duration::ZERO;
+        while app.drive_writer() == Duration::ZERO {}
+    }
+
+    /// A rating key changes the catalog and the row at once; the sidecar is
+    /// written once keys pause, not on the key -- writing per key is what
+    /// made fast rating lag.
     #[test]
-    fn rating_the_cursor_row_writes_a_sidecar() {
+    fn rating_the_cursor_row_writes_a_sidecar_once_keys_pause() {
         let (dir, mut app) = app();
         press(&mut app, '3');
 
         let sidecar = dir.path().join("2026/08/09/750_0001.xmp");
-        assert!(sidecar.exists(), "rating did not reach disk");
         assert_eq!(app.rows[0].rating, Some(3));
+        assert!(!sidecar.exists(), "written on the key, not deferred");
+        assert_eq!(app.write_badge().0.trim(), "1 to write");
+
+        drain(&mut app);
+        assert!(sidecar.exists(), "rating did not reach disk");
+        assert_eq!(app.write_badge().0.trim(), "saved");
+    }
+
+    /// `q` with sidecars queued doesn't exit until they're written.
+    #[test]
+    fn quitting_waits_until_every_queued_sidecar_is_written() {
+        let (dir, mut app) = app();
+        press(&mut app, '4');
+        press(&mut app, 'q');
+        assert!(!app.may_exit(), "would exit with a write outstanding");
+
+        // The event loop: keep driving the writer until it may exit.
+        let mut passes = 0;
+        while !app.may_exit() {
+            app.drive_writer();
+            passes += 1;
+            assert!(passes < 100, "never finished writing");
+        }
+        assert!(app.closing);
+        assert!(dir.path().join("2026/08/09/750_0001.xmp").exists());
+    }
+
+    /// Offline there is nothing to write to: `q` exits at once and the edit
+    /// stays queued in the catalog for the next time the drive is mounted.
+    #[test]
+    fn quitting_offline_does_not_wait() {
+        let (_dir, mut app) = app();
+        app.online = false;
+        press(&mut app, '4');
+        press(&mut app, 'q');
+        assert!(app.may_exit());
+        assert_eq!(edit::queued(&app.cat).unwrap(), 1);
+        assert_eq!(app.write_badge().0.trim(), "OFFLINE - 1 queued");
     }
 
     #[test]
@@ -2770,6 +2925,7 @@ mod tests {
         press(&mut app, ' ');
         press(&mut app, ' '); // two selected
         press(&mut app, '5');
+        drain(&mut app);
 
         assert!(dir.path().join("2026/08/09/750_0001.xmp").exists());
         assert!(dir.path().join("2026/08/09/750_0002.xmp").exists());
@@ -3495,6 +3651,7 @@ mod tests {
         press(&mut app, 'l');
         press(&mut app, '5');
         assert_eq!(app.rows[1].rating, Some(5));
+        drain(&mut app);
         assert!(dir.path().join("2026/08/09/750_0002.xmp").exists());
     }
 

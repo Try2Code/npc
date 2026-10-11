@@ -176,39 +176,145 @@ pub fn flush(cat: &mut Catalog, config: &Config) -> Result<EditStats> {
     };
 
     for (sid, dir, base) in dirty {
-        let sidecar = PathBuf::from(&dir).join(format!("{base}.xmp"));
-
-        if let Err(e) = config.ensure_mutable(&sidecar) {
-            stats.errors.push(e.to_string());
-            continue;
-        }
-
-        if !Path::new(&dir).is_dir() {
-            // Offline: leave it dirty and queued for the next flush.
-            stats.queued_offline += 1;
-            continue;
-        }
-
-        let doc = build_doc(cat, sid)?;
-        match meta::write_sidecar(sidecar.to_str().unwrap_or_default(), &doc) {
-            Ok(()) => {
-                let mtime = std::fs::metadata(&sidecar).ok().map_or(0, |m| {
-                    use std::os::unix::fs::MetadataExt;
-                    m.mtime() * 1_000_000_000 + m.mtime_nsec()
-                });
-                cat.conn.execute(
-                    "UPDATE stack SET dirty = 0, sidecar_mtime = ?2 WHERE id = ?1",
-                    params![sid, mtime],
-                )?;
-                cat.conn
-                    .execute("DELETE FROM pending WHERE stack_id = ?1", params![sid])?;
-                stats.sidecars_written += 1;
-            }
-            Err(e) => stats.errors.push(format!("{}: {e}", sidecar.display())),
-        }
+        flush_stack(cat, config, sid, &dir, &base, &mut stats)?;
     }
 
     Ok(stats)
+}
+
+/// Write one dirty stack's sidecar. `true` if written; otherwise it stays
+/// queued and `stats` says why (offline, protected, write error).
+fn flush_stack(
+    cat: &mut Catalog,
+    config: &Config,
+    sid: i64,
+    dir: &str,
+    base: &str,
+    stats: &mut EditStats,
+) -> Result<bool> {
+    let sidecar = PathBuf::from(dir).join(format!("{base}.xmp"));
+
+    if let Err(e) = config.ensure_mutable(&sidecar) {
+        stats.errors.push(e.to_string());
+        return Ok(false);
+    }
+
+    if !Path::new(dir).is_dir() {
+        // Offline: leave it dirty and queued for the next flush.
+        stats.queued_offline += 1;
+        return Ok(false);
+    }
+
+    let doc = build_doc(cat, sid)?;
+    match meta::write_sidecar(sidecar.to_str().unwrap_or_default(), &doc) {
+        Ok(()) => {
+            let mtime = std::fs::metadata(&sidecar).ok().map_or(0, |m| {
+                use std::os::unix::fs::MetadataExt;
+                m.mtime() * 1_000_000_000 + m.mtime_nsec()
+            });
+            cat.conn.execute(
+                "UPDATE stack SET dirty = 0, sidecar_mtime = ?2 WHERE id = ?1",
+                params![sid, mtime],
+            )?;
+            cat.conn
+                .execute("DELETE FROM pending WHERE stack_id = ?1", params![sid])?;
+            stats.sidecars_written += 1;
+            Ok(true)
+        }
+        Err(e) => {
+            stats.errors.push(format!("{}: {e}", sidecar.display()));
+            Ok(false)
+        }
+    }
+}
+
+/// Stacks edited in the catalog whose sidecar isn't written yet. Counted
+/// from the small `pending` table, not by scanning every stack: the
+/// browsers show this on every redraw.
+pub fn queued(cat: &Catalog) -> Result<i64> {
+    Ok(cat
+        .conn
+        .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))?)
+}
+
+/// Writes queued sidecars one at a time, between keypresses.
+///
+/// Measured on a 95k-stack library: an edit in the catalog takes 0.05 ms, a
+/// sidecar write ~65 ms. Writing on every keypress made fast rating lag, so
+/// the browsers only `apply` on a key and let this write once input pauses.
+/// The queue is the catalog's own `dirty`/`pending` state -- not something
+/// held in memory -- so nothing is lost if the program dies with writes
+/// outstanding; the next flush picks them up.
+///
+/// Runs on the caller's thread with the caller's catalog connection, so no
+/// second writer can race an edit made between two steps.
+pub struct Writer {
+    last_edit: std::time::Instant,
+    /// Stacks that couldn't be written this session (folder gone, protected,
+    /// write error), so an idle loop doesn't retry the same one every step.
+    /// Editing a stack again gives it another chance.
+    stuck: std::collections::HashSet<i64>,
+    pub idle_after: std::time::Duration,
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Self {
+            last_edit: std::time::Instant::now(),
+            stuck: std::collections::HashSet::new(),
+            idle_after: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+impl Writer {
+    /// Call after every `apply`.
+    pub fn edited(&mut self, ids: &[i64]) {
+        self.last_edit = std::time::Instant::now();
+        for id in ids {
+            self.stuck.remove(id);
+        }
+    }
+
+    /// No edit for `idle_after`.
+    pub fn is_idle(&self) -> bool {
+        self.last_edit.elapsed() >= self.idle_after
+    }
+
+    /// How long until `is_idle`, for a UI that only repaints on demand.
+    pub fn until_idle(&self) -> std::time::Duration {
+        self.idle_after.saturating_sub(self.last_edit.elapsed())
+    }
+
+    /// Queued stacks this session couldn't write.
+    pub fn stuck(&self) -> usize {
+        self.stuck.len()
+    }
+
+    /// Write the oldest queued sidecar not already stuck. `Ok(false)` when
+    /// there was nothing left to try.
+    pub fn step(&mut self, cat: &mut Catalog, config: &Config) -> Result<bool> {
+        let next: Vec<(i64, String, String)> = {
+            let mut stmt = cat.conn.prepare(
+                "SELECT s.id, s.dir, s.base FROM pending p JOIN stack s ON s.id = p.stack_id
+                 ORDER BY p.queued_at, s.id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // Written meanwhile by a full `flush` (the TUI's `w`): not stuck anymore.
+        self.stuck
+            .retain(|id| next.iter().any(|(queued, ..)| queued == id));
+        let Some((sid, dir, base)) = next.into_iter().find(|(id, ..)| !self.stuck.contains(id))
+        else {
+            return Ok(false);
+        };
+        let mut stats = EditStats::default();
+        if !flush_stack(cat, config, sid, &dir, &base, &mut stats)? {
+            self.stuck.insert(sid);
+        }
+        Ok(true)
+    }
 }
 
 /// Assemble the sidecar contents from the catalog's view of a stack.
@@ -513,6 +619,82 @@ mod tests {
             .query_row("SELECT dirty FROM stack WHERE id = ?1", [sid], |r| r.get(0))
             .unwrap();
         assert_eq!(dirty, 0);
+    }
+
+    fn stack_in(cat: &Catalog, dir: &Path, base: &str) -> i64 {
+        cat.conn
+            .execute(
+                "INSERT INTO stack (dir, base) VALUES (?1, ?2)",
+                rusqlite::params![dir.to_str().unwrap(), base],
+            )
+            .unwrap();
+        cat.conn.last_insert_rowid()
+    }
+
+    /// The idle writer drains the queue one sidecar per step, and says when
+    /// there is nothing left.
+    #[test]
+    fn the_writer_drains_the_queue_one_sidecar_per_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+        let a = stack_in(&cat, dir.path(), "750_0001");
+        let b = stack_in(&cat, dir.path(), "750_0002");
+        apply(
+            &mut cat,
+            &[a, b],
+            &[Change::SetRating(Some(3))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let mut w = Writer::default();
+        w.edited(&[a, b]);
+        assert_eq!(queued(&cat).unwrap(), 2);
+        assert!(w.step(&mut cat, &Config::default()).unwrap());
+        assert_eq!(queued(&cat).unwrap(), 1);
+        assert!(w.step(&mut cat, &Config::default()).unwrap());
+        assert_eq!(queued(&cat).unwrap(), 0);
+        assert!(!w.step(&mut cat, &Config::default()).unwrap());
+        assert!(dir.path().join("750_0001.xmp").exists());
+        assert!(dir.path().join("750_0002.xmp").exists());
+    }
+
+    /// A stack whose folder is gone stays queued and is skipped -- the writer
+    /// moves on instead of retrying it every step -- until it's edited again.
+    #[test]
+    fn a_stack_the_writer_cant_write_is_skipped_until_edited_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+        let gone = stack_in(&cat, &dir.path().join("unplugged"), "750_0001");
+        let ok = stack_in(&cat, dir.path(), "750_0002");
+        apply(
+            &mut cat,
+            &[gone, ok],
+            &[Change::SetRating(Some(2))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let mut w = Writer::default();
+        while w.step(&mut cat, &Config::default()).unwrap() {}
+        assert_eq!(queued(&cat).unwrap(), 1, "the unplugged one stays queued");
+        assert_eq!(w.stuck(), 1);
+        assert!(dir.path().join("750_0002.xmp").exists());
+
+        w.edited(&[gone]);
+        assert_eq!(w.stuck(), 0);
+        assert!(w.step(&mut cat, &Config::default()).unwrap(), "tried again");
+        assert_eq!(w.stuck(), 1);
+    }
+
+    #[test]
+    fn the_writer_is_idle_only_after_a_pause_in_edits() {
+        let mut w = Writer::default();
+        w.edited(&[1]);
+        assert!(!w.is_idle());
+        assert!(w.until_idle() > std::time::Duration::ZERO);
+        w.idle_after = std::time::Duration::ZERO;
+        assert!(w.is_idle());
     }
 
     /// Regression: the guard must refuse **before** mutating the catalog.

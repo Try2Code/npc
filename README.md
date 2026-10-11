@@ -263,11 +263,23 @@ npc tag add beach -q 'date=2026-08-09' --dry-run
 `npc import` with no path detects mounted cards (any mount with a top-level
 `DCIM` folder) and prompts you to pick one or more; `npc import <path>`
 still works directly for scripting. `--library` defaults to the configured
-library like every other subcommand. A file is skipped as "already in the
-library" once its identity (camera serial + shutter count, or capture time
-as a fallback) and size match something already cataloged -- hashing every
-already-imported file on every re-scan was measured too slow to be the
-default. `--verify-content` hash-verifies the full bytes on top of that, for
+library like every other subcommand.
+
+Each card file is checked in two levels. First from the catalog alone,
+without reading the file: a library file with the same name (extension
+included) and size -- and, for files imported from 0.5.0 on, the same mtime
+the file had on the card -- means it is already imported. What's left is
+read once per shot and matched by camera serial + shutter count + file type
+(a JPG only against JPGs): same size, already imported; different size, the
+same file with rewritten metadata, which is merged rather than copied again;
+found only as the other type, a missing RAW or JPG, which is copied into
+that shot's existing stack. That also works across cards in one run, so
+RAW on one card and JPG on another end up in one stack. A shared basename
+alone never joins two shots: a new shot whose name is already taken in its
+day folder gets a `_1`-style suffix. `--deep` skips the first level and
+confirms every file by shutter count. Re-imports of a card that is never
+reformatted take seconds; hashing every already-imported file was measured
+too slow to be the default. `--verify-content` hash-verifies the full bytes on top of that, for
 when you know a same-size edit is in play; when it finds an identity+size
 match whose content actually differs, it reports a `near-miss` line with the
 byte count and offset of the difference, rather than importing silently. A

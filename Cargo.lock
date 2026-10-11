@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "npc"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arboard",

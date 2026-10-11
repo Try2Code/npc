@@ -44,6 +44,16 @@ walkdir = "2"
 opt-level = 3
 lto = "thin"
 
+# What `./check` actually builds and runs tests under. Same opt-level as
+# release -- real-library tests decode real RAW files and need release-speed
+# SQLite/image code to run in reasonable time -- but no LTO: that buys
+# runtime speed in the binary someone installs, nothing in a test run about
+# to be thrown away, and it's paid at *link* time, once per test binary,
+# every single `./check` regardless of how small the edit was.
+[profile.release-nolto]
+inherits = "release"
+lto = false
+
 # Lint level lives here rather than only in `check`, so `cargo build`, `cargo
 # test` and your editor all enforce the same bar. `check` adds `-D warnings`,
 # which promotes everything below to an error there.

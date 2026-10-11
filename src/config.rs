@@ -184,6 +184,15 @@ pub struct Config {
     /// it every time" role `library` plays for `--root`.
     #[serde(default)]
     pub export_dir: Option<PathBuf>,
+    /// Name -> absolute path, for an `[[action]]`/`[[export]]` `cmd` whose
+    /// first element needs resolving to more than whatever `PATH` the
+    /// process happened to start with. A GUI launcher (a `.desktop` file, an
+    /// app-menu icon) commonly hands a process the bare session `PATH`
+    /// (`/usr/bin`, `/bin`, ...), not an interactive shell's one -- a tool
+    /// installed under `~/local/bin` or similar is invisible there even
+    /// though `which` finds it fine from a terminal. See `resolve_tool`.
+    #[serde(default)]
+    pub tools: std::collections::HashMap<String, String>,
 }
 
 impl Config {
@@ -202,6 +211,23 @@ impl Config {
         self.export_dir.as_deref().map(expand_home).or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures/export"))
         })
+    }
+
+    /// `name` as given, unless `[tools]` configures a path for it -- in
+    /// which case that path (`~` expanded) is used instead. Every external
+    /// command this project runs (`[[action]]`, `[[export]]` presets) goes
+    /// through this before `Command::new`, so configuring a tool once here
+    /// fixes it regardless of which `cmd` entries reference it, and
+    /// regardless of what `PATH` the process launching npc/npcg happened to
+    /// start with.
+    pub fn resolve_tool<'a>(&'a self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.tools.get(name) {
+            Some(path) => expand_home(Path::new(path))
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+            None => name.into(),
+        }
     }
 
     /// Where catalogs are kept, honouring `catalog_dir` if it is set.
@@ -372,6 +398,31 @@ mod tests {
             c.default_export_dir(),
             Some(PathBuf::from(home).join("Pictures/graded"))
         );
+    }
+
+    #[test]
+    fn resolve_tool_falls_back_to_the_bare_name_when_unconfigured() {
+        let c = Config::default();
+        assert_eq!(c.resolve_tool("spektra"), "spektra");
+    }
+
+    #[test]
+    fn resolve_tool_uses_the_configured_path_and_expands_home() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let mut tools = std::collections::HashMap::new();
+        tools.insert("spektra".to_string(), "~/local/bin/spektra".to_string());
+        let c = Config {
+            tools,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.resolve_tool("spektra"),
+            PathBuf::from(home)
+                .join("local/bin/spektra")
+                .to_string_lossy()
+        );
+        // An unconfigured name is untouched, even with other tools set.
+        assert_eq!(c.resolve_tool("gimp"), "gimp");
     }
 
     #[test]

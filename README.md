@@ -216,6 +216,9 @@ quality = 80
 [watch]
 enabled = true      # auto-catalog new files that appear while tui/npcg is open
 
+[tools]                                     # resolve a cmd[0] below to a path,
+spektra = "~/local/bin/spektra"             # regardless of how npc/npcg was launched
+
 [[action]]                                  # what the `a` menu launches
 key  = "r"
 name = "RawTherapee"

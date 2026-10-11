@@ -973,7 +973,7 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            let outcome = npc::action::run(chosen, &sel)?;
+            let outcome = npc::action::run(chosen, &sel, &config)?;
             println!("{}", outcome.description);
             if let Some(text) = outcome.output {
                 if !text.is_empty() {

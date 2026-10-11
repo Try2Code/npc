@@ -65,6 +65,17 @@ enabled = true
 debounce_ms = 2000   # how long a directory must go quiet before it's rescanned
 exclude = []          # extra top-level directory names to never watch
 
+# Resolve a command name used in [[action]]/[[export]] cmd to a specific
+# path, instead of trusting whatever PATH the process happened to start
+# with. Matters most for npcg launched from a desktop icon or .desktop
+# file: that typically gets the bare session PATH (/usr/bin, /bin, ...), not
+# an interactive shell's PATH, so a tool installed somewhere like
+# ~/local/bin is invisible there even though `which` finds it fine from a
+# terminal. Only the first element of a cmd array is looked up here; the
+# rest are arguments, untouched.
+#[tools]
+#spektra = "~/local/bin/spektra"
+
 # --- Actions: what the TUI's `a` menu launches on the current selection ---
 #
 # Defining ANY [[action]] block replaces the built-ins entirely (not

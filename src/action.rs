@@ -219,11 +219,14 @@ pub struct Outcome {
 
 /// Run an action. `Wait` and `Term` callers must have left the alternate
 /// screen already.
-pub fn run(action: &Action, sel: &Selection) -> Result<Outcome> {
+pub fn run(action: &Action, sel: &Selection, config: &crate::config::Config) -> Result<Outcome> {
     let argv = build_argv(action, sel)?;
 
     if action.shell {
-        // Explicitly opted in; documented as the user's responsibility.
+        // Explicitly opted in; documented as the user's responsibility,
+        // which includes writing its own correct path if `PATH` alone isn't
+        // enough -- `resolve_tool` only ever substitutes a whole argv[0],
+        // and a shell command line has no single such slot to substitute.
         let joined = argv.join(" ");
         let status = Command::new("sh").arg("-c").arg(&joined).status()?;
         return Ok(Outcome {
@@ -232,7 +235,7 @@ pub fn run(action: &Action, sel: &Selection) -> Result<Outcome> {
         });
     }
 
-    let mut cmd = Command::new(&argv[0]);
+    let mut cmd = Command::new(config.resolve_tool(&argv[0]).as_ref());
     cmd.args(&argv[1..]);
 
     match action.mode {

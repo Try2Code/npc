@@ -190,7 +190,7 @@ pub fn export(
         }
 
         let result = match opts.preset {
-            Some(p) => run_preset(p, &src, &dst),
+            Some(p) => run_preset(p, &src, &dst, config),
             None => render(&src, embedded, orientation, &dst, opts),
         };
 
@@ -258,8 +258,10 @@ fn render(src: &Path, embedded: bool, orientation: u16, dst: &Path, opts: &Optio
 }
 
 /// A configured command. argv is built directly; `{src}` and `{dst}` are
-/// whole arguments, so a filename cannot alter the command.
-fn run_preset(preset: &Preset, src: &Path, dst: &Path) -> Result<()> {
+/// whole arguments, so a filename cannot alter the command. `argv[0]` goes
+/// through `config.resolve_tool` before `Command::new` -- see its own doc
+/// comment for why that matters for a GUI-launched process in particular.
+fn run_preset(preset: &Preset, src: &Path, dst: &Path, config: &Config) -> Result<()> {
     let argv: Vec<String> = preset
         .cmd
         .iter()
@@ -273,7 +275,7 @@ fn run_preset(preset: &Preset, src: &Path, dst: &Path) -> Result<()> {
     if argv.is_empty() {
         bail!("preset `{}` has an empty command", preset.name);
     }
-    let status = std::process::Command::new(&argv[0])
+    let status = std::process::Command::new(config.resolve_tool(&argv[0]).as_ref())
         .args(&argv[1..])
         .status()
         .with_context(|| format!("running {}", argv[0]))?;
@@ -569,6 +571,50 @@ mod tests {
         .unwrap();
         assert_eq!(stats.written, 0);
         assert_eq!(stats.errors.len(), 1);
+    }
+
+    /// `[tools]` is exactly for a name that doesn't resolve via `PATH` on
+    /// its own -- a GUI-launched process commonly has a barer `PATH` than an
+    /// interactive shell. `cp`'s own real location stands in for that: the
+    /// preset references a name that cannot possibly be a real command, and
+    /// only resolves at all because `config.tools` maps it to `cp`'s actual
+    /// path.
+    #[test]
+    fn a_preset_command_resolves_through_configured_tools() {
+        let cp = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v cp"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(!cp.is_empty(), "this test needs `cp` to exist somewhere");
+
+        let (lib, cat, sid) = library();
+        let out = tempfile::tempdir().unwrap();
+        let preset = Preset {
+            name: "copy".into(),
+            cmd: vec![
+                "definitely-not-a-real-binary-xyz".into(),
+                "{src}".into(),
+                "{dst}".into(),
+            ],
+            ext: "jpg".into(),
+        };
+        let mut tools = std::collections::HashMap::new();
+        tools.insert("definitely-not-a-real-binary-xyz".to_string(), cp);
+        let config = Config {
+            tools,
+            ..Default::default()
+        };
+        let mut o = opts();
+        o.preset = Some(&preset);
+        let stats = export(&cat, &[sid], out.path(), lib.path(), &config, &o).unwrap();
+        assert_eq!(stats.written, 1, "errors: {:?}", stats.errors);
+        assert!(out.path().join("750_0001.jpg").exists());
     }
 
     #[test]

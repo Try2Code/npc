@@ -662,7 +662,7 @@ impl GuiApp {
                 return;
             }
         };
-        self.status = Some(match action::run(&a, &sel) {
+        self.status = Some(match action::run(&a, &sel, &self.config) {
             Ok(outcome) => outcome.description,
             Err(e) => format!("{}: {e}", a.name),
         });

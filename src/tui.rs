@@ -1664,7 +1664,7 @@ impl App {
         let current = self.rows.get(self.cursor).map(|r| r.id);
         let sel = action::gather(&self.cat, &ids, current, &self.query)?;
 
-        match action::run(&a, &sel) {
+        match action::run(&a, &sel, &self.config) {
             Ok(outcome) => self.status = outcome.description,
             Err(e) => self.status = format!("{}: {e}", a.name),
         }

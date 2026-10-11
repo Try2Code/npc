@@ -49,6 +49,16 @@ enum Cmd {
         /// Reparse every file rather than trusting size+mtime
         #[arg(long)]
         full: bool,
+        /// Limit the walk to this directory instead of the whole library --
+        /// repeatable. For a late addition dropped somewhere specific (the
+        /// watcher's own job while npc tui/npcg is open, but there is no
+        /// daemon for when neither is running): a full walk of a
+        /// tens-of-thousands-of-stacks library to catalog a handful of new
+        /// files is the exact cost this exists to skip. Must be inside the
+        /// library; "vanished" detection stays scoped to each one given,
+        /// same as a directory the watcher rescans on its own.
+        #[arg(long, value_name = "PATH")]
+        only: Vec<PathBuf>,
     },
     /// Report which volume a path lives on, and where its catalog would go.
     Volume { path: PathBuf },
@@ -365,6 +375,28 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// `dir` must resolve to somewhere inside `root` -- checked before `npc scan
+/// --only` walks it, so a relative path or a `..` can't make an unrelated
+/// directory look like it's inside the library. Canonicalizing both first is
+/// what makes that check meaningful rather than a string-prefix guess; same
+/// reasoning `import::plan`'s own overlap check uses.
+fn only_dir_is_inside_library(root: &Path, dir: &Path) -> Result<()> {
+    let root_canon = root
+        .canonicalize()
+        .with_context(|| format!("resolving library {}", root.display()))?;
+    let dir_canon = dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", dir.display()))?;
+    anyhow::ensure!(
+        dir_canon.starts_with(&root_canon),
+        "{} is not inside the library {} -- --only takes a subdirectory of \
+         it, not an arbitrary path",
+        dir.display(),
+        root.display()
+    );
+    Ok(())
+}
+
 /// Every stack currently cataloged under one of `dirs`, by exact match --
 /// used to hand `import`'s background thumbnail warm-up an exact id list
 /// for what it just copied, without going through the query language's
@@ -604,14 +636,52 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Scan { root, full } => {
+        Cmd::Scan { root, full, only } => {
             let root = library(root.get().as_deref())?;
             let started = std::time::Instant::now();
-            let (stats, cat) = scan::scan_root(&root, full)?;
+
+            let (stats, cat_path, scanned) = if only.is_empty() {
+                let (stats, cat) = scan::scan_root(&root, full)?;
+                (stats, cat.path, root.display().to_string())
+            } else {
+                // Checked before canonicalizing: an unmounted drive fails a
+                // path-resolution with a confusing message, when the real
+                // problem is simpler and already has its own clear one.
+                let mut cat = require_online(&root)?;
+
+                for dir in &only {
+                    only_dir_is_inside_library(&root, dir)?;
+                }
+
+                if let Ok(vol) = npc::vol::identify(&root) {
+                    cat.register_volume(&vol.uuid, vol.label.as_deref(), &root)?;
+                }
+                let mut totals = scan::ScanStats::default();
+                for dir in &only {
+                    let s = scan::scan(&mut cat, dir, full).context("scanning")?;
+                    totals.files_seen += s.files_seen;
+                    totals.unchanged += s.unchanged;
+                    totals.parsed += s.parsed;
+                    totals.stacks += s.stacks;
+                    totals.orphans += s.orphans;
+                    totals.vanished += s.vanished;
+                    totals.sidecars_read += s.sidecars_read;
+                    totals.events += s.events;
+                    totals.seeded_from_embedded += s.seeded_from_embedded;
+                    totals.inherited_rating += s.inherited_rating;
+                    totals.errors.extend(s.errors);
+                }
+                let names = only
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (totals, cat.path.clone(), names)
+            };
             let elapsed = started.elapsed();
 
-            println!("scanned {}", root.display());
-            println!("  catalog     {}", cat.path.display());
+            println!("scanned {scanned}");
+            println!("  catalog     {}", cat_path.display());
             println!("  files seen  {}", stats.files_seen);
             println!("  stacks      {}", stats.stacks);
             println!("  parsed      {}", stats.parsed);
@@ -1833,5 +1903,46 @@ mod tests {
         // must not print a bar wider than requested.
         assert_eq!(progress_bar(1.2, 10), "[##########]");
         assert_eq!(progress_bar(-0.1, 10), "[----------]");
+    }
+
+    #[test]
+    fn only_dir_accepts_a_real_subdirectory_of_the_library() {
+        let lib = tempfile::tempdir().unwrap();
+        let sub = lib.path().join("export/4claudia");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(only_dir_is_inside_library(lib.path(), &sub).is_ok());
+    }
+
+    #[test]
+    fn only_dir_refuses_a_sibling_directory_outside_the_library() {
+        let lib = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let err = only_dir_is_inside_library(lib.path(), outside.path()).unwrap_err();
+        assert!(err.to_string().contains("not inside the library"));
+    }
+
+    /// `..` inside an otherwise-plausible-looking path must not escape the
+    /// containment check -- the whole reason this canonicalizes both sides
+    /// first rather than comparing the strings as given.
+    #[test]
+    fn only_dir_refuses_a_dotdot_escape() {
+        let lib = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lib.path().join("export")).unwrap();
+        // `..` all the way up to filesystem root from `lib/export`, then back
+        // down the absolute path to `outside` -- lands exactly on `outside`
+        // once canonicalized, by construction, whatever depth either sits at.
+        let mut escape = lib.path().join("export");
+        let depth = escape
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count();
+        for _ in 0..depth {
+            escape = escape.join("..");
+        }
+        escape = escape.join(outside.path().strip_prefix("/").unwrap());
+
+        let err = only_dir_is_inside_library(lib.path(), &escape).unwrap_err();
+        assert!(err.to_string().contains("not inside the library"));
     }
 }

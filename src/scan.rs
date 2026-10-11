@@ -96,11 +96,23 @@ pub(crate) fn combine_rating(raw: Option<i32>, jpg: Option<i32>) -> Option<i32> 
 /// `capture_time` is weaker evidence than identity and deliberately never
 /// promoted above it: it comes from the camera's clock, which a user can
 /// reset or let drift, where `shutter_count` is a hardware count of
-/// actuations that nothing short of deliberate tampering moves. It is only
-/// reached here after identity has already failed to find a match, and a
-/// wrong guess only mis-copies a rating -- visible and correctable, not the
+/// actuations that nothing short of deliberate tampering moves. A wrong
+/// guess there only mis-copies a rating -- visible and correctable, not the
 /// kind of silent merge `import.rs` guards with an actual pixel check before
 /// trusting this same field.
+///
+/// Identity, once present, is authoritative and the basename fallback is
+/// never tried after it either way -- not only on a match. The real bug
+/// this guards against: every fresh photo straight off a camera has a
+/// `shutter_count` nothing else has ever had, so the identity query always
+/// and correctly comes back empty for it. Falling through to basename on
+/// that "no match" used to hand a brand-new, never-before-seen shot a stray
+/// rating left over from some unrelated session that happened to reuse the
+/// same low, recycled frame number (`750_0001`, the first frame of nearly
+/// every card, is the worst offender) -- the opposite of "inherit, don't
+/// start from zero". Basename is reached only when identity is unavailable
+/// to begin with: no maker notes at all, a non-Nikon body, or an export tool
+/// that stripped them.
 fn find_inherited_rating(
     tx: &rusqlite::Transaction,
     root: &Path,
@@ -155,9 +167,10 @@ fn find_inherited_rating(
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<std::result::Result<_, _>>()?;
-        if let Some(rating) = pick(candidates) {
-            return Ok(Some(rating));
-        }
+        // Authoritative either way -- see the doc comment above. A
+        // `shutter_count` that matches nothing is proof there is no version
+        // of this shot elsewhere, not a cue to fall back to a filename guess.
+        return Ok(pick(candidates));
     }
 
     // Basename fallback: the new stack's own base, then each of its
@@ -990,6 +1003,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inherited, Some(2));
+    }
+
+    /// Reproduces the real bug behind a lot of freshly imported photos
+    /// turning up already rated: `750_0001` is the first frame of nearly
+    /// every card from a long-lived body, so the library already holds
+    /// several old, legitimately-rated stacks under that exact basename.
+    /// A brand-new shot sharing the number but carrying its own, never
+    /// -before-seen `shutter_count` must come back unrated -- identity
+    /// finding no match is proof nothing else is a version of this shot, not
+    /// a cue to fall back to the basename and grab a stranger's rating.
+    #[test]
+    fn identity_present_but_unmatched_never_falls_back_to_a_recycled_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("2025/04/26");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("750_0001.NEF"), "raw-old").unwrap();
+        let new_dir = dir.path().join("2026/10/03");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("750_0001.NEF"), "raw-new").unwrap();
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+
+        let old_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [old_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM stack WHERE dir = ?1",
+                [new_dir.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Same body, two different lifetime shutter actuations -- exactly
+        // what distinguishes a real recycled-basename collision from an
+        // actual re-export of the same shot.
+        cat.conn
+            .execute(
+                "UPDATE file SET serial = '6094708', shutter_count = 59662 WHERE stack_id = ?1",
+                [old_id],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE file SET serial = '6094708', shutter_count = 67223 WHERE stack_id = ?1",
+                [new_id],
+            )
+            .unwrap();
+        edit::apply(
+            &mut cat,
+            &[old_id],
+            &[Change::SetRating(Some(1))],
+            &Config::default(),
+        )
+        .unwrap();
+
+        let stats = scan(&mut cat, dir.path(), true).unwrap();
+        assert_eq!(stats.inherited_rating, 0);
+
+        let new_rating: Option<i64> = cat
+            .conn
+            .query_row("SELECT rating FROM stack WHERE id = ?1", [new_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            new_rating, None,
+            "a never-before-seen shutter_count must not inherit a stranger's rating \
+             just because the recycled filename matches"
+        );
     }
 
     /// Camera identity is unavailable (no maker notes in these fixture bytes,

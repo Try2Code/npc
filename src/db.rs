@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS volume (
@@ -69,11 +69,12 @@ CREATE TABLE IF NOT EXISTS file (
     content_hash     TEXT,
     present          INTEGER NOT NULL DEFAULT 1,
     -- The card file this was imported from: its name there (before any
-    -- collision suffix) and its mtime there. NULL for files not imported by
-    -- this build. `mtime_ns` above is this file's own stat -- the import
-    -- time, unless the file was touched since.
+    -- collision suffix), its size and its mtime there. NULL until an import
+    -- records them. `size` and `mtime_ns` above are this file's own stat --
+    -- they move when another tool rewrites it; these don't.
     src_name         TEXT,
     src_mtime_ns     INTEGER,
+    src_size         INTEGER,
     UNIQUE(stack_id, name)
 );
 
@@ -470,6 +471,19 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
         }
     }
 
+    // v5 -> v6: the card size too. NULL even where v5 recorded a card name and
+    // mtime: the library copy's size is not the card's once another tool
+    // (Shotwell) has rewritten it, so it can't be backfilled. The next import
+    // of that card records it.
+    if from < 6 {
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('file') WHERE name = 'src_size'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute("ALTER TABLE file ADD COLUMN src_size INTEGER", [])?;
+        }
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -500,6 +514,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE file DROP COLUMN src_name;
                  ALTER TABLE file DROP COLUMN src_mtime_ns;
+                 ALTER TABLE file DROP COLUMN src_size;
                  INSERT INTO stack (dir, base) VALUES ('/lib', '750_0001');
                  INSERT INTO file (stack_id, name, role) VALUES (1, '750_0001.NEF', 'raw');
                  PRAGMA user_version = 4;",
@@ -508,18 +523,48 @@ mod tests {
 
         migrate(&cat.conn, 4, Path::new(":memory:")).unwrap();
 
-        let (name, mtime): (Option<String>, Option<i64>) = cat
+        let row: (Option<String>, Option<i64>, Option<i64>) = cat
             .conn
-            .query_row("SELECT src_name, src_mtime_ns FROM file", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT src_name, src_mtime_ns, src_size FROM file",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!((name, mtime), (None, None));
+        assert_eq!(row, (None, None, None));
         let version: i64 = cat
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// v5 recorded card name and mtime; v6 adds the card size without
+    /// touching them, and without guessing it from the library copy.
+    #[test]
+    fn a_v5_catalog_keeps_its_card_stats_and_gains_an_empty_card_size() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute_batch(
+                "ALTER TABLE file DROP COLUMN src_size;
+                 INSERT INTO stack (dir, base) VALUES ('/lib', '750_0001');
+                 INSERT INTO file (stack_id, name, role, size, src_name, src_mtime_ns)
+                     VALUES (1, '750_0001.JPG', 'oocjpg', 100, '750_0001.JPG', 42);
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+
+        migrate(&cat.conn, 5, Path::new(":memory:")).unwrap();
+
+        let row: (String, i64, Option<i64>) = cat
+            .conn
+            .query_row(
+                "SELECT src_name, src_mtime_ns, src_size FROM file",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("750_0001.JPG".to_string(), 42, None));
     }
 
     #[test]

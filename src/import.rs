@@ -86,6 +86,7 @@ pub struct PlannedFile {
 #[derive(Debug, Clone)]
 pub struct Already {
     pub src: PathBuf,
+    pub src_size: u64,
     pub src_mtime_ns: i64,
     /// The library file it matched.
     pub library: String,
@@ -94,11 +95,13 @@ pub struct Already {
     pub unread: bool,
 }
 
-/// The card name and mtime of a library file, as `record_sources` stores them.
+/// The card name, size and mtime of a library file, as `record_sources`
+/// stores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRecord {
     pub library: PathBuf,
     pub src_name: String,
+    pub src_size: u64,
     pub src_mtime_ns: i64,
 }
 
@@ -240,6 +243,7 @@ pub fn plan(
             match on_disk.find(m) {
                 Some(library) => already.push(Already {
                     src: m.0.clone(),
+                    src_size: m.2,
                     src_mtime_ns: m.3,
                     library,
                     unread: true,
@@ -289,6 +293,7 @@ pub fn plan(
                 if let Some(library) = dup {
                     already.push(Already {
                         src: path.clone(),
+                        src_size: *size,
                         src_mtime_ns: *mtime,
                         library,
                         unread: false,
@@ -321,6 +326,7 @@ pub fn plan(
                         metadata_merge = build_metadata_merge(cat, &existing, meta);
                         already.push(Already {
                             src: path.clone(),
+                            src_size: *size,
                             src_mtime_ns: *mtime,
                             library: existing,
                             unread: false,
@@ -475,12 +481,14 @@ pub fn execute(
                 crate::edit::apply(cat, &[m.stack_id], &changes, config)?;
                 stats.merges_applied += 1;
             }
-            stats.sources.extend(
-                stack
-                    .already
-                    .iter()
-                    .map(|a| source_record(&a.src, PathBuf::from(&a.library), a.src_mtime_ns)),
-            );
+            stats.sources.extend(stack.already.iter().map(|a| {
+                source_record(
+                    &a.src,
+                    PathBuf::from(&a.library),
+                    a.src_size,
+                    a.src_mtime_ns,
+                )
+            }));
         }
         if stack.duplicate_of.is_some() {
             stats.duplicates_skipped += 1;
@@ -546,7 +554,7 @@ pub fn execute(
             stack
                 .members
                 .iter()
-                .map(|m| source_record(&m.src, m.dest.clone(), m.src_mtime_ns)),
+                .map(|m| source_record(&m.src, m.dest.clone(), m.size, m.src_mtime_ns)),
         );
         index += 1;
         on_event(ImportEvent::Copied {
@@ -565,7 +573,7 @@ pub fn execute(
     Ok(stats)
 }
 
-fn source_record(src: &Path, library: PathBuf, src_mtime_ns: i64) -> SourceRecord {
+fn source_record(src: &Path, library: PathBuf, src_size: u64, src_mtime_ns: i64) -> SourceRecord {
     SourceRecord {
         library,
         src_name: src
@@ -573,22 +581,24 @@ fn source_record(src: &Path, library: PathBuf, src_mtime_ns: i64) -> SourceRecor
             .unwrap_or_default()
             .to_string_lossy()
             .to_string(),
+        src_size,
         src_mtime_ns,
     }
 }
 
-/// Store each record's card name and mtime on its library file's catalog
-/// row -- level 1 of the next import. Call after the catalog has scanned
-/// the copies, or their rows don't exist yet. Only fills a row that has no
-/// card stat yet: the first one recorded is the file's real origin. Writes
-/// the catalog only, never a file. Returns rows updated.
+/// Store each record's card name, size and mtime on its library file's
+/// catalog row -- level 1 of the next import. Call after the catalog has
+/// scanned the copies, or their rows don't exist yet. Only fills a row with
+/// no card size yet (rows from schema 5 have name and mtime but no size):
+/// the first complete record is the file's real origin. Writes the catalog
+/// only, never a file. Returns rows updated.
 pub fn record_sources(cat: &mut Catalog, records: &[SourceRecord]) -> Result<usize> {
     let tx = cat.conn.transaction()?;
     let mut updated = 0;
     {
         let mut stmt = tx.prepare(
-            "UPDATE file SET src_name = ?1, src_mtime_ns = ?2
-             WHERE src_mtime_ns IS NULL AND name = ?3
+            "UPDATE file SET src_name = ?1, src_mtime_ns = ?2, src_size = ?5
+             WHERE src_size IS NULL AND name = ?3
                AND stack_id IN (SELECT id FROM stack WHERE dir = ?4)",
         )?;
         for r in records {
@@ -599,7 +609,8 @@ pub fn record_sources(cat: &mut Catalog, records: &[SourceRecord]) -> Result<usi
                 r.src_name,
                 r.src_mtime_ns,
                 name.to_string_lossy(),
-                dir.to_string_lossy()
+                dir.to_string_lossy(),
+                i64::try_from(r.src_size).unwrap_or(i64::MAX)
             ])?;
         }
     }
@@ -672,10 +683,11 @@ fn mtime_ns(m: &std::fs::Metadata) -> i64 {
 /// Level 1: what the library already holds, from the catalog alone.
 #[derive(Default)]
 struct LibraryFiles {
-    /// `(card name, size, card mtime) -> library path`, for files whose card
-    /// stat was recorded at import.
+    /// `(card name, card size, card mtime) -> library path`, for files whose
+    /// card stat was recorded at import. The card's size, not the library
+    /// copy's: a copy another tool rewrote since (Shotwell) still matches.
     by_src: HashMap<(String, i64, i64), String>,
-    /// `(name, size) -> library path`, for files imported before that.
+    /// `(name, size) -> library path`, for files with no card size recorded.
     by_name: HashMap<(String, i64), String>,
 }
 
@@ -692,7 +704,7 @@ impl LibraryFiles {
 
 fn library_files(cat: &Catalog) -> Result<LibraryFiles> {
     let mut stmt = cat.conn.prepare(
-        "SELECT f.name, f.size, f.src_name, f.src_mtime_ns, s.dir || '/' || f.name
+        "SELECT f.name, f.size, f.src_name, f.src_size, f.src_mtime_ns, s.dir || '/' || f.name
          FROM file f JOIN stack s ON s.id = f.stack_id
          WHERE f.present = 1 AND f.size IS NOT NULL",
     )?;
@@ -702,16 +714,17 @@ fn library_files(cat: &Catalog) -> Result<LibraryFiles> {
             r.get::<_, i64>(1)?,
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<i64>>(3)?,
-            r.get::<_, String>(4)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, String>(5)?,
         ))
     })?;
     let mut files = LibraryFiles::default();
     for row in rows {
         match row? {
-            (_, size, Some(src_name), Some(src_mtime), path) => {
-                files.by_src.insert((src_name, size, src_mtime), path);
+            (_, _, Some(src_name), Some(src_size), Some(src_mtime), path) => {
+                files.by_src.insert((src_name, src_size, src_mtime), path);
             }
-            (name, size, _, _, path) => {
+            (name, size, _, _, _, path) => {
                 files.by_name.insert((name, size), path);
             }
         }
@@ -1972,7 +1985,8 @@ mod safety_tests {
         for name in ["750_0001.NEF", "750_0001.JPG"] {
             cat.conn
                 .execute(
-                    "UPDATE file SET src_name = ?1, src_mtime_ns = ?2 WHERE name = ?1",
+                    "UPDATE file SET src_name = ?1, src_mtime_ns = ?2, src_size = 200000
+                     WHERE name = ?1",
                     rusqlite::params![name, card_mtime(&card.path().join(name))],
                 )
                 .unwrap();
@@ -2077,11 +2091,13 @@ mod safety_tests {
                 SourceRecord {
                     library: home.join("750_0001.JPG"),
                     src_name: "750_0001.JPG".into(),
+                    src_size: 200_000,
                     src_mtime_ns: card_mtime(&card.path().join("750_0001.JPG")),
                 },
                 SourceRecord {
                     library: home.join("750_0001.NEF"),
                     src_name: "750_0001.NEF".into(),
+                    src_size: 200_000,
                     src_mtime_ns: card_mtime(&card.path().join("750_0001.NEF")),
                 },
             ]
@@ -2102,20 +2118,81 @@ mod safety_tests {
         let record = |mtime| SourceRecord {
             library: day.join("750_0001.NEF"),
             src_name: "750_0001.NEF".into(),
+            src_size: 3,
             src_mtime_ns: mtime,
         };
         assert_eq!(record_sources(&mut cat, &[record(42)]).unwrap(), 1);
         assert_eq!(record_sources(&mut cat, &[record(99)]).unwrap(), 0);
         crate::scan::scan(&mut cat, lib.path(), true).unwrap();
 
-        let stored: (String, i64) = cat
+        let stored: (String, i64, i64) = cat
             .conn
-            .query_row("SELECT src_name, src_mtime_ns FROM file", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT src_name, src_size, src_mtime_ns FROM file",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(stored, ("750_0001.NEF".to_string(), 42));
+        assert_eq!(stored, ("750_0001.NEF".to_string(), 3, 42));
     }
+
+    /// A library copy another tool rewrote after import (Shotwell embeds a
+    /// rating: the size moves) still matches at level 1, through the card
+    /// size recorded at import -- not the library copy's current size.
+    #[test]
+    fn a_library_copy_rewritten_since_import_matches_by_its_card_stat() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        catalog_copy(&cat, &lib.path().join("2026/08/09"), true);
+        for name in ["750_0001.NEF", "750_0001.JPG"] {
+            cat.conn
+                .execute(
+                    "UPDATE file SET size = 199_000, src_name = ?1, src_mtime_ns = ?2,
+                                     src_size = 200000
+                     WHERE name = ?1",
+                    rusqlite::params![name, card_mtime(&card.path().join(name))],
+                )
+                .unwrap();
+        }
+
+        let plans = plan(&cat, card.path(), lib.path(), false, false).unwrap();
+        assert!(plans[0].duplicate_of.is_some());
+        assert!(plans[0].already.iter().all(|a| a.unread));
+    }
+
+    /// A schema-5 row has card name and mtime but no card size: it is
+    /// matched by name and library size as before, and the next import
+    /// completes its record.
+    #[test]
+    fn a_record_without_card_size_is_completed_by_the_next_import() {
+        let lib = tempfile::tempdir().unwrap();
+        let day = lib.path().join("2026/08/09");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("750_0001.NEF"), "raw").unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+        crate::scan::scan(&mut cat, lib.path(), true).unwrap();
+        cat.conn
+            .execute(
+                "UPDATE file SET src_name = '750_0001.NEF', src_mtime_ns = 42",
+                [],
+            )
+            .unwrap();
+
+        let record = SourceRecord {
+            library: day.join("750_0001.NEF"),
+            src_name: "750_0001.NEF".into(),
+            src_size: 3,
+            src_mtime_ns: 42,
+        };
+        assert_eq!(record_sources(&mut cat, &[record]).unwrap(), 1);
+        let size: i64 = cat
+            .conn
+            .query_row("SELECT src_size FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(size, 3);
+    }
+
     #[test]
     fn importing_into_a_protected_root_is_refused() {
         let card = card();

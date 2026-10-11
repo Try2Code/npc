@@ -1125,7 +1125,7 @@ fn main() -> Result<()> {
 
             let mut totals = npc::import::ImportStats::default();
             // Every destination directory a stack actually landed in this
-            // run -- used after the post-import scan (below) to resolve
+            // run -- used once every card is cataloged (below) to resolve
             // exactly which stacks to prewarm thumbnails for, without
             // touching anything import.rs itself returns.
             let mut touched_dirs: std::collections::HashSet<PathBuf> =
@@ -1139,10 +1139,7 @@ fn main() -> Result<()> {
                     .iter()
                     .filter(|p| p.duplicate_of.is_some() && p.already.iter().all(|a| a.unread))
                     .count();
-                let joining = plans
-                    .iter()
-                    .filter(|p| !p.members.is_empty() && !p.already.is_empty())
-                    .count();
+                let joining = plans.iter().filter(|p| p.joins_existing).count();
 
                 println!("import {} -> {}", source.display(), root.display());
                 println!("  stacks found      {}", plans.len());
@@ -1325,8 +1322,11 @@ fn main() -> Result<()> {
             }
 
             if !dry_run {
-                let (_, scanned_cat) = scan::scan_root(&root, false)?;
-                println!("catalog now holds {} stacks", scanned_cat.stack_count()?);
+                // No full-library scan here: each card's folders were cataloged
+                // right after it was copied (above), which is everything this
+                // import changed. A walk of the whole library cost ~10 min per
+                // import to find nothing more; `npc scan` is for the rest.
+                println!("catalog now holds {} stacks", cat.stack_count()?);
 
                 // Thumbnails for what just landed: warm the Grid tier in a
                 // detached background process rather than making `import`
@@ -1336,7 +1336,7 @@ fn main() -> Result<()> {
                 // query language's `path=` (a substring match) -- this is
                 // an internal handoff, not a user-typed filter.
                 if !touched_dirs.is_empty() {
-                    let ids = stack_ids_in_dirs(&scanned_cat, &touched_dirs)?;
+                    let ids = stack_ids_in_dirs(&cat, &touched_dirs)?;
 
                     if !ids.is_empty() {
                         let ids_path = std::env::temp_dir().join(format!(

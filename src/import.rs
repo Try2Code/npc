@@ -47,6 +47,9 @@ pub struct PlannedStack {
     pub members: Vec<PlannedFile>,
     /// Card files of this shot that are already in the library.
     pub already: Vec<Already>,
+    /// `members` complete a stack already in the library -- found on this
+    /// card or by shutter count, e.g. a RAW whose JPG came off another card.
+    pub joins_existing: bool,
     /// Set when every member is already in the library: nothing to copy.
     pub duplicate_of: Option<String>,
     /// Set (only under `--verify-content`) when identity and size matched an
@@ -352,8 +355,8 @@ pub fn plan(
             dir.join(format!("{dest_base}{suffix}"))
         };
 
-        let (dest_dir, dest_base) = if to_copy.is_empty() {
-            (library.to_path_buf(), base.clone())
+        let (dest_dir, dest_base, joins_existing) = if to_copy.is_empty() {
+            (library.to_path_buf(), base.clone(), false)
         } else {
             // Join the existing stack, unless that would land on a file
             // that's already there -- then it's not as simple as a missing
@@ -364,6 +367,7 @@ pub fn plan(
                     !dest.exists() && !claimed.contains(&dest)
                 })
             });
+            let joins = joinable.is_some();
             let (dir, b) = joinable.unwrap_or_else(|| {
                 let dir = match capture_time {
                     Some(t) => library.join(date_path(t)),
@@ -379,7 +383,7 @@ pub fn plan(
                 .entry(dir.clone())
                 .or_insert_with(|| stems_in(&dir))
                 .insert(b.clone());
-            (dir, b)
+            (dir, b, joins)
         };
 
         let planned: Vec<PlannedFile> = to_copy
@@ -408,6 +412,7 @@ pub fn plan(
             capture_time,
             members: planned,
             already,
+            joins_existing,
             duplicate_of,
             near_miss,
             metadata_merge,
@@ -2005,6 +2010,7 @@ mod safety_tests {
         assert_eq!(p.already.len(), 1);
         assert_eq!(p.members.len(), 1);
         assert_eq!(p.members[0].dest, home.join("750_0001.JPG"));
+        assert!(p.joins_existing);
     }
 
     /// Level 2 compares a card file only with library files of its own role:

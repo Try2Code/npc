@@ -1320,6 +1320,10 @@ fn import_adds_a_raw_whose_jpg_sibling_is_already_in_the_library() {
         stack.metadata_merge.is_none(),
         "there is nothing to merge -- this is a new member, not a re-embed"
     );
+    assert!(
+        stack.joins_existing,
+        "found by shutter count, the RAW completes the JPG's stack"
+    );
 
     let dest_nef = stack.dest_dir.join("750_6278.NEF");
     let jpg_before = fingerprint_tree(lib.path());

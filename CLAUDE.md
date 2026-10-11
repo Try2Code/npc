@@ -57,7 +57,7 @@ and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
-Currently 376 tests. Coverage was ~84% region / 86% line at 177 tests and
+Currently 385 tests. Coverage was ~84% region / 86% line at 177 tests and
 has not been re-measured since.
 
 ## Layout
@@ -113,6 +113,12 @@ is the wrong one in each case:
   inheritance fell back to the basename whenever identity found no match —
   which is every fresh shot — and handed new imports ratings from old shoots
   with the same recycled number (`750_0001` was rated in six past sessions).
+- **A rating key must not write.** Per key it was ~65 ms for the sidecar plus
+  ~140 ms reloading the whole result list (95k stacks); the catalog update
+  itself is 0.05 ms. The browsers now `apply` only and update the row in
+  place; `edit::Writer` writes the `pending` queue one sidecar per idle step
+  and quitting waits for it. Keep it on the UI thread with the UI's own
+  connection — a second writer would race edits made between steps.
 - **Import catalogs only what it copied**, card by card, before planning the
   next card (so a RAW on card 2 joins its JPG from card 1). The old full-
   library scan after every import cost 8–10 min to find nothing more.

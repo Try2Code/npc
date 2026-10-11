@@ -340,6 +340,15 @@ cycling and undo -- those stay TUI-only.
 - **Touch a protected root.** Including refusing to launch an external editor
   against one, since an editor cannot be told not to write.
 
+## Saving
+
+In `npc tui` and `npcg`, a rating, mark or tag changes the catalog at once
+and is written to its sidecar when you pause for a second, so rating fast
+doesn't wait on the disk. A badge shows the state: `saved`, `3 to write`,
+`writing 3`. Quitting (`q`, or closing the window) waits until everything
+queued is written. The queue lives in the catalog, so a crash loses nothing:
+the next start writes it.
+
 ## Offline
 
 The catalog lives on your machine, not the drive. With the drive unplugged you

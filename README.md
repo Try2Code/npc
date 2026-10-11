@@ -267,8 +267,10 @@ library like every other subcommand.
 
 Each card file is checked in two levels. First from the catalog alone,
 without reading the file: a library file with the same name (extension
-included) and size -- and, for files imported from 0.5.0 on, the same mtime
-the file had on the card -- means it is already imported. What's left is
+included) and size means it is already imported. Each import also records
+the name, size and mtime every file had on the card, and those are what is
+compared from then on -- so a library copy another program rewrote since
+(Shotwell embedding a rating) is still recognised instantly. What's left is
 read once per shot and matched by camera serial + shutter count + file type
 (a JPG only against JPGs): same size, already imported; different size, the
 same file with rewritten metadata, which is merged rather than copied again;

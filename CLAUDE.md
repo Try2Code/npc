@@ -47,7 +47,9 @@ cargo cov-summary            coverage numbers only
 ```
 
 If `~/.cargo/bin` is not on PATH, export it first. `check` must stay
-executable — rewriting it with a script drops the bit.
+executable — rewriting it with a script drops the bit. Its tests build under
+the `release-nolto` profile (release opt-level, no LTO): LTO is paid at link
+time per test binary and took a full `./check` from 48 s to 4m38s.
 
 The library to operate on comes from `library` in the config, or from the root
 given on the command line. Every subcommand accepts `--root`; `scan`, `status`
@@ -55,7 +57,8 @@ and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
-Currently 177 tests, ~84% region / 86% line coverage.
+Currently 376 tests. Coverage was ~84% region / 86% line at 177 tests and
+has not been re-measured since.
 
 ## Layout
 
@@ -63,7 +66,8 @@ Currently 177 tests, ~84% region / 86% line coverage.
 src/meta/shim.cc   the only C++, and the only writer   <- read this first
 src/meta/mod.rs    cxx bridge + the Mutex serialising Exiv2
 src/stack.rs       filename -> stack. Closed whitelist: nef, jpg/jpeg, xmp
-src/scan.rs        walk, change detection, event derivation
+src/scan.rs        walk, change detection, event derivation, rating inheritance
+src/import.rs      card -> library: two-level identification, verified copy
 src/db.rs          schema, migrations, offline catalog resolution
 src/query.rs       query language -> SQL, plus its own reference text
 src/thumbs.rs      preview extraction, cache, sizing
@@ -93,6 +97,25 @@ is the wrong one in each case:
   version-guards. XMP support is asserted at build time, because an Exiv2
   built without it passes every test that does not touch sidecars and then
   destroys metadata in the field.
+- **Import identity is per file *and per role*.** Serial + shutter count is
+  shot-level: a RAW and its JPG share it. Mapping it to one file per shot
+  (the RAW) made every card JPG miss on size and fall through to reading
+  both files in full — 35 min and ~78 GB to plan one JPG card, where the
+  user shoots RAW to one card and JPG to the other.
+- **Import level 1 is the catalog, not the card.** Name (extension
+  included) + size alone never matched two *different* shots across 115k
+  real files. The *card's* name, size and mtime are recorded at import
+  (`file.src_*`), because library copies get rewritten afterwards — ~200
+  by Shotwell on two cards — and their own size no longer matches. Planning
+  two fully imported cards: 1.7 s. Basename alone never decides: a new shot
+  never joins a stem already used in its day folder.
+- **A camera identity that matches nothing is authoritative.** Rating
+  inheritance fell back to the basename whenever identity found no match —
+  which is every fresh shot — and handed new imports ratings from old shoots
+  with the same recycled number (`750_0001` was rated in six past sessions).
+- **Import catalogs only what it copied**, card by card, before planning the
+  next card (so a RAW on card 2 joins its JPG from card 1). The old full-
+  library scan after every import cost 8–10 min to find nothing more.
 
 ## Test data
 
@@ -152,7 +175,11 @@ has caused a bug here.
 - **Other applications write to originals.** Shotwell embeds ratings directly
   into JPGs, so anything sharing a library with this tool will disagree about
   ratings: Shotwell embeds, npc uses sidecars. `doctor` reports originals whose
-  size or mtime has moved.
+  size or mtime has moved. Import copes (card stats in `file.src_*`, metadata
+  merge at level 2), but the library copies are no longer the camera's bytes.
+- **The catalog is at schema 6** (since 0.5.1). A build older than that refuses
+  to open it — update `npc` and `npcg` together. Rows imported before 0.5.0
+  have no card stats until a card holding them is imported again.
 - **No license file**, so the code is not legally reusable as published.
 - Branch is `master`.
 

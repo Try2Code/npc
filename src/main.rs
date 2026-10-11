@@ -266,6 +266,12 @@ enum Cmd {
         /// hand, or another tool's output).
         #[arg(long)]
         rescan: bool,
+        /// Check every file on the card, ignoring what earlier imports from
+        /// it already confirmed. By default a file whose path, size and mtime
+        /// are unchanged since an earlier import is not read again -- on a
+        /// card that is never reformatted, that is most of it.
+        #[arg(long)]
+        deep: bool,
     },
     /// List shooting days, and give them names.
     Events {
@@ -1073,6 +1079,7 @@ fn main() -> Result<()> {
             dry_run,
             verify_content,
             rescan,
+            deep,
         } => {
             let root = library(library_arg.as_deref())?;
             let config = npc::config::Config::load()?;
@@ -1125,13 +1132,40 @@ fn main() -> Result<()> {
                 std::collections::HashSet::new();
             for source in &sources {
                 println!("scanning {}...", source.display());
-                let plans = npc::import::plan(&cat, source, &root, verify_content)?;
+                // Only a cache: failing to load or save it costs speed, never
+                // an import, so it warns rather than aborting.
+                let mut profile = match npc::vol::identify(source)
+                    .and_then(|v| npc::card_profile::CardProfile::open(&config.catalog_store(), &v))
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("warning: card profile unavailable, checking every file: {e:#}");
+                        None
+                    }
+                };
+                let plans = npc::import::plan_with_profile(
+                    &cat,
+                    source,
+                    &root,
+                    verify_content,
+                    profile.as_ref().filter(|_| !deep),
+                )?;
                 let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
                 let fresh = plans.len() - dupes;
+                let unread = plans
+                    .iter()
+                    .filter(|p| p.duplicate_of.as_deref() == Some(npc::import::PREVIOUSLY_IMPORTED))
+                    .count();
 
                 println!("import {} -> {}", source.display(), root.display());
                 println!("  stacks found      {}", plans.len());
                 println!("  already in library {dupes}");
+                if unread > 0 {
+                    println!(
+                        "    of which {unread} unchanged since an earlier import, not re-read \
+                         (--deep checks them too)"
+                    );
+                }
                 println!("  to copy           {fresh}");
 
                 let mut by_day: std::collections::BTreeMap<String, usize> =
@@ -1270,6 +1304,15 @@ fn main() -> Result<()> {
                     }
                 }
                 println!();
+
+                if let Some(p) = profile.as_mut().filter(|_| !stats.confirmed.is_empty()) {
+                    for path in &stats.confirmed {
+                        p.record(path);
+                    }
+                    if let Err(e) = p.save() {
+                        eprintln!("warning: could not save card profile: {e:#}");
+                    }
+                }
 
                 totals.stacks_copied += stats.stacks_copied;
                 totals.files_copied += stats.files_copied;

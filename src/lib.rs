@@ -6,6 +6,7 @@
 //! without losing anything.
 
 pub mod action;
+pub mod card_profile;
 pub mod cards;
 pub mod config;
 pub mod db;

@@ -83,6 +83,10 @@ pub struct ImportStats {
     /// `--dry-run`, since nothing is written then.
     pub merges_applied: usize,
     pub errors: Vec<String>,
+    /// Source files of every stack now known to be in the library -- a
+    /// duplicate, or a stack copied in full. What `card_profile` records.
+    /// Empty under `--dry-run`: nothing was confirmed, only planned.
+    pub confirmed: Vec<PathBuf>,
 }
 
 /// Build the plan without touching anything. `verify_content` controls
@@ -94,6 +98,24 @@ pub fn plan(
     source: &Path,
     library: &Path,
     verify_content: bool,
+) -> Result<Vec<PlannedStack>> {
+    plan_with_profile(cat, source, library, verify_content, None)
+}
+
+/// `duplicate_of` for a stack skipped because `profile` already knew every
+/// member -- there is no library path to report without the Exiv2 read the
+/// skip exists to avoid.
+pub const PREVIOUSLY_IMPORTED: &str = "(unchanged since an earlier import)";
+
+/// `plan`, but a stack whose every member `profile` recorded after an
+/// earlier import -- same path, size and mtime -- is marked a duplicate
+/// without being read. See `card_profile` for why that is safe.
+pub fn plan_with_profile(
+    cat: &Catalog,
+    source: &Path,
+    library: &Path,
+    verify_content: bool,
+    profile: Option<&crate::card_profile::CardProfile>,
 ) -> Result<Vec<PlannedStack>> {
     if !source.is_dir() {
         bail!("import source {} is not a directory", source.display());
@@ -175,6 +197,28 @@ pub fn plan(
         let members = &groups[&key];
         if !members.iter().any(|(_, role, _)| role.is_image()) {
             continue; // orphan profile on the card
+        }
+
+        if profile.is_some_and(|p| members.iter().all(|(path, _, _)| p.contains(path))) {
+            plans.push(PlannedStack {
+                base: key.1.clone(),
+                dest_base: key.1.clone(),
+                dest_dir: library.to_path_buf(),
+                capture_time: None,
+                members: members
+                    .iter()
+                    .map(|(src, role, size)| PlannedFile {
+                        src: src.clone(),
+                        dest: PathBuf::new(),
+                        role: *role,
+                        size: *size,
+                    })
+                    .collect(),
+                duplicate_of: Some(PREVIOUSLY_IMPORTED.to_string()),
+                near_miss: None,
+                metadata_merge: None,
+            });
+            continue;
         }
 
         // Prefer the RAW for capture time and identity; fall back to any image.
@@ -340,6 +384,9 @@ pub fn execute(
                     crate::edit::apply(cat, &[m.stack_id], &changes, config)?;
                     stats.merges_applied += 1;
                 }
+                stats
+                    .confirmed
+                    .extend(stack.members.iter().map(|m| m.src.clone()));
             }
             on_event(ImportEvent::Skipped(stack));
             continue;
@@ -399,6 +446,9 @@ pub fn execute(
         }
 
         stats.stacks_copied += 1;
+        stats
+            .confirmed
+            .extend(stack.members.iter().map(|m| m.src.clone()));
         index += 1;
         on_event(ImportEvent::Copied {
             index,
@@ -1688,6 +1738,112 @@ mod safety_tests {
             .filter(|e| e.file_type().is_file())
             .collect();
         assert!(created.is_empty(), "a dry run created files");
+    }
+
+    fn profile_for(card: &Path, store: &Path) -> crate::card_profile::CardProfile {
+        let vol = crate::vol::Volume {
+            uuid: "TEST-CARD".into(),
+            label: None,
+            mount: card.to_path_buf(),
+            device: None,
+            stable: true,
+        };
+        crate::card_profile::CardProfile::open(store, &vol)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The catalog is empty, so the full check would call this stack fresh:
+    /// only the profile can be what marked it already imported.
+    #[test]
+    fn a_stack_the_profile_already_knows_is_skipped() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let mut profile = profile_for(card.path(), store.path());
+        profile.record(&card.path().join("750_0001.NEF"));
+        profile.record(&card.path().join("750_0001.JPG"));
+
+        let plans =
+            plan_with_profile(&cat, card.path(), lib.path(), false, Some(&profile)).unwrap();
+        assert_eq!(plans[0].duplicate_of.as_deref(), Some(PREVIOUSLY_IMPORTED));
+
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        assert_eq!(
+            plans[0].duplicate_of, None,
+            "without the profile it is fresh"
+        );
+    }
+
+    /// One member the profile doesn't recognise -- here, rewritten with a
+    /// different size under the same name -- sends the whole stack through
+    /// the full check. A stack moves together.
+    #[test]
+    fn a_stack_with_one_changed_member_gets_the_full_check() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let cat = Catalog::open_memory().unwrap();
+
+        let mut profile = profile_for(card.path(), store.path());
+        profile.record(&card.path().join("750_0001.NEF"));
+        profile.record(&card.path().join("750_0001.JPG"));
+        std::fs::write(card.path().join("750_0001.JPG"), "a recycled number").unwrap();
+
+        let plans =
+            plan_with_profile(&cat, card.path(), lib.path(), false, Some(&profile)).unwrap();
+        assert_eq!(plans[0].duplicate_of, None);
+    }
+
+    #[test]
+    fn execute_confirms_what_landed_but_not_what_a_dry_run_planned() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path(), false).unwrap();
+        let dry = execute(&plans, &mut cat, &Config::default(), true, &mut |_| {}).unwrap();
+        assert!(dry.confirmed.is_empty());
+
+        let real = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
+        let mut confirmed = real.confirmed.clone();
+        confirmed.sort();
+        assert_eq!(
+            confirmed,
+            vec![
+                card.path().join("750_0001.JPG"),
+                card.path().join("750_0001.NEF")
+            ]
+        );
+    }
+
+    /// The round trip the profile exists for: import, record what was
+    /// confirmed, import the same card again -- nothing is copied twice.
+    #[test]
+    fn a_second_import_of_the_same_card_copies_nothing() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+        let mut profile = profile_for(card.path(), store.path());
+
+        let plans =
+            plan_with_profile(&cat, card.path(), lib.path(), false, Some(&profile)).unwrap();
+        let first = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
+        assert_eq!(first.stacks_copied, 1);
+        for p in &first.confirmed {
+            profile.record(p);
+        }
+        profile.save().unwrap();
+
+        let profile = profile_for(card.path(), store.path());
+        let plans =
+            plan_with_profile(&cat, card.path(), lib.path(), false, Some(&profile)).unwrap();
+        let second = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
+        assert_eq!(second.stacks_copied, 0);
+        assert_eq!(second.duplicates_skipped, 1);
     }
 
     #[test]

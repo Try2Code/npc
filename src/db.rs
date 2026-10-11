@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS volume (
@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS file (
     shutter_count    INTEGER,
     content_hash     TEXT,
     present          INTEGER NOT NULL DEFAULT 1,
+    -- The card file this was imported from: its name there (before any
+    -- collision suffix) and its mtime there. NULL for files not imported by
+    -- this build. `mtime_ns` above is this file's own stat -- the import
+    -- time, unless the file was touched since.
+    src_name         TEXT,
+    src_mtime_ns     INTEGER,
     UNIQUE(stack_id, name)
 );
 
@@ -450,6 +456,20 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
         conn.execute("UPDATE stack SET event_id = NULL", [])?;
     }
 
+    // v4 -> v5: the card name and mtime a file was imported from. Existing
+    // rows stay NULL: their card stat was never recorded, and import matches
+    // them by name and size instead.
+    if from < 5 {
+        for (column, ty) in [("src_name", "TEXT"), ("src_mtime_ns", "INTEGER")] {
+            let has_column: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('file') WHERE name = ?1")?
+                .exists([column])?;
+            if !has_column {
+                conn.execute(&format!("ALTER TABLE file ADD COLUMN {column} {ty}"), [])?;
+            }
+        }
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -469,6 +489,37 @@ mod tests {
         let cat = Catalog::open_memory().unwrap();
         cat.conn.execute_batch(SCHEMA).unwrap(); // re-applying must not fail
         assert_eq!(cat.stack_count().unwrap(), 0);
+    }
+
+    /// A v4 catalog -- every real one before the card-stat columns -- gains
+    /// them with existing rows left NULL, not refused or rebuilt.
+    #[test]
+    fn a_v4_catalog_gains_the_source_columns_with_existing_rows_null() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute_batch(
+                "ALTER TABLE file DROP COLUMN src_name;
+                 ALTER TABLE file DROP COLUMN src_mtime_ns;
+                 INSERT INTO stack (dir, base) VALUES ('/lib', '750_0001');
+                 INSERT INTO file (stack_id, name, role) VALUES (1, '750_0001.NEF', 'raw');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+
+        migrate(&cat.conn, 4, Path::new(":memory:")).unwrap();
+
+        let (name, mtime): (Option<String>, Option<i64>) = cat
+            .conn
+            .query_row("SELECT src_name, src_mtime_ns FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((name, mtime), (None, None));
+        let version: i64 = cat
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

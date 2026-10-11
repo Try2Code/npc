@@ -366,7 +366,7 @@ fn import_dedup_needs_a_rescan_to_see_a_hand_added_file() {
 
     let mut cat = Catalog::open_memory().unwrap();
 
-    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
     assert_eq!(plans.len(), 1, "{plans:?}");
     assert!(
         plans[0].duplicate_of.is_none(),
@@ -375,7 +375,7 @@ fn import_dedup_needs_a_rescan_to_see_a_hand_added_file() {
 
     scan::scan(&mut cat, lib.path(), true).unwrap();
 
-    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
     assert_eq!(plans.len(), 1, "{plans:?}");
     assert!(
         plans[0].duplicate_of.is_some(),
@@ -1211,7 +1211,7 @@ fn import_merges_metadata_from_a_re_embedded_card_copy_instead_of_duplicating() 
     let before = fingerprint_tree(lib.path());
     let card_before = fingerprint_tree(card.path());
 
-    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
     assert_eq!(plans.len(), 1);
     let stack = &plans[0];
     assert!(stack.duplicate_of.is_some(), "must not plan a fresh import");
@@ -1309,7 +1309,7 @@ fn import_adds_a_raw_whose_jpg_sibling_is_already_in_the_library() {
     let card = tempfile::tempdir().unwrap();
     let card_nef = copy_into(card.path(), "750_6278.NEF");
 
-    let plans = npc::import::plan(&cat, card.path(), lib.path(), false).unwrap();
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
     assert_eq!(plans.len(), 1);
     let stack = &plans[0];
     assert_eq!(
@@ -1369,4 +1369,37 @@ fn import_adds_a_raw_whose_jpg_sibling_is_already_in_the_library() {
         .collect();
     roles.sort();
     assert_eq!(roles, vec!["oocjpg".to_string(), "raw".to_string()]);
+}
+
+/// Split cards: RAW to one card, JPG to the other. With the shot already in
+/// the library, a card holding only its JPG must be matched to the library
+/// JPG by the JPG's own identity -- serial, shutter count *and* role -- not
+/// compared with the RAW, whose size never matches (that fell through to
+/// reading both files in full: ~78 GB for one real card). `deep` so the
+/// name+size check can't answer first.
+#[test]
+fn a_jpg_only_card_matches_the_library_jpg_by_identity() {
+    require_ground_truth!();
+    let root = require_library!();
+    let lib = tempfile::tempdir().unwrap();
+    let fm = npc::meta::read_meta(root.join("08/01/750_6278.JPG").to_str().unwrap()).unwrap();
+    let date_dir = lib.path().join(npc::import::date_path(fm.capture_time));
+    std::fs::create_dir_all(&date_dir).unwrap();
+    copy_into(&date_dir, "750_6278.NEF");
+    let lib_jpg = copy_into(&date_dir, "750_6278.JPG");
+
+    let mut cat = Catalog::open_memory().unwrap();
+    scan::scan(&mut cat, lib.path(), false).unwrap();
+
+    let card = tempfile::tempdir().unwrap();
+    copy_into(card.path(), "750_6278.JPG");
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, true).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        plans[0].duplicate_of.as_deref(),
+        Some(lib_jpg.to_str().unwrap()),
+        "the card JPG is the library JPG, found by identity"
+    );
+    assert!(plans[0].already.iter().all(|a| !a.unread));
 }

@@ -266,10 +266,10 @@ enum Cmd {
         /// hand, or another tool's output).
         #[arg(long)]
         rescan: bool,
-        /// Check every file on the card, ignoring what earlier imports from
-        /// it already confirmed. By default a file whose path, size and mtime
-        /// are unchanged since an earlier import is not read again -- on a
-        /// card that is never reformatted, that is most of it.
+        /// Confirm every card file by its shutter count, skipping the cheap
+        /// first check. By default a card file whose name and size -- and,
+        /// for files imported from now on, card mtime -- match a library file
+        /// counts as imported without being read.
         #[arg(long)]
         deep: bool,
     },
@@ -1132,29 +1132,16 @@ fn main() -> Result<()> {
                 std::collections::HashSet::new();
             for source in &sources {
                 println!("scanning {}...", source.display());
-                // Only a cache: failing to load or save it costs speed, never
-                // an import, so it warns rather than aborting.
-                let mut profile = match npc::vol::identify(source)
-                    .and_then(|v| npc::card_profile::CardProfile::open(&config.catalog_store(), &v))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("warning: card profile unavailable, checking every file: {e:#}");
-                        None
-                    }
-                };
-                let plans = npc::import::plan_with_profile(
-                    &cat,
-                    source,
-                    &root,
-                    verify_content,
-                    profile.as_ref().filter(|_| !deep),
-                )?;
+                let plans = npc::import::plan(&cat, source, &root, verify_content, deep)?;
                 let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
                 let fresh = plans.len() - dupes;
                 let unread = plans
                     .iter()
-                    .filter(|p| p.duplicate_of.as_deref() == Some(npc::import::PREVIOUSLY_IMPORTED))
+                    .filter(|p| p.duplicate_of.is_some() && p.already.iter().all(|a| a.unread))
+                    .count();
+                let joining = plans
+                    .iter()
+                    .filter(|p| !p.members.is_empty() && !p.already.is_empty())
                     .count();
 
                 println!("import {} -> {}", source.display(), root.display());
@@ -1162,11 +1149,14 @@ fn main() -> Result<()> {
                 println!("  already in library {dupes}");
                 if unread > 0 {
                     println!(
-                        "    of which {unread} unchanged since an earlier import, not re-read \
-                         (--deep checks them too)"
+                        "    of which {unread} matched in the catalog by name and size, not read \
+                         (--deep reads them)"
                     );
                 }
                 println!("  to copy           {fresh}");
+                if joining > 0 {
+                    println!("    of which {joining} add a missing RAW/JPG to a stack already in the library");
+                }
 
                 let mut by_day: std::collections::BTreeMap<String, usize> =
                     std::collections::BTreeMap::default();
@@ -1210,9 +1200,9 @@ fn main() -> Result<()> {
                 let stats = npc::import::execute(&plans, &mut cat, &config, dry_run, &mut |ev| {
                     match ev {
                         npc::import::ImportEvent::Skipped(stack) => {
-                            let name = stack.members.first().map_or_else(
+                            let name = stack.already.first().map_or_else(
                                 || stack.base.clone(),
-                                |m| m.src.display().to_string(),
+                                |a| a.src.display().to_string(),
                             );
                             let existing = stack.duplicate_of.as_deref().unwrap_or("?");
                             match stack.metadata_merge.as_ref().filter(|m| m.needs_write()) {
@@ -1305,13 +1295,25 @@ fn main() -> Result<()> {
                 }
                 println!();
 
-                if let Some(p) = profile.as_mut().filter(|_| !stats.confirmed.is_empty()) {
-                    for path in &stats.confirmed {
-                        p.record(path);
+                if !dry_run {
+                    // Catalog this card's copies now, not only at the end: the
+                    // next card is planned against the catalog, and a RAW from
+                    // card 2 can only find its JPG from card 1 there -- without
+                    // it, the RAW would be filed as a different shot under a
+                    // suffixed name. Scoped to the folders this card wrote to,
+                    // the way the watcher rescans one.
+                    let dirs: std::collections::BTreeSet<&PathBuf> = plans
+                        .iter()
+                        .filter(|p| !p.members.is_empty())
+                        .map(|p| &p.dest_dir)
+                        .collect();
+                    for dir in dirs {
+                        if dir.is_dir() {
+                            scan::scan(&mut cat, dir, false)
+                                .with_context(|| format!("cataloging {}", dir.display()))?;
+                        }
                     }
-                    if let Err(e) = p.save() {
-                        eprintln!("warning: could not save card profile: {e:#}");
-                    }
+                    npc::import::record_sources(&mut cat, &stats.sources)?;
                 }
 
                 totals.stacks_copied += stats.stacks_copied;
@@ -1323,8 +1325,8 @@ fn main() -> Result<()> {
             }
 
             if !dry_run {
-                let (s, scanned_cat) = scan::scan_root(&root, false)?;
-                println!("catalog now holds {} stacks", s.stacks);
+                let (_, scanned_cat) = scan::scan_root(&root, false)?;
+                println!("catalog now holds {} stacks", scanned_cat.stack_count()?);
 
                 // Thumbnails for what just landed: warm the Grid tier in a
                 // detached background process rather than making `import`

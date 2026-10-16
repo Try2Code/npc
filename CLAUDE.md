@@ -57,7 +57,7 @@ and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
-Currently 385 tests. Coverage was ~84% region / 86% line at 177 tests and
+Currently 388 tests. Coverage was ~84% region / 86% line at 177 tests and
 has not been re-measured since.
 
 ## Layout

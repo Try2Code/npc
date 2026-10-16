@@ -68,9 +68,11 @@ if [ -d "$LIBRARY" ]; then
   CURRENT=$(mktemp)
   # Only originals. Sidecars are ours and profiles are RawTherapee's; both
   # appear during normal use, and a tripwire that fires on legitimate activity
-  # gets ignored, which defeats it.
+  # gets ignored, which defeats it. LC_ALL=C: a locale-aware sort ordered
+  # `750_5744_1.NEF` differently from one session to the next and fired on
+  # files that hadn't changed at all.
   find "$LIBRARY" -type f \! -name '*.xmp' \! -name '*.pp3' \
-       -printf '%s\t%T@\t%p\n' | sort -k3 > "$CURRENT"
+       -printf '%s\t%T@\t%p\n' | LC_ALL=C sort -k3 > "$CURRENT"
   if [ -f "$MANIFEST" ]; then
     if diff -q "$MANIFEST" "$CURRENT" >/dev/null; then
       ok "$(wc -l < "$CURRENT") originals unchanged"

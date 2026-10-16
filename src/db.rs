@@ -209,7 +209,7 @@ impl Catalog {
     /// writing into the real one.
     pub fn open_for_root_in(dir: &Path, root: &Path) -> Result<(Self, bool)> {
         if let Ok(vol) = crate::vol::identify(root) {
-            return Ok((Self::open_for(&vol.uuid, root)?, true));
+            return Ok((Self::open_for_in(dir, &vol.uuid, root)?, true));
         }
 
         let wanted = root.to_string_lossy().to_string();
@@ -633,6 +633,24 @@ mod tests {
         let (found, online) = Catalog::open_for_root_in(store.path(), absent).unwrap();
         assert!(!online, "an absent drive must not report as mounted");
         assert_eq!(found.stack_count().unwrap(), 1, "the catalog was not found");
+    }
+
+    /// With the drive present, the catalog must be created in the store
+    /// passed in -- not the real one. It used to go through `open_for`, which
+    /// ignores `dir`: every test handing in a temporary store (the watcher's)
+    /// left a catalog in ~/.local/share/npc, ~200 of them by the time anyone
+    /// looked.
+    #[test]
+    fn a_reachable_root_gets_its_catalog_in_the_given_store() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (cat, online) = Catalog::open_for_root_in(store.path(), root.path()).unwrap();
+        assert!(online);
+        assert!(
+            cat.path.starts_with(store.path()),
+            "catalog created at {} instead of in the given store",
+            cat.path.display()
+        );
     }
 
     #[test]

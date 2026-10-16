@@ -386,7 +386,10 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
 /// directory look like it's inside the library. Canonicalizing both first is
 /// what makes that check meaningful rather than a string-prefix guess; same
 /// reasoning `import::plan`'s own overlap check uses.
-fn only_dir_is_inside_library(root: &Path, dir: &Path) -> Result<()> {
+///
+/// Returns the directory spelled under `root` as given, so `--only .` or
+/// `--only ../x` is cataloged with the same dirs a full scan stores.
+fn only_dir_is_inside_library(root: &Path, dir: &Path) -> Result<PathBuf> {
     let root_canon = root
         .canonicalize()
         .with_context(|| format!("resolving library {}", root.display()))?;
@@ -400,7 +403,8 @@ fn only_dir_is_inside_library(root: &Path, dir: &Path) -> Result<()> {
         dir.display(),
         root.display()
     );
-    Ok(())
+    let rel = dir_canon.strip_prefix(&root_canon).unwrap_or(Path::new(""));
+    Ok(root.join(rel))
 }
 
 /// Every stack currently cataloged under one of `dirs`, by exact match --
@@ -438,7 +442,8 @@ fn stack_ids_in_dirs(cat: &Catalog, dirs: &std::collections::HashSet<PathBuf>) -
 /// scanning whatever happens to be underfoot is not a helpful guess.
 fn library(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(r) = explicit {
-        return Ok(r.to_path_buf());
+        // `npc scan .` must not record `.` as the library's root.
+        return std::path::absolute(r).with_context(|| format!("resolving {}", r.display()));
     }
     if let Some(r) = npc::config::Config::load()
         .unwrap_or_default()
@@ -655,15 +660,16 @@ fn main() -> Result<()> {
                 // problem is simpler and already has its own clear one.
                 let mut cat = require_online(&root)?;
 
-                for dir in &only {
-                    only_dir_is_inside_library(&root, dir)?;
-                }
+                let dirs = only
+                    .iter()
+                    .map(|dir| only_dir_is_inside_library(&root, dir))
+                    .collect::<Result<Vec<_>>>()?;
 
                 if let Ok(vol) = npc::vol::identify(&root) {
                     cat.register_volume(&vol.uuid, vol.label.as_deref(), &root)?;
                 }
                 let mut totals = scan::ScanStats::default();
-                for dir in &only {
+                for dir in &dirs {
                     let s = scan::scan(&mut cat, dir, full).context("scanning")?;
                     totals.files_seen += s.files_seen;
                     totals.unchanged += s.unchanged;
@@ -1955,7 +1961,21 @@ mod tests {
         let lib = tempfile::tempdir().unwrap();
         let sub = lib.path().join("export/4claudia");
         std::fs::create_dir_all(&sub).unwrap();
-        assert!(only_dir_is_inside_library(lib.path(), &sub).is_ok());
+        assert_eq!(only_dir_is_inside_library(lib.path(), &sub).unwrap(), sub);
+    }
+
+    /// `--only` hands the scan the dir spelled under the library root, so a
+    /// detour through `..` stores the same dirs a full scan would.
+    #[test]
+    fn only_dir_is_spelled_under_the_library_root() {
+        let lib = tempfile::tempdir().unwrap();
+        let sub = lib.path().join("export/4cdsh");
+        std::fs::create_dir_all(&sub).unwrap();
+        let detour = lib.path().join("export/../export/4cdsh");
+        assert_eq!(
+            only_dir_is_inside_library(lib.path(), &detour).unwrap(),
+            sub
+        );
     }
 
     #[test]

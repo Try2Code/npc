@@ -244,6 +244,13 @@ struct Walked {
 /// Scan `root` into the catalog. Originals are only ever opened read-only, so
 /// this cannot alter the drive even if it panics mid-walk.
 pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
+    // Stack dirs are stored as walked. `npc scan --only .` once stored 1,834
+    // stacks as `./4cdsh` and the like: duplicates of their absolute twins,
+    // whose sidecars resolve against whatever the browser's cwd happens to
+    // be. Absolute, but not canonical -- a symlinked library keeps the path
+    // it was configured with, which is what every other path is built from.
+    let root =
+        &std::path::absolute(root).with_context(|| format!("resolving {}", root.display()))?;
     let mut stats = ScanStats::default();
     let known = if full {
         HashMap::new()
@@ -762,6 +769,42 @@ mod tests {
     /// The exact workflow this feature exists for: rate the originals
     /// first, edit later. A RawTherapee/spektra export keeps the source's
     /// filename stem but starts with none of its metadata -- it should
+    /// A relative root is cataloged under its absolute path. Stored as given,
+    /// `./4cdsh` stacks duplicated their absolute twins and their sidecars
+    /// resolved against the browser's cwd -- "can't be written" in npcg.
+    #[test]
+    fn a_relative_root_is_stored_as_absolute_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("export/4cdsh");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("750_5610.JPG"), "jpg").unwrap();
+
+        // Relative to the cwd without changing it (process-global in tests):
+        // `..` up to `/`, then down to the target.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = std::path::PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(dir.path().join("export").strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, &relative, true).unwrap();
+
+        let dirs: Vec<String> = cat
+            .conn
+            .prepare("SELECT dir FROM stack")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert!(Path::new(&dirs[0]).is_absolute(), "stored {:?}", dirs[0]);
+        assert!(Path::new(&dirs[0]).join("750_5610.JPG").is_file());
+    }
+
     /// inherit the rating already given to the original, not start unrated.
     #[test]
     fn a_new_stack_inherits_the_rating_of_a_same_named_stack_elsewhere() {

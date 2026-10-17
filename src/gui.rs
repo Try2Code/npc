@@ -355,7 +355,14 @@ struct GuiApp {
     /// enough. `Size::Grid` and `Size::Full` textures for the same source
     /// coexist here under their own distinct cache-file paths -- no key
     /// collision, since `thumbs::Cache` keys by size too.
-    textures: HashMap<PathBuf, egui::TextureHandle>,
+    ///
+    /// Each entry carries the frame it was last drawn in. Kept unbounded,
+    /// stepping through 1,000 photos in single view held ~7 GB of 1620 px
+    /// textures; `evict_textures` drops the least recently drawn past
+    /// `TEXTURE_BUDGET`.
+    textures: HashMap<PathBuf, (egui::TextureHandle, u64)>,
+    /// Frames drawn so far; the clock `textures` ages by.
+    frame: u64,
     /// Tiles per row, recorded during the previous frame's layout and used
     /// by arrow-key row-jumping -- the same "measured during draw, consumed
     /// next frame" pattern as `tui.rs`'s `page_size`.
@@ -483,6 +490,7 @@ impl GuiApp {
             range_anchor: 0,
             scroll_to_selected: false,
             textures: HashMap::new(),
+            frame: 0,
             cols: 1,
             mode: Mode::Grid,
             applied_filter: None,
@@ -951,7 +959,8 @@ impl GuiApp {
     }
 
     fn texture_for(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.textures.get(path) {
+        if let Some((t, used)) = self.textures.get_mut(path) {
+            *used = self.frame;
             return Some(t.clone());
         }
         let img = image::open(path).ok()?.to_rgba8();
@@ -963,8 +972,64 @@ impl GuiApp {
             color,
             egui::TextureOptions::default(),
         );
-        self.textures.insert(path.to_path_buf(), tex.clone());
+        self.textures
+            .insert(path.to_path_buf(), (tex.clone(), self.frame));
         Some(tex)
+    }
+
+    /// Drop the least recently drawn textures until the rest fit `budget`
+    /// bytes. What this frame drew is never dropped.
+    fn evict_textures(&mut self, budget: usize) {
+        let bytes = |t: &egui::TextureHandle| {
+            let [w, h] = t.size();
+            w * h * 4
+        };
+        let mut total: usize = self.textures.values().map(|(t, _)| bytes(t)).sum();
+        if total <= budget {
+            return;
+        }
+        let mut by_age: Vec<(u64, PathBuf, usize)> = self
+            .textures
+            .iter()
+            .map(|(p, (t, used))| (*used, p.clone(), bytes(t)))
+            .collect();
+        by_age.sort_unstable_by_key(|(used, ..)| *used);
+        for (used, path, size) in by_age {
+            if total <= budget || used == self.frame {
+                break;
+            }
+            self.textures.remove(&path);
+            total -= size;
+        }
+    }
+
+    /// Single view: make the photos either side of `selected` ready while
+    /// this one is looked at, so stepping to them finds a finished view
+    /// image (generated on the cache's worker) and, for the next one, a
+    /// texture already uploaded. A first view used to wait for both: up to
+    /// ~350 ms of generation for a JPG-only stack, ~30 ms of decode on this
+    /// thread for any.
+    fn prefetch_neighbours(&mut self, ctx: &egui::Context, size: thumbs::Size) {
+        let mut decoded_one = false;
+        for offset in [1_isize, -1, 2] {
+            let Some(i) = self.selected.checked_add_signed(offset) else {
+                continue;
+            };
+            let Some(id) = self.rows.get(i).map(|r| r.id) else {
+                continue;
+            };
+            let Ok(Some(src)) = thumbs::best_source(&self.cat, id) else {
+                continue;
+            };
+            // `get` queues generation when it isn't cached yet. At most one
+            // decode per frame, so prefetching never stalls a frame twice.
+            if let Some(path) = self.cache.get(&src, size) {
+                if !decoded_one && !self.textures.contains_key(&path) {
+                    let _ = self.texture_for(ctx, &path);
+                    decoded_one = true;
+                }
+            }
+        }
     }
 
     fn draw_query_bar(&mut self, ui: &mut egui::Ui) {
@@ -1995,6 +2060,12 @@ impl GuiApp {
                 .and_then(|path| self.texture_for(&ctx, &path))
             {
                 Some(tex) => {
+                    // Only once this one shows, so it never waits behind its
+                    // neighbours. Not when zoomed: a full-resolution
+                    // texture is ~100 MB, too much to make on speculation.
+                    if size_tier == thumbs::Size::View {
+                        self.prefetch_neighbours(&ctx, size_tier);
+                    }
                     let avail = ui.available_size();
                     let (viewport, response) =
                         ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
@@ -2095,8 +2166,13 @@ fn visuals_for(theme: Theme) -> egui::Visuals {
     }
 }
 
+/// GPU memory for decoded thumbnails and view images: ~70 single-view
+/// images at 1620 px, or ~750 grid tiles at 500 px.
+const TEXTURE_BUDGET: usize = 512 * 1024 * 1024;
+
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame += 1;
         self.poll_watcher();
         self.draw_query_bar(ui);
         self.draw_sidebar(ui);
@@ -2141,6 +2217,7 @@ impl eframe::App for GuiApp {
         self.draw_actions_menu(ui);
         self.draw_export_menu(ui);
         self.poll_thumbnail_generation(ui.ctx());
+        self.evict_textures(TEXTURE_BUDGET);
         // Last, so an edit made this frame already counts as "not idle".
         self.drive_writer(ui.ctx());
     }
@@ -2354,6 +2431,8 @@ pub fn run(root: &Path, no_watch: bool) -> Result<()> {
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(visuals_for(theme));
+            let ctx = cc.egui_ctx.clone();
+            cache.on_done(move || ctx.request_repaint());
             Ok(Box::new(GuiApp::new(
                 cat, cache, config, watcher, root, online,
             )))
@@ -2958,5 +3037,74 @@ mod tests {
             app.status.as_deref(),
             Some("export not available: the library is not mounted")
         );
+    }
+
+    /// A real JPEG at `path`, `w`x`h`, so `texture_for` has something to load.
+    fn write_jpeg(path: &Path, w: u32, h: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::new(w, h).save(path).unwrap();
+    }
+
+    /// Stepping through photos must not keep every one it showed: least
+    /// recently drawn go first, and what this frame drew stays even when it
+    /// alone is over budget.
+    #[test]
+    fn textures_past_the_budget_are_dropped_oldest_first() {
+        let (dir, mut app) = app();
+        let ctx = egui::Context::default();
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| dir.path().join(format!("t{i}.jpg")))
+            .collect();
+        for (frame, path) in paths.iter().enumerate() {
+            write_jpeg(path, 100, 100); // 40,000 bytes as RGBA
+            app.frame = frame as u64;
+            assert!(app.texture_for(&ctx, path).is_some());
+        }
+        // Draw the oldest again: now the middle one is least recent.
+        app.frame = 3;
+        assert!(app.texture_for(&ctx, &paths[0]).is_some());
+
+        app.evict_textures(80_000);
+        assert!(app.textures.contains_key(&paths[0]), "redrawn this frame");
+        assert!(!app.textures.contains_key(&paths[1]), "least recent stayed");
+        assert!(app.textures.contains_key(&paths[2]));
+
+        app.evict_textures(1);
+        assert_eq!(
+            app.textures.keys().collect::<Vec<_>>(),
+            vec![&paths[0]],
+            "this frame's texture must survive any budget"
+        );
+    }
+
+    /// Single view readies the next photo while this one is looked at: its
+    /// view image is queued for generation, and once cached, uploaded
+    /// before the user steps to it -- one decode per frame at most.
+    #[test]
+    fn single_view_prepares_the_neighbours() {
+        let (_dir, mut app) = app();
+        let cache_dir = tempfile::tempdir().unwrap();
+        app.cache = thumbs::Cache::in_dir(cache_dir.path().to_path_buf()).unwrap();
+        let ctx = egui::Context::default();
+        app.selected = 1;
+        let view_path = |app: &GuiApp, i: usize| {
+            let src = thumbs::best_source(&app.cat, app.rows[i].id)
+                .unwrap()
+                .unwrap();
+            app.cache.path_for(&src, thumbs::Size::View)
+        };
+        let (prev, next) = (view_path(&app, 0), view_path(&app, 2));
+        write_jpeg(&prev, 30, 20);
+        write_jpeg(&next, 30, 20);
+
+        app.prefetch_neighbours(&ctx, thumbs::Size::View);
+        assert!(
+            app.textures.contains_key(&next),
+            "the next photo comes first"
+        );
+        assert!(!app.textures.contains_key(&prev), "one decode per frame");
+
+        app.prefetch_neighbours(&ctx, thumbs::Size::View);
+        assert!(app.textures.contains_key(&prev));
     }
 }

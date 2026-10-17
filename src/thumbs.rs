@@ -30,7 +30,7 @@
 
 use crate::db::Catalog;
 use anyhow::{Context, Result};
-use image::imageops::FilterType;
+use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -92,7 +92,7 @@ impl Size {
     /// (plain or zoomed) is looked at closely, so quality does.
     fn filter(self) -> FilterType {
         match self {
-            Size::Grid => FilterType::Triangle,
+            Size::Grid => FilterType::Bilinear,
             Size::View | Size::Full => FilterType::Lanczos3,
         }
     }
@@ -164,7 +164,12 @@ pub struct Cache {
     tx: mpsc::Sender<(Source, Size, PathBuf)>,
     /// Signals the UI that something new landed and a redraw is worthwhile.
     pub done: mpsc::Receiver<PathBuf>,
+    /// Called on the worker thread after each finished thumbnail, so a GUI
+    /// can wake at once instead of on its next polling tick.
+    notify: Notify,
 }
+
+type Notify = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
 
 impl Cache {
     pub fn new(vol_uuid: &str) -> Result<Self> {
@@ -172,6 +177,12 @@ impl Cache {
             .unwrap_or_default()
             .cache_store()
             .join(vol_uuid);
+        Self::in_dir(dir)
+    }
+
+    /// A cache kept in `dir`, outside the configured store. Tests use it so
+    /// what they generate never lands in the real thumbnail cache.
+    pub fn in_dir(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating thumbnail cache {}", dir.display()))?;
 
@@ -182,12 +193,17 @@ impl Cache {
         // One worker. Decoding is the expensive half and it happens here,
         // off the UI thread, so scrolling never waits on a JPEG.
         let busy = inflight.clone();
+        let notify: Notify = Arc::default();
+        let wake = notify.clone();
         std::thread::spawn(move || {
             while let Ok((src, size, out)) = rx.recv() {
                 let _ = generate(&src, size, &out);
                 busy.lock().map(|mut b| b.remove(&out)).ok();
                 if done_tx.send(out).is_err() {
                     break;
+                }
+                if let Ok(Some(f)) = wake.lock().as_deref() {
+                    f();
                 }
             }
         });
@@ -197,6 +213,7 @@ impl Cache {
             inflight,
             tx,
             done,
+            notify,
         })
     }
 
@@ -230,6 +247,13 @@ impl Cache {
             }
         }
         None
+    }
+
+    /// Call `f` on the worker thread whenever a thumbnail is finished.
+    pub fn on_done(&self, f: impl Fn() + Send + 'static) {
+        if let Ok(mut n) = self.notify.lock() {
+            *n = Some(Box::new(f));
+        }
     }
 
     /// Generate synchronously. Used by `npc thumbs` for bulk pre-warming.
@@ -345,11 +369,12 @@ fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
     let close_enough = long <= size.px() + size.px() / 20;
     let img = if long > size.px() && !close_enough {
         let scale = size.px() as f32 / long as f32;
-        img.resize(
+        resize(
+            &img,
             (w as f32 * scale).round().max(1.0) as u32,
             (h as f32 * scale).round().max(1.0) as u32,
             size.filter(),
-        )
+        )?
     } else {
         img
     };
@@ -383,6 +408,26 @@ fn generate(src: &Source, size: Size, out: &Path) -> Result<()> {
     }
     std::fs::rename(&part, out)?;
     Ok(())
+}
+
+/// Resample to exactly `w`x`h`. `image`'s own `resize` took 640 ms of a
+/// JPG-only stack's ~950 ms first view (24 MP down to 1620 px, Lanczos3);
+/// the same filter here, SIMD, takes 31 ms. Most of the catalog is JPG-only.
+fn resize(
+    img: &image::DynamicImage,
+    w: u32,
+    h: u32,
+    filter: FilterType,
+) -> Result<image::DynamicImage> {
+    let mut dst = image::DynamicImage::new(w, h, img.color());
+    Resizer::new()
+        .resize(
+            img,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter)),
+        )
+        .context("resizing preview")?;
+    Ok(dst)
 }
 
 /// EXIF orientation, applied so portrait shots are not shown on their side.
@@ -508,6 +553,73 @@ mod tests {
                 made.height()
             );
         }
+    }
+
+    /// The SIMD resampler must keep pixels where they were and colours what
+    /// they were, for colour and greyscale sources alike -- a channel mixup
+    /// or a transposed buffer still produces an image of the right size.
+    #[test]
+    fn resizing_keeps_the_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rgb = image::RgbImage::new(2000, 1000);
+        for (x, _, p) in rgb.enumerate_pixels_mut() {
+            *p = if x < 1000 {
+                image::Rgb([220, 30, 30])
+            } else {
+                image::Rgb([30, 30, 220])
+            };
+        }
+        let grey = image::GrayImage::from_fn(2000, 1000, |x, _| {
+            image::Luma([if x < 1000 { 20 } else { 230 }])
+        });
+        for (name, img) in [
+            ("rgb.png", image::DynamicImage::ImageRgb8(rgb)),
+            ("grey.png", image::DynamicImage::ImageLuma8(grey)),
+        ] {
+            let path = dir.path().join(name);
+            img.save(&path).unwrap();
+            let src = Source {
+                path,
+                embedded: false,
+                mtime: 1,
+                orientation: 1,
+                stack_id: 1,
+            };
+            let out = dir.path().join(format!("{name}.jpg"));
+            generate(&src, Size::Grid, &out).unwrap();
+            let made = image::open(&out).unwrap().to_rgb8();
+            let (w, h) = made.dimensions();
+            // Not `Size::Grid.px()`: other tests reconfigure sizes concurrently.
+            assert!(w < 2000 && w == 2 * h, "{name}: {w}x{h}");
+            let left = made.get_pixel(w / 4, h / 2).0;
+            let right = made.get_pixel(w * 3 / 4, h / 2).0;
+            let near = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 12);
+            if name == "rgb.png" {
+                assert!(near(left, [220, 30, 30]), "{name}: left is {left:?}");
+                assert!(near(right, [30, 30, 220]), "{name}: right is {right:?}");
+            } else {
+                assert!(near(left, [20, 20, 20]), "{name}: left is {left:?}");
+                assert!(near(right, [230, 230, 230]), "{name}: right is {right:?}");
+            }
+        }
+    }
+
+    /// The GUI repaints from this callback instead of polling, so it must
+    /// fire once the file is actually there to load.
+    #[test]
+    fn on_done_fires_after_the_thumbnail_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::in_dir(dir.path().join("cache")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        cache.on_done(move || {
+            let _ = tx.send(());
+        });
+        let src = source(dir.path(), 800, 600, 1);
+        let out = cache.path_for(&src, Size::Grid);
+        assert!(cache.get(&src, Size::Grid).is_none(), "nothing cached yet");
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("on_done never fired");
+        assert!(out.is_file(), "on_done fired before the thumbnail existed");
     }
 
     #[test]

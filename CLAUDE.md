@@ -119,6 +119,13 @@ is the wrong one in each case:
   place; `edit::Writer` writes the `pending` queue one sidecar per idle step
   and quitting waits for it. Keep it on the UI thread with the UI's own
   connection — a second writer would race edits made between steps.
+- **npcg's single view prepares its neighbours.** A first view waited on
+  generation (~950 ms for a JPG-only stack, 640 ms of it `image`'s Lanczos3
+  resize; `fast_image_resize` does the same filter in 31 ms) and on a 120 ms
+  repaint tick. The cache's worker now wakes the GUI (`Cache::on_done`), and
+  textures are capped at 512 MB, least recently drawn first — unbounded,
+  1,000 photos held ~7 GB. Most of the library (72k of 94k stacks) is
+  JPG-only, so that path is the common one, not the RAW.
 - **Import catalogs only what it copied**, card by card, before planning the
   next card (so a RAW on card 2 joins its JPG from card 1). The old full-
   library scan after every import cost 8–10 min to find nothing more.

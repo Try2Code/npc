@@ -25,6 +25,9 @@ blake3 = "1"
 ratatui = { version = "0.29", features = ["serde"] }
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# SIMD resampling: the same Lanczos3 as `image`, 31 ms instead of 640 ms for
+# a 24 MP JPG down to the view size.
+fast_image_resize = { version = "6", features = ["image"] }
 ratatui-image = "4"
 eframe = "0.36.1"
 egui = "0.36.1"

@@ -1584,10 +1584,21 @@ fn main() -> Result<()> {
             let config = npc::config::Config::load()?;
             let root = library(root.as_deref())?;
 
-            let mut cat = open_for(&root)?;
+            let (mut cat, online) = open_checked(&root)?;
             let entries = npc::trash::list(&cat)?;
             if entries.is_empty() {
-                println!("trash is empty");
+                // Folders left empty by an earlier emptying: nothing in them
+                // to lose, so no --yes needed.
+                let dirs = if online {
+                    npc::trash::prune_empty_dirs(&root, &config)?
+                } else {
+                    0
+                };
+                if dirs > 0 {
+                    println!("trash is empty; removed {dirs} empty folder(s)");
+                } else {
+                    println!("trash is empty");
+                }
                 return Ok(());
             }
             if !yes {
@@ -1601,8 +1612,11 @@ fn main() -> Result<()> {
                 println!("\nThis cannot be undone. Re-run with --yes to proceed.");
                 return Ok(());
             }
-            let stats = npc::trash::empty(&mut cat, &config)?;
-            println!("deleted {} stack(s), {} files", stats.stacks, stats.files);
+            let stats = npc::trash::empty(&mut cat, &root, &config)?;
+            println!(
+                "deleted {} stack(s), {} files; removed {} empty folder(s)",
+                stats.stacks, stats.files, stats.dirs
+            );
             for e in &stats.errors {
                 eprintln!("error: {e}");
             }

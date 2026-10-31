@@ -22,6 +22,8 @@ pub const TRASH_DIR: &str = ".trash";
 pub struct TrashStats {
     pub stacks: usize,
     pub files: usize,
+    /// Empty folders removed from under `.trash/` afterwards.
+    pub dirs: usize,
     pub errors: Vec<String>,
 }
 
@@ -200,7 +202,7 @@ pub fn list(cat: &Catalog) -> Result<Vec<TrashedEntry>> {
 
 /// The only operation in this program that deletes a photograph. Callers must
 /// have confirmed with the user first.
-pub fn empty(cat: &mut Catalog, config: &Config) -> Result<TrashStats> {
+pub fn empty(cat: &mut Catalog, library: &Path, config: &Config) -> Result<TrashStats> {
     let mut stats = TrashStats::default();
     let entries = list(cat)?;
 
@@ -219,7 +221,34 @@ pub fn empty(cat: &mut Catalog, config: &Config) -> Result<TrashStats> {
         stats.stacks += 1;
     }
 
+    stats.dirs = prune_empty_dirs(library, config)?;
     Ok(stats)
+}
+
+/// Remove every empty folder under `.trash/`, deepest first, keeping
+/// `.trash/` itself. Emptying the trash deletes files, not the `YYYY/MM/DD`
+/// folders they were trashed into, so those piled up empty. Only
+/// `remove_dir` is used, which refuses a folder with anything in it -- a
+/// file can't be lost here, even one npc doesn't know about.
+pub fn prune_empty_dirs(library: &Path, config: &Config) -> Result<usize> {
+    let root = trash_root(library);
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    config.ensure_mutable(&root)?;
+    let mut removed = 0;
+    for entry in walkdir::WalkDir::new(&root)
+        .min_depth(1)
+        .contents_first(true)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_dir() && std::fs::remove_dir(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -347,11 +376,47 @@ mod tests {
         // Still on disk after trashing -- nothing was unlinked.
         assert!(dir.path().join(".trash/2026/08/09/750_0001.NEF").exists());
 
-        let stats = empty(&mut cat, &Config::default()).unwrap();
+        let stats = empty(&mut cat, dir.path(), &Config::default()).unwrap();
         assert_eq!(stats.stacks, 1);
         assert_eq!(stats.files, 5);
         assert!(!dir.path().join(".trash/2026/08/09/750_0001.NEF").exists());
         assert_eq!(cat.stack_count().unwrap(), 0);
+        // ..and the YYYY/MM/DD folders it was trashed into go with it.
+        assert_eq!(stats.dirs, 3);
+        assert!(dir.path().join(".trash").is_dir(), ".trash itself stays");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(".trash"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// Only empty folders go: one holding anything at all -- even a file
+    /// npc never cataloged -- stays, and so does the file.
+    #[test]
+    fn pruning_keeps_any_folder_that_holds_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join(".trash");
+        std::fs::create_dir_all(trash.join("2025/02/08")).unwrap();
+        std::fs::create_dir_all(trash.join("2026/07/11")).unwrap();
+        std::fs::write(trash.join("2026/07/11/stray.txt"), "keep me").unwrap();
+
+        let removed = prune_empty_dirs(dir.path(), &Config::default()).unwrap();
+        assert_eq!(removed, 3, "2025/02/08, 2025/02, 2025");
+        assert!(!trash.join("2025").exists());
+        assert!(trash.join("2026/07/11/stray.txt").is_file());
+
+        let protected = Config {
+            protected_roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(trash.join("2024/01/01")).unwrap();
+        assert!(prune_empty_dirs(dir.path(), &protected).is_err());
+        assert!(
+            trash.join("2024/01/01").is_dir(),
+            "a protected library was touched"
+        );
     }
 
     #[test]

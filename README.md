@@ -261,7 +261,8 @@ npc tag add beach -q 'date=2026-08-09' --dry-run
 ```
 
 `npc import` with no path detects mounted cards (any mount with a top-level
-`DCIM` folder) and prompts you to pick one or more; `npc import <path>`
+`DCIM` folder) and prompts you to pick one or more -- Enter takes them all,
+`q` cancels; `npc import <path>`
 still works directly for scripting. `--library` defaults to the configured
 library like every other subcommand.
 

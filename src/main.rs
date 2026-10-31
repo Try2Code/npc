@@ -479,8 +479,9 @@ fn open_for(root: &Path) -> Result<Catalog> {
     Ok(open_checked(root)?.0)
 }
 
-/// Detect mounted cards and prompt for one or more to import. `Ok(None)`
-/// means the user cancelled (blank input) -- not an error, just nothing to do.
+/// Detect mounted cards and prompt for one or more to import. Enter takes
+/// them all. `Ok(None)` means the user cancelled (`q`) -- not an error, just
+/// nothing to do.
 fn pick_cards() -> Result<Option<Vec<PathBuf>>> {
     let cards = npc::cards::detect()?;
     if cards.is_empty() {
@@ -497,7 +498,7 @@ fn pick_cards() -> Result<Option<Vec<PathBuf>>> {
             None => println!("  {}) {}", i + 1, c.mount.display()),
         }
     }
-    print!("import which? (e.g. \"1,3\", \"all\", enter to cancel): ");
+    print!("import which? (enter for all, e.g. \"1,3\", q to cancel): ");
     std::io::Write::flush(&mut std::io::stdout())?;
 
     let mut line = String::new();

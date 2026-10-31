@@ -55,15 +55,16 @@ fn candidate_mounts(text: &str, has_dcim: impl Fn(&Path) -> bool) -> Vec<PathBuf
 
 /// Parse a card-selection line: comma/space separated 1-based numbers, or
 /// `all`. Returns 0-based indices, in the order given, deduplicated. Empty
-/// input (just pressing enter) means "cancel" and returns an empty, non-error
-/// selection.
+/// input (just pressing enter) means all cards -- importing every card in
+/// the reader is the usual case. `q` or `none` cancels and returns an
+/// empty, non-error selection.
 pub fn parse_selection(input: &str, n: usize) -> Result<Vec<usize>> {
     let input = input.trim();
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-    if input.eq_ignore_ascii_case("all") {
+    if input.is_empty() || input.eq_ignore_ascii_case("all") {
         return Ok((0..n).collect());
+    }
+    if input.eq_ignore_ascii_case("q") || input.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
     }
 
     let mut out = Vec::new();
@@ -129,9 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_selects_nothing() {
-        assert_eq!(parse_selection("", 3).unwrap(), Vec::<usize>::new());
-        assert_eq!(parse_selection("   ", 3).unwrap(), Vec::<usize>::new());
+    fn empty_input_selects_every_card() {
+        assert_eq!(parse_selection("", 3).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_selection("  \n", 2).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn q_or_none_cancels() {
+        assert_eq!(parse_selection("q", 3).unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_selection(" None ", 3).unwrap(), Vec::<usize>::new());
     }
 
     #[test]

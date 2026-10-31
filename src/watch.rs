@@ -88,8 +88,9 @@ impl Watcher {
 /// (`import::date_path()`'s `YYYY/MM/DD` convention) and the trash. Neither
 /// is ever written to by hand -- trash operations in particular move files
 /// *into* `.trash`, which would otherwise look exactly like a new import.
+/// The desktop's trash on the drive counts too (see `is_trash_dir`).
 pub(crate) fn is_reserved_top_level(name: &str) -> bool {
-    name == crate::trash::TRASH_DIR || (name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()))
+    crate::scan::is_trash_dir(name) || (name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// True if `path` falls under a reserved or user-configured excluded
@@ -237,6 +238,7 @@ mod tests {
         assert!(is_reserved_top_level("2026"));
         assert!(is_reserved_top_level("1999"));
         assert!(is_reserved_top_level(".trash"));
+        assert!(is_reserved_top_level(".Trash-1000"));
         assert!(!is_reserved_top_level("export"));
         assert!(!is_reserved_top_level("20260")); // 5 digits, not a year
         assert!(!is_reserved_top_level("202a")); // not all digits

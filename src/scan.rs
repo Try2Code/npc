@@ -241,6 +241,14 @@ struct Walked {
     role: Role,
 }
 
+/// A trash folder, never cataloged: npc's own `.trash/`, and the desktop's
+/// on a removable drive -- `.Trash-<uid>` (freedesktop) and `.Trashes`
+/// (macOS). Photos deleted in a file manager sat in `.Trash-1000` as 13
+/// rated stacks of their own.
+pub fn is_trash_dir(name: &str) -> bool {
+    name == crate::trash::TRASH_DIR || name.starts_with(".Trash-") || name == ".Trashes"
+}
+
 /// Scan `root` into the catalog. Originals are only ever opened read-only, so
 /// this cannot alter the drive even if it panics mid-walk.
 pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
@@ -272,10 +280,7 @@ pub fn scan(cat: &mut Catalog, root: &Path, full: bool) -> Result<ScanStats> {
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            // `.trash/` holds deleted stacks and must not re-enter the catalog.
-            e.file_name() != ".trash"
-        })
+        .filter_entry(|e| !is_trash_dir(&e.file_name().to_string_lossy()))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -769,6 +774,37 @@ mod tests {
     /// The exact workflow this feature exists for: rate the originals
     /// first, edit later. A RawTherapee/spektra export keeps the source's
     /// filename stem but starts with none of its metadata -- it should
+    /// Nothing in a trash folder is cataloged -- npc's own, or the desktop's
+    /// on the drive.
+    #[test]
+    fn trash_folders_are_never_cataloged() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in [
+            "2026/08/09",
+            ".trash/2026/08/09",
+            ".Trash-1000/files",
+            ".Trashes/501",
+        ] {
+            let d = dir.path().join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("750_0001.JPG"), "jpg").unwrap();
+        }
+        let mut cat = Catalog::open_memory().unwrap();
+        scan(&mut cat, dir.path(), true).unwrap();
+        let dirs: Vec<String> = cat
+            .conn
+            .prepare("SELECT dir FROM stack")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            dirs,
+            vec![dir.path().join("2026/08/09").to_string_lossy().to_string()]
+        );
+    }
+
     /// A relative root is cataloged under its absolute path. Stored as given,
     /// `./4cdsh` stacks duplicated their absolute twins and their sidecars
     /// resolved against the browser's cwd -- "can't be written" in npcg.

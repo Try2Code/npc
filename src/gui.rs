@@ -269,33 +269,72 @@ fn build_tag_tree(flat: &[(String, i64)]) -> Vec<TagNode> {
     into_nodes(root.children, "")
 }
 
-/// Renders one tag (and, recursively, its children); returns the filter
-/// fragment if this node (or a descendant) was clicked this frame. A leaf
+/// The Folders section as a tree, like the tags: each stack's directory
+/// relative to the library, split on `/` -- `2026` > `10` > `31`, `export` >
+/// `color`. A flat list of every directory was ~3,000 rows.
+fn build_folder_tree(flat: &[(String, i64)], root: &Path) -> Vec<TagNode> {
+    let relative: Vec<(String, i64)> = flat
+        .iter()
+        .map(|(dir, n)| {
+            let rel = Path::new(dir).strip_prefix(root).map_or_else(
+                |_| dir.trim_start_matches('/').to_string(),
+                |r| r.to_string_lossy().into_owned(),
+            );
+            (rel, *n)
+        })
+        .collect();
+    build_tag_tree(&relative)
+}
+
+/// The filter a Folders node applies: everything in that folder and below.
+/// `path` is a substring match on `dir/base`, so the trailing `/` is what
+/// keeps `2026/10/3` from also matching `2026/10/31`.
+fn folder_filter(root: &Path, rel: &str) -> String {
+    let dir = if rel.is_empty() {
+        root.to_string_lossy().into_owned()
+    } else {
+        format!("{}/{rel}", root.display())
+    };
+    format!("path=\"{dir}/\"")
+}
+
+/// Renders one tag or folder (and, recursively, its children); returns the
+/// filter fragment (`filter` of the node's path) if this node (or a
+/// descendant) was clicked this frame. A leaf
 /// is a plain selectable label; a node with children is a collapsing
 /// header whose own click both toggles expansion and filters by the whole
 /// subtree -- one click doing both is a deliberate simplification for this
 /// first cut, not an oversight; worth revisiting if it feels wrong in use.
-fn draw_tag_node(ui: &mut egui::Ui, node: &TagNode) -> Option<String> {
+fn draw_tree_node(
+    ui: &mut egui::Ui,
+    node: &TagNode,
+    filter: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    let name = if node.name.is_empty() {
+        "(top level)"
+    } else {
+        node.name.as_str()
+    };
     if node.children.is_empty() {
-        let label = format!("{} ({})", node.name, node.own_count.unwrap_or(0));
+        let label = format!("{name} ({})", node.own_count.unwrap_or(0));
         if ui.selectable_label(false, label).clicked() {
-            return Some(format!("tag:\"{}\"", node.path));
+            return Some(filter(&node.path));
         }
         return None;
     }
-    let label = format!("{} ({})", node.name, node.total_count());
+    let label = format!("{name} ({})", node.total_count());
     let mut clicked = None;
     let resp = egui::CollapsingHeader::new(label)
         .id_salt(&node.path)
         .show(ui, |ui| {
             for child in &node.children {
-                if let Some(f) = draw_tag_node(ui, child) {
+                if let Some(f) = draw_tree_node(ui, child, filter) {
                     clicked = Some(f);
                 }
             }
         });
     if resp.header_response.clicked() {
-        clicked = Some(format!("tag:\"{}\"", node.path));
+        clicked = Some(filter(&node.path));
     }
     clicked
 }
@@ -381,10 +420,10 @@ struct GuiApp {
     rating_filter: [bool; 5],
     events: Vec<EventEntry>,
     tags: Vec<TagNode>,
-    /// One entry per distinct `stack.dir` -- a flat list, not a real
-    /// filesystem tree; this catalog has no folder-nesting concept beyond
-    /// one string column per stack.
-    folders: Vec<(String, i64)>,
+    /// Every distinct `stack.dir`, relative to the library and nested by
+    /// `/` (see `build_folder_tree`). The catalog itself stores one string
+    /// per stack; the tree exists only here.
+    folders: Vec<TagNode>,
     /// On-screen tile size in the grid, adjustable live via the zoom
     /// slider. Unlike `thumbs::Size::Grid`'s fixed pixel target (a global,
     /// config-driven cache tier), this only changes how big an
@@ -580,7 +619,7 @@ impl GuiApp {
             .unwrap_or_default();
         self.tags = build_tag_tree(&flat_tags);
 
-        self.folders = self
+        let flat_folders: Vec<(String, i64)> = self
             .cat
             .conn
             .prepare(&format!(
@@ -593,6 +632,7 @@ impl GuiApp {
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
             .unwrap_or_default();
+        self.folders = build_folder_tree(&flat_folders, &self.root);
     }
 
     /// Whole-library bucket counts at `self.timeline_granularity` -- see
@@ -1323,7 +1363,7 @@ impl GuiApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         for node in &self.tags {
-                            if let Some(f) = draw_tag_node(ui, node) {
+                            if let Some(f) = draw_tree_node(ui, node, &|p| format!("tag:\"{p}\"")) {
                                 clicked = Some(f);
                             }
                         }
@@ -1331,12 +1371,11 @@ impl GuiApp {
                 egui::CollapsingHeader::new("Folders")
                     .default_open(false)
                     .show(ui, |ui| {
-                        for (dir, count) in &self.folders {
-                            if ui
-                                .selectable_label(false, format!("{dir} ({count})"))
-                                .clicked()
+                        let root = self.root.clone();
+                        for node in &self.folders {
+                            if let Some(f) = draw_tree_node(ui, node, &|p| folder_filter(&root, p))
                             {
-                                clicked = Some(format!("path=\"{dir}\""));
+                                clicked = Some(f);
                             }
                         }
                     });
@@ -2802,6 +2841,53 @@ mod tests {
         assert_eq!(groups[1].1.len(), 1);
         assert_eq!(groups[2].0, None);
         assert_eq!(groups[2].1.len(), 2);
+    }
+
+    #[test]
+    fn folders_nest_by_path_relative_to_the_library() {
+        let root = Path::new("/lib");
+        let tree = build_folder_tree(
+            &[
+                ("/lib/2026/10/3".into(), 2),
+                ("/lib/2026/10/31".into(), 5),
+                ("/lib/2026/09/01".into(), 1),
+                ("/lib/export".into(), 4),
+                ("/lib/export/color".into(), 6),
+            ],
+            root,
+        );
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["2026", "export"]);
+        assert_eq!(tree[0].total_count(), 8);
+        let october = &tree[0].children[1];
+        assert_eq!((october.name.as_str(), october.children.len()), ("10", 2));
+        assert_eq!(october.children[1].path, "2026/10/31");
+        // A folder holding photos and a subfolder counts both.
+        assert_eq!(tree[1].own_count, Some(4));
+        assert_eq!(tree[1].total_count(), 10);
+    }
+
+    /// The trailing `/` is what keeps a day from matching every day that
+    /// starts with the same digits.
+    #[test]
+    fn a_folder_filter_matches_its_subtree_and_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["2026/10/3", "2026/10/31", "export/color"] {
+            let d = dir.path().join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("750_0001.JPG"), "jpg").unwrap();
+        }
+        let mut cat = Catalog::open_memory().unwrap();
+        crate::scan::scan(&mut cat, dir.path(), true).unwrap();
+        let count = |rel: &str| {
+            run_query(&cat, &folder_filter(dir.path(), rel), [false; 5])
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count("2026/10/3"), 1);
+        assert_eq!(count("2026/10"), 2);
+        assert_eq!(count("export"), 1);
+        assert_eq!(count(""), 3);
     }
 
     #[test]

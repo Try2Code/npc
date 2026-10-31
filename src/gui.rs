@@ -1773,39 +1773,11 @@ impl GuiApp {
     /// opens it (guarded by the same text-field-focus check as every other
     /// key handler here, so typing "a" into the query box stays just
     /// typing), Escape closes it without running anything, and any other
-    /// letter key while it's open attempts that action and closes the menu
+    /// character typed while it's open attempts that action and closes the menu
     /// -- the same catch-all `KeyCode::Char(c) if self.show_actions` the
     /// TUI uses, including reporting "no action bound" for an unmapped key
     /// rather than silently doing nothing.
     fn handle_action_keys(&mut self, ui: &egui::Ui) {
-        const LETTERS: [(egui::Key, char); 26] = [
-            (egui::Key::A, 'a'),
-            (egui::Key::B, 'b'),
-            (egui::Key::C, 'c'),
-            (egui::Key::D, 'd'),
-            (egui::Key::E, 'e'),
-            (egui::Key::F, 'f'),
-            (egui::Key::G, 'g'),
-            (egui::Key::H, 'h'),
-            (egui::Key::I, 'i'),
-            (egui::Key::J, 'j'),
-            (egui::Key::K, 'k'),
-            (egui::Key::L, 'l'),
-            (egui::Key::M, 'm'),
-            (egui::Key::N, 'n'),
-            (egui::Key::O, 'o'),
-            (egui::Key::P, 'p'),
-            (egui::Key::Q, 'q'),
-            (egui::Key::R, 'r'),
-            (egui::Key::S, 's'),
-            (egui::Key::T, 't'),
-            (egui::Key::U, 'u'),
-            (egui::Key::V, 'v'),
-            (egui::Key::W, 'w'),
-            (egui::Key::X, 'x'),
-            (egui::Key::Y, 'y'),
-            (egui::Key::Z, 'z'),
-        ];
         if ui.ctx().text_edit_focused() {
             return;
         }
@@ -1819,9 +1791,18 @@ impl GuiApp {
                 if i.modifiers.command {
                     return;
                 }
-                if let Some((_, c)) = LETTERS.into_iter().find(|(k, _)| i.key_pressed(*k)) {
-                    fire = Some(c);
-                }
+                // The typed character, not the key: `Key::S` is one key for
+                // both `s` and `S` (Shift is a separate modifier), so the
+                // key alone cannot tell "Spektra (JPG)" from "Spektra (RAW)".
+                fire = i.events.iter().find_map(|e| match e {
+                    egui::Event::Text(t) => {
+                        let mut chars = t.chars();
+                        chars
+                            .next()
+                            .filter(|c| !c.is_whitespace() && chars.next().is_none())
+                    }
+                    _ => None,
+                });
             });
             if let Some(c) = fire {
                 self.show_actions = false;
@@ -3406,6 +3387,51 @@ mod tests {
             app.status.as_deref(),
             Some("Test Editor not launched: the library is not mounted")
         );
+    }
+
+    /// `S` and `s` are one key; only the typed text tells them apart. The
+    /// menu once read the key alone, so `S` ran the `s` action -- Spektra
+    /// opened the JPG instead of the RAW.
+    #[test]
+    fn the_action_menu_tells_upper_from_lower_case() {
+        let (_dir, mut app) = app();
+        app.online = false; // refuse with the action's name, launch nothing
+        let spektra = |key: &str, name: &str| Action {
+            key: key.into(),
+            name: name.into(),
+            cmd: vec!["true".into()],
+            mode: action::Mode::Detach,
+            shell: false,
+        };
+        app.actions = vec![spektra("s", "Spektra (JPG)"), spektra("S", "Spektra (RAW)")];
+
+        let ctx = egui::Context::default();
+        let typed = |text: &str, modifiers| egui::RawInput {
+            events: vec![
+                egui::Event::Key {
+                    key: egui::Key::S,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text(text.into()),
+            ],
+            ..Default::default()
+        };
+        for (text, modifiers, name) in [
+            ("S", egui::Modifiers::SHIFT, "Spektra (RAW)"),
+            ("s", egui::Modifiers::NONE, "Spektra (JPG)"),
+        ] {
+            app.show_actions = true;
+            let _ = ctx.run_ui(typed(text, modifiers), |ui| app.handle_action_keys(ui));
+            assert!(!app.show_actions, "firing closes the menu");
+            assert_eq!(
+                app.status.as_deref(),
+                Some(format!("{name} not launched: the library is not mounted").as_str()),
+                "typed `{text}`"
+            );
+        }
     }
 
     #[test]

@@ -49,6 +49,7 @@ comes first.
 - [Portability](#portability)
 - [Development](#development)
 - [Icon](#icon)
+- [License](#license)
 
 ## How this was built
 
@@ -644,3 +645,11 @@ cityscape at dusk, camera) directly, as base64-encoded PNGs, rather than
 redrawing them. Twemoji graphics are © 2020 Twitter, Inc and contributors,
 licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/);
 this notice is that license's attribution requirement.
+
+## License
+
+GPL-3.0-or-later, see [`LICENSE`](LICENSE). npc links against Exiv2, which is
+GPL-2.0-or-later, so a GPL license keeps the source and every built binary
+under the same terms. The Rust dependencies are permissive (MIT, Apache-2.0,
+BSD, Unicode-3.0, one MPL-2.0) and compatible with it. The icon's Twemoji
+graphics stay CC-BY 4.0, as above.

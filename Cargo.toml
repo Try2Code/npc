@@ -2,6 +2,7 @@
 name = "npc"
 version = "0.5.14"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Terminal photo catalog: tag, rate and browse a library without ever writing to the originals"
 
 [[bin]]

@@ -206,7 +206,8 @@ has caused a bug here.
 - **The catalog is at schema 6** (since 0.5.1). A build older than that refuses
   to open it — update `npc` and `npcg` together. Rows imported before 0.5.0
   have no card stats until a card holding them is imported again.
-- **No license file**, so the code is not legally reusable as published.
+- **Licensed GPL-3.0-or-later** (`LICENSE`, since 0.5.14), because Exiv2 is
+  GPL-2.0-or-later. Keep new dependencies GPL-3-compatible.
 - Branch is `master`.
 
 ## Testing notes

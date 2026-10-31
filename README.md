@@ -1,5 +1,7 @@
 # npc
 
+<img src="assets/npcg-icon.png" alt="npc icon: a grid of photos under a magnifying glass" width="128" align="right">
+
 A terminal photo catalog: tag, rate, browse with real thumbnails, and hand
 selections to a proper editor. Built for a Nikon RAW+JPG library on a removable
 drive.

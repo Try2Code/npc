@@ -439,6 +439,7 @@ arrows  pgup pgdn     move (shift extends)           enter / esc   single view /
 space   esc           toggle selection, clear        wheel, drag   zoom, pan (single view)
 0-5                   rate (0 clears)                ctrl+1-5      rating filter
 `  x  c               flag / reject / clear          a  e          actions / export menu
+ctrl+a                select every photo shown
 ```
 
 - **Sidebar:** events by month, tags and folders as trees; a click on a
@@ -450,8 +451,11 @@ space   esc           toggle selection, clear        wheel, drag   zoom, pan (si
   near-identical frames; leaving with `esc` resets them.
 - **Export menu** (`e`): the web export and each configured preset, each
   into its own folder under `export_dir`.
-- **Top bar:** query field, rating checkboxes, tile size, light/dark theme,
-  the save badge and the watcher's eye.
+- **Top bar:** query field, rating checkboxes, flagged/rejected toggles,
+  tile size, light/dark theme, the save badge and the watcher's eye.
+  "flagged", then `ctrl+a`, selects a culling pass's keepers for the export
+  or action menu; "rejected", then `ctrl+a`, sets up the duds for the
+  trash button.
 
 | | `npc tui` | `npcg` |
 |---|---|---|

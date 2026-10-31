@@ -56,7 +56,26 @@ struct Row {
 /// has to stay bounded is *rendering*, which `draw_grid`'s
 /// `ScrollArea::show_rows` now handles by only drawing whatever is
 /// actually scrolled into view.
-fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5]) -> Result<Vec<Row>> {
+/// The flagged/rejected toggles in the top bar. Like the rating checkboxes:
+/// each one ticked widens to "or that mark", none ticked means no filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MarkFilter {
+    flagged: bool,
+    rejected: bool,
+}
+
+impl MarkFilter {
+    fn sql(self) -> Option<&'static str> {
+        match (self.flagged, self.rejected) {
+            (false, false) => None,
+            (true, false) => Some("s.flag = 1"),
+            (false, true) => Some("s.reject = 1"),
+            (true, true) => Some("(s.flag = 1 OR s.reject = 1)"),
+        }
+    }
+}
+
+fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5], marks: MarkFilter) -> Result<Vec<Row>> {
     let mut compiled = query::compile(text)?;
     // Excluded by default, same as `tui.rs`'s own `TrashView::Exclude`: a
     // trashed stack is on its way out of the library, not part of what
@@ -86,6 +105,9 @@ fn run_query(cat: &Catalog, text: &str, ratings: [bool; 5]) -> Result<Vec<Row>> 
         compiled
             .params
             .extend(selected.into_iter().map(rusqlite::types::Value::Integer));
+    }
+    if let Some(mark) = marks.sql() {
+        compiled.where_sql = format!("({}) AND {mark}", compiled.where_sql);
     }
     let sql = compiled.select_stacks(None);
     let mut stmt = cat.conn.prepare(&sql)?;
@@ -418,6 +440,9 @@ struct GuiApp {
     /// text query -- lets "2 and 5, but nothing else" be selected in one
     /// step, which typing `rating>=N` alone can't express.
     rating_filter: [bool; 5],
+    /// The flagged/rejected toggles next to the rating checkboxes, so a
+    /// culling pass's picks are one click away rather than a typed query.
+    mark_filter: MarkFilter,
     events: Vec<EventEntry>,
     tags: Vec<TagNode>,
     /// Every distinct `stack.dir`, relative to the library and nested by
@@ -511,7 +536,7 @@ impl GuiApp {
         root: PathBuf,
         online: bool,
     ) -> Self {
-        let rows = run_query(&cat, "", [false; 5]).unwrap_or_default();
+        let rows = run_query(&cat, "", [false; 5], MarkFilter::default()).unwrap_or_default();
         let theme = config.gui.theme;
         let mut app = Self {
             cat,
@@ -541,6 +566,7 @@ impl GuiApp {
             mode: Mode::Grid,
             applied_filter: None,
             rating_filter: [false; 5],
+            mark_filter: MarkFilter::default(),
             events: Vec::new(),
             tags: Vec::new(),
             folders: Vec::new(),
@@ -667,7 +693,7 @@ impl GuiApp {
     /// Splice a sidebar-click fragment into the query and re-run it.
     fn apply_filter(&mut self, fragment: &str) {
         self.splice_filter(fragment);
-        match run_query(&self.cat, &self.query, self.rating_filter) {
+        match run_query(&self.cat, &self.query, self.rating_filter, self.mark_filter) {
             Ok(rows) => {
                 self.rows = rows;
                 self.selected = 0;
@@ -938,7 +964,7 @@ impl GuiApp {
     /// keypress and a click can never disagree about what happens next.
     fn toggle_rating_filter(&mut self, n: usize) {
         self.rating_filter[n - 1] = !self.rating_filter[n - 1];
-        self.refresh_rows_after_rating_filter_change();
+        self.refresh_rows_after_filter_change();
     }
 
     /// What a grid-tile click does, pulled out of `draw_grid`'s rendering
@@ -1015,8 +1041,8 @@ impl GuiApp {
         self.single_pan = egui::Vec2::ZERO;
     }
 
-    fn refresh_rows_after_rating_filter_change(&mut self) {
-        match run_query(&self.cat, &self.query, self.rating_filter) {
+    fn refresh_rows_after_filter_change(&mut self) {
+        match run_query(&self.cat, &self.query, self.rating_filter, self.mark_filter) {
             Ok(rows) => {
                 self.rows = rows;
                 self.selected = 0;
@@ -1172,7 +1198,7 @@ impl GuiApp {
                 if was_focused
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
-                    match run_query(&self.cat, &self.query, self.rating_filter) {
+                    match run_query(&self.cat, &self.query, self.rating_filter, self.mark_filter) {
                         Ok(rows) => {
                             self.rows = rows;
                             self.selected = 0;
@@ -1204,8 +1230,19 @@ impl GuiApp {
                         .checkbox(&mut self.rating_filter[n - 1], n.to_string())
                         .changed();
                 }
+                ui.separator();
+                changed |= ui
+                    .checkbox(&mut self.mark_filter.flagged, "flagged")
+                    .on_hover_text("Only flagged photos (` flags). Ctrl+A then selects them all.")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.mark_filter.rejected, "rejected")
+                    .on_hover_text(
+                        "Only rejected photos (x rejects). Ctrl+A then selects them all.",
+                    )
+                    .changed();
                 if changed {
-                    self.refresh_rows_after_rating_filter_change();
+                    self.refresh_rows_after_filter_change();
                 }
                 ui.separator();
                 ui.label("zoom:");
@@ -1779,6 +1816,9 @@ impl GuiApp {
                 if i.key_pressed(egui::Key::Escape) {
                     close = true;
                 }
+                if i.modifiers.command {
+                    return;
+                }
                 if let Some((_, c)) = LETTERS.into_iter().find(|(k, _)| i.key_pressed(*k)) {
                     fire = Some(c);
                 }
@@ -1789,9 +1829,23 @@ impl GuiApp {
             } else if close {
                 self.show_actions = false;
             }
+        } else if ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+        {
+            self.select_all();
         } else if !self.show_export && ui.ctx().input(|i| i.key_pressed(egui::Key::A)) {
             self.show_actions = true;
         }
+    }
+
+    /// `Ctrl+A`: every photo the grid currently shows joins the batch, so the
+    /// info panel, the action and export menus and the trash button act on
+    /// all of them -- after the flagged toggle, that is the whole culling
+    /// pass's keepers.
+    fn select_all(&mut self) {
+        self.multi_selected = self.rows.iter().map(|r| r.id).collect();
+        self.status = Some(format!("selected {} stack(s)", self.multi_selected.len()));
     }
 
     /// `e` menu: same open/close/dispatch shape as `handle_action_keys`, but
@@ -2301,7 +2355,9 @@ impl GuiApp {
             }
         }
         if rescanned {
-            if let Ok(rows) = run_query(&self.cat, &self.query, self.rating_filter) {
+            if let Ok(rows) =
+                run_query(&self.cat, &self.query, self.rating_filter, self.mark_filter)
+            {
                 self.rows = rows;
             }
             self.reload_sidebar();
@@ -2880,9 +2936,14 @@ mod tests {
         let mut cat = Catalog::open_memory().unwrap();
         crate::scan::scan(&mut cat, dir.path(), true).unwrap();
         let count = |rel: &str| {
-            run_query(&cat, &folder_filter(dir.path(), rel), [false; 5])
-                .unwrap()
-                .len()
+            run_query(
+                &cat,
+                &folder_filter(dir.path(), rel),
+                [false; 5],
+                MarkFilter::default(),
+            )
+            .unwrap()
+            .len()
         };
         assert_eq!(count("2026/10/3"), 1);
         assert_eq!(count("2026/10"), 2);
@@ -2972,6 +3033,99 @@ mod tests {
             3,
             "clearing every box shows everything again"
         );
+    }
+
+    /// Fixture rows: ids in grid order, the first flagged, the second
+    /// rejected (it is also the one rated 5).
+    fn marked_app() -> (tempfile::TempDir, GuiApp, Vec<i64>) {
+        let (dir, mut app) = app();
+        let ids: Vec<i64> = app.rows.iter().map(|r| r.id).collect();
+        edit::apply(
+            &mut app.cat,
+            &[ids[0]],
+            &[Change::SetFlag(true)],
+            &Config::default(),
+        )
+        .unwrap();
+        edit::apply(
+            &mut app.cat,
+            &[ids[1]],
+            &[Change::SetReject(true)],
+            &Config::default(),
+        )
+        .unwrap();
+        (dir, app, ids)
+    }
+
+    fn shown(app: &GuiApp) -> Vec<i64> {
+        app.rows.iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn the_mark_toggles_narrow_to_flagged_rejected_or_either() {
+        let (_dir, mut app, ids) = marked_app();
+        app.mark_filter.flagged = true;
+        app.refresh_rows_after_filter_change();
+        assert_eq!(shown(&app), [ids[0]]);
+
+        app.mark_filter.rejected = true;
+        app.refresh_rows_after_filter_change();
+        assert_eq!(shown(&app).len(), 2, "both ticked: flagged or rejected");
+
+        app.mark_filter.flagged = false;
+        app.refresh_rows_after_filter_change();
+        assert_eq!(shown(&app), [ids[1]]);
+
+        app.mark_filter = MarkFilter::default();
+        app.refresh_rows_after_filter_change();
+        assert_eq!(shown(&app).len(), 3);
+    }
+
+    #[test]
+    fn a_mark_toggle_combines_with_the_rating_checkboxes() {
+        let (_dir, mut app, _ids) = marked_app();
+        let rating_of_rejected = app.rows[1].rating.unwrap();
+        app.mark_filter.rejected = true;
+        app.rating_filter[usize::try_from(rating_of_rejected).unwrap() - 1] = true;
+        app.refresh_rows_after_filter_change();
+        assert_eq!(app.rows.len(), 1);
+
+        app.rating_filter = [false; 5];
+        app.rating_filter[usize::try_from(rating_of_rejected).unwrap() % 5] = true;
+        app.refresh_rows_after_filter_change();
+        assert!(app.rows.is_empty(), "rejected AND another rating: nothing");
+    }
+
+    /// Ctrl+A selects what the grid shows -- and only that: a plain `a`
+    /// still opens the action menu, Ctrl+A must not.
+    #[test]
+    fn ctrl_a_selects_every_shown_photo_and_does_not_open_the_actions() {
+        let (_dir, mut app, ids) = marked_app();
+        app.mark_filter.flagged = true;
+        app.mark_filter.rejected = true;
+        app.refresh_rows_after_filter_change();
+
+        let ctx = egui::Context::default();
+        let key = |modifiers| egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(key(egui::Modifiers::COMMAND), |ui| {
+            app.handle_action_keys(ui);
+        });
+        assert!(!app.show_actions);
+        let picked: std::collections::HashSet<i64> = [ids[0], ids[1]].into();
+        assert_eq!(app.multi_selected, picked);
+        assert_eq!(app.targets().len(), 2);
+
+        let _ = ctx.run_ui(key(egui::Modifiers::NONE), |ui| app.handle_action_keys(ui));
+        assert!(app.show_actions, "plain a still opens the menu");
     }
 
     /// The info panel's path is absolute, unlike the grid/single-view label
@@ -3347,14 +3501,14 @@ mod tests {
     fn a_rated_photo_stays_in_view_until_the_filter_changes() {
         let (_dir, mut app) = app();
         app.rating_filter = [false, false, false, false, true];
-        app.refresh_rows_after_rating_filter_change();
+        app.refresh_rows_after_filter_change();
         assert_eq!(app.rows.len(), 1);
 
         app.rate_selected(Some(1));
         assert_eq!(app.rows.len(), 1);
         assert_eq!(app.rows[0].rating, Some(1));
 
-        app.refresh_rows_after_rating_filter_change();
+        app.refresh_rows_after_filter_change();
         assert!(app.rows.is_empty());
     }
 

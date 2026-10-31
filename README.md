@@ -38,6 +38,10 @@ comes first.
 - [The query language](#the-query-language)
 - [The browser](#the-browser)
 - [What it will not do](#what-it-will-not-do)
+- [Web export](#web-export)
+- [Trash](#trash)
+- [Watching and scanning](#watching-and-scanning)
+- [Saving](#saving)
 - [Offline](#offline)
 - [Coverage](#coverage)
 - [Portability](#portability)
@@ -243,15 +247,15 @@ cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 
 `npc find --help-syntax` documents the query language.
 
-`tag`, `rate`, `mark`, `rotate`, `set` and `exec` all take the same target:
-either `-q '<query>'`, or one or more explicit paths to act on directly. An
-explicit path can be any present member -- RAW or JPG, with or without the
-extension -- since only the stack it belongs to matters; the directory part
-has to match exactly what's in the catalog, which is the library's
-**absolute** path, not one relative to wherever you're running `npc` from. A
-query is almost always the more convenient choice day to day. Both forms
-refuse to run with neither given, rather than silently acting on the whole
-library:
+`tag`, `rate`, `mark`, `rotate`, `set`, `exec` and `trash` all take the same
+target: either `-q '<query>'`, or one or more explicit paths to act on
+directly. A path is a stack (`dir/base`) or any of its files (`.NEF`, `.JPG`,
+`.xmp`), absolute or relative to where you run `npc`. A base may contain dots
+of its own -- `750_2117._spektra` is that stack, not `750_2117`; a path that
+could mean two different stacks is refused with both named. A query is
+almost always the more convenient choice day to day. Both forms refuse to run
+with neither given, rather than silently acting on the whole library.
+`--dry-run` lists the stacks it would act on:
 
 ```
 npc tag add beach -q 'date=2026-08-09'
@@ -326,13 +330,48 @@ stacks) turns the page automatically. Every text prompt (`/`, `t`, `T`, `i`)
 supports normal line editing: arrow keys, Home/End, and readline's
 `ctrl-a/e/b/f/k/u/w`.
 
-`npcg` covers the same ground with the mouse: a sidebar (events, tags,
-folders) to filter by, five rating checkboxes instead of typing
-`rating>=N`, a clickable timeline bar in place of the TUI's keyboard-driven
-one, and the same configured action menu. Its info panel also has a
-trash-can button for the photo or the selection, the same reversible
-move as `npc trash`. Not ported: RAW/JPG member cycling and undo -- those
-stay TUI-only.
+### npcg
+
+The same catalog, queries and action menu, driven by the mouse:
+
+```
+click / ctrl / shift  select one / toggle / range    double-click  single view
+arrows  pgup pgdn     move (shift extends)           enter / esc   single view / back
+space   esc           toggle selection, clear        wheel, drag   zoom, pan (single view)
+0-5                   rate (0 clears)                ctrl+1-5      rating filter
+`  x  c               flag / reject / clear          a  e          actions / export menu
+```
+
+- **Sidebar:** events by month, tags and folders as trees; a click on a
+  parent filters to everything below it.
+- **Info panel:** EXIF, the full path (with a copy button), tags with a
+  remove button, an add-tag field, and the trash-can button. With several
+  photos selected, it rates, marks, tags, untags and trashes them all.
+- **Single view:** the zoom and pan stay put while you step through
+  near-identical frames; leaving with `esc` resets them.
+- **Export menu** (`e`): the web export and each configured preset, each
+  into its own folder under `export_dir`.
+- **Top bar:** query field, rating checkboxes, tile size, light/dark theme,
+  the save badge and the watcher's eye.
+
+| | `npc tui` | `npcg` |
+|---|---|---|
+| views | list, grid, single | grid, single |
+| query, rate, flag, tag | keys and prompts | keys, mouse, info panel |
+| sidebar | tags or events, flat lists | events, tags, folders as trees |
+| timeline | keyboard bar, `[ ]` granularity | clickable bar |
+| zoom in single view | `+ -` crop, arrows pan | wheel at cursor, drag |
+| RAW/JPG member cycling (`o`) | yes | no |
+| undo (`u`) | yes | no |
+| copy path | `y` | button in info panel |
+| trash | `npc trash` | trash-can button |
+| images | terminal graphics (kitty etc.) | native |
+
+In npcg, next to the save badge, a small eye shows the watcher (see
+[Watching and scanning](#watching-and-scanning)): drowsy while it sets up,
+open and blinking while it watches, circling while it catalogs a folder
+that just changed, asleep when watching is off or the drive is offline,
+crossed out if it failed. Hover for details.
 
 ## What it will not do
 
@@ -359,6 +398,43 @@ Into the copy go:
 It refuses any folder inside the library: it is a low-quality copy, not a
 photo to catalog. Presets may still write into the library. To check a copy:
 `exiftool -IPTC:Keywords -XMP-dc:Subject -XPKeywords copy.jpg`.
+
+## Trash
+
+`npc trash` (or npcg's trash-can button) moves a stack's files -- RAW, JPG,
+sidecar, RawTherapee profile -- into `<library>/.trash/`, keeping their
+folder layout. Nothing is deleted:
+
+```
+npc trash --dry-run -q 'rejected'    # lists what would go
+npc trash-list                       # what is in the trash
+npc untrash 750_0001                 # back where it came from
+npc trash-empty --yes                # the only real delete; also removes
+                                     # folders the trash left empty
+```
+
+Trash folders are never cataloged, whatever their case (the drive may be
+exFAT, where `.Trash` is `.trash`): npc's own `.trash`, the desktop's
+`.Trash-<uid>`, macOS's `.Trashes`, and digiKam's `.dtrash`.
+
+## Watching and scanning
+
+While `npc tui` or `npcg` is open, a watcher catalogs new or changed photos
+by itself -- in every folder *outside* the dated import tree (`2026/...`)
+and the trash, e.g. `export/`. It sets itself up in the background, so the
+window opens at once. `[watch] exclude` in the config skips further
+top-level folders.
+
+`npc import` catalogs what it copies. Everything else needs `npc scan`:
+
+- changes inside the dated tree made by another program -- photos deleted
+  or renamed in a file manager, JPGs rewritten by Shotwell;
+- anything that changed while neither browser was open, or on another
+  machine.
+
+A scan only reads files whose size or mtime changed. Files that disappeared
+are marked missing, never removed from the catalog -- an unplugged drive or a
+renamed folder must not cost you tags and ratings. `npc doctor` reports them.
 
 ## Saving
 
@@ -391,14 +467,13 @@ boundary, so `meta/mod.rs` reads as covered while `shim.cc` — the file that
 actually writes to disk — is measured by nothing. It is covered behaviourally
 instead, by the invariant tests, which is the coverage that matters for it.
 
-`gui.rs` and `bin/npcg.rs` pull the total down the same way: `tui.rs` gets
+`gui.rs` and `bin/npcg.rs` pull the total down the same way. `tui.rs` gets
 its interaction logic tested headlessly and its rendering tested through
-ratatui's `TestBackend`, but egui has no equivalent of feeding it synthetic
-frames and asserting on the result, so only `gui.rs`'s pure-function logic
-(tag-tree grouping, month bucketing) has automated tests — the drawing and
-event-handling code is verified the same way `tui.rs`'s testing notes
-describe for a real kitty terminal: by running it, against the real library,
-by hand.
+ratatui's `TestBackend`. For `gui.rs` the tests cover its logic (selection,
+rating, tagging, trash, folder and tag trees, the watcher's states) and run
+a few whole frames headlessly -- closing, the watcher's eye -- but nothing
+asserts on what a frame looks like. That is checked by running it, against
+the real library, by hand. (The numbers above predate those tests.)
 
 ## Portability
 

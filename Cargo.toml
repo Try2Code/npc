@@ -43,16 +43,21 @@ pkg-config = "0.3"
 tempfile = "3"
 walkdir = "2"
 
+# No LTO, incremental on. With thin LTO and cargo's default (no incremental
+# for release), a one-line edit took 206 s to rebuild: the whole npc crate
+# recompiled at -O3, then re-optimised against every dependency at link time.
+# Now 2-3 s. Measured at runtime too: exporting the test photos takes 2.7 s
+# either way -- the heavy work is Exiv2, libjpeg, SQLite and SIMD resizing,
+# none of which LTO reaches.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = false
+incremental = true
 
-# What `./check` actually builds and runs tests under. Same opt-level as
-# release -- real-library tests decode real RAW files and need release-speed
-# SQLite/image code to run in reasonable time -- but no LTO: that buys
-# runtime speed in the binary someone installs, nothing in a test run about
-# to be thrown away, and it's paid at *link* time, once per test binary,
-# every single `./check` regardless of how small the edit was.
+# What `./check` builds and runs tests under. Now the same settings as
+# release; kept as its own profile so test builds land in their own target
+# directory and never invalidate the release build's incremental state (or
+# the other way round).
 [profile.release-nolto]
 inherits = "release"
 lto = false

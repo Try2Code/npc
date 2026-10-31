@@ -48,8 +48,10 @@ cargo cov-summary            coverage numbers only
 
 If `~/.cargo/bin` is not on PATH, export it first. `check` must stay
 executable — rewriting it with a script drops the bit. Its tests build under
-the `release-nolto` profile (release opt-level, no LTO): LTO is paid at link
-time per test binary and took a full `./check` from 48 s to 4m38s.
+the `release-nolto` profile -- now the same settings as release (no LTO,
+incremental), kept separate so test and release builds don't invalidate each
+other. LTO is paid at link time per test binary and once took a full
+`./check` from 48 s to 4m38s.
 
 The library to operate on comes from `library` in the config, or from the root
 given on the command line. Every subcommand accepts `--root`; `scan`, `status`
@@ -126,6 +128,11 @@ is the wrong one in each case:
   textures are capped at 512 MB, least recently drawn first — unbounded,
   1,000 photos held ~7 GB. Most of the library (72k of 94k stacks) is
   JPG-only, so that path is the common one, not the RAW.
+- **Release builds: no LTO, incremental on.** With thin LTO and no
+  incremental a one-line edit rebuilt in 206 s; now 2-3 s. Exporting the
+  test photos takes 2.7 s either way -- the heavy work is C/C++ and SIMD,
+  which LTO doesn't reach. mold and sccache come from the user's global
+  cargo setup, not the project.
 - **Import catalogs only what it copied**, card by card, before planning the
   next card (so a RAW on card 2 joins its JPG from card 1). The old full-
   library scan after every import cost 8–10 min to find nothing more.

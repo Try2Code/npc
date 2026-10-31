@@ -245,6 +245,8 @@ struct Walked {
 /// on a removable drive -- `.Trash-<uid>` (freedesktop) and `.Trashes`
 /// (macOS). Photos deleted in a file manager sat in `.Trash-1000` as 13
 /// rated stacks of their own.
+/// `.dtrash` is digiKam's: 112 photos deleted there showed up in npcg,
+/// 62 of them rated.
 ///
 /// Case is ignored: the library is on exFAT, where `.Trash` *is* `.trash`,
 /// and Linux reports a folder under whichever spelling it was first looked
@@ -252,7 +254,10 @@ struct Walked {
 /// ordinary folder and cataloged two trashed stacks a second time.
 pub fn is_trash_dir(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name == crate::trash::TRASH_DIR || name.starts_with(".trash-") || name == ".trashes"
+    name == crate::trash::TRASH_DIR
+        || name.starts_with(".trash-")
+        || name == ".trashes"
+        || name == ".dtrash"
 }
 
 /// Scan `root` into the catalog. Originals are only ever opened read-only, so
@@ -792,6 +797,7 @@ mod tests {
             ".Trashes/501",
             ".Trash/export/color",
             ".TRASH-1000/files",
+            ".dtrash/files",
         ] {
             let d = dir.path().join(sub);
             std::fs::create_dir_all(&d).unwrap();

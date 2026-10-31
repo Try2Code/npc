@@ -369,6 +369,7 @@ mod tests {
         // exFAT ignores case; npc's own trash was reported as `.Trash`.
         assert!(is_reserved_top_level(".Trash"));
         assert!(is_reserved_top_level(".TRASHES"));
+        assert!(is_reserved_top_level(".dtrash"));
         assert!(!is_reserved_top_level("export"));
         assert!(!is_reserved_top_level("20260")); // 5 digits, not a year
         assert!(!is_reserved_top_level("202a")); // not all digits

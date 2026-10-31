@@ -340,6 +340,23 @@ cycling and undo -- those stay TUI-only.
 - **Touch a protected root.** Including refusing to launch an external editor
   against one, since an editor cannot be told not to write.
 
+## Web export
+
+The built-in export (npcg's "Quick web", or `npc export` without
+`--preset`) makes a resized JPEG and nothing else -- no sidecar beside it.
+Into the copy go:
+
+- the original's EXIF: camera, lens, exposure, dates, GPS. Not the maker
+  note or the embedded thumbnail; orientation is reset, since the pixels are
+  already upright. Where the original has no value, the catalog's is used.
+- every tag, three ways: IPTC Keywords (what web galleries read; cut to
+  IPTC's 64 bytes), XMP `dc:subject`, and EXIF `XPKeywords` (Windows).
+- rating, title and description.
+
+It refuses any folder inside the library: it is a low-quality copy, not a
+photo to catalog. Presets may still write into the library. To check a copy:
+`exiftool -IPTC:Keywords -XMP-dc:Subject -XPKeywords copy.jpg`.
+
 ## Saving
 
 In `npc tui` and `npcg`, a rating, mark or tag changes the catalog at once

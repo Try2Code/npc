@@ -140,6 +140,58 @@ pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()
     Ok(())
 }
 
+/// The built-in web export is deliberately low quality, so it must never
+/// land in the library: the watcher would catalog it as photos in their own
+/// right, sidecars and all. Presets keep `check_target`'s looser rule.
+pub fn check_web_target(target: &Path, library: &Path) -> Result<()> {
+    let t = resolve_as_far_as_exists(target);
+    let l = library
+        .canonicalize()
+        .unwrap_or_else(|_| library.to_path_buf());
+    if t.starts_with(&l) {
+        bail!(
+            "refusing to export into {} -- it is inside the library {}.\n\
+             The web export is a low-quality copy and is kept out of the \
+             library; set export_dir in {} to a folder outside it.",
+            target.display(),
+            library.display(),
+            Config::path().display()
+        );
+    }
+    Ok(())
+}
+
+/// `path` with its longest existing prefix canonicalized and the rest
+/// appended lexically (`..` popping a component), so a target that doesn't
+/// exist yet still resolves through symlinks and `..` the way it will once
+/// created.
+fn resolve_as_far_as_exists(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut base = abs.as_path();
+    let mut rest = Vec::new();
+    let mut resolved = loop {
+        if let Ok(c) = base.canonicalize() {
+            break c;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                base = parent;
+            }
+            // `..` as the last component, or the root itself.
+            _ => break abs.clone(),
+        }
+    };
+    for part in rest.iter().rev() {
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
+    }
+    resolved
+}
+
 pub struct Options<'a> {
     pub long_edge: u32,
     pub quality: u8,
@@ -158,6 +210,9 @@ pub fn export(
     opts: &Options,
 ) -> Result<ExportStats> {
     check_target(target, library, config)?;
+    if opts.preset.is_none() {
+        check_web_target(target, library)?;
+    }
     let mut stats = ExportStats::default();
 
     for &sid in stack_ids {
@@ -197,7 +252,7 @@ pub fn export(
         match result {
             Ok(()) => {
                 if !opts.strip && opts.preset.is_none() {
-                    if let Err(e) = stamp(cat, sid, &dst) {
+                    if let Err(e) = stamp(cat, sid, &src, &dst) {
                         stats.errors.push(format!("{}: {e}", dst.display()));
                     }
                 }
@@ -288,14 +343,84 @@ fn run_preset(preset: &Preset, src: &Path, dst: &Path, config: &Config) -> Resul
     Ok(())
 }
 
-/// Carry tags and rating onto the copy. Writes to a file this tool created
-/// outside the library, which is why it does not go through `write_sidecar`.
-fn stamp(cat: &Catalog, stack_id: i64, dst: &Path) -> Result<()> {
+/// Carry the original's EXIF, the catalog's shooting data where the original
+/// has none, and tags, rating, title and description onto the copy -- all
+/// inside the JPEG; no sidecar is written beside it. Writes to a file this
+/// tool created outside the library, which is why it does not go through
+/// `write_sidecar`.
+fn stamp(cat: &Catalog, stack_id: i64, src: &Path, dst: &Path) -> Result<()> {
     let doc = crate::edit::build_doc(cat, stack_id)?;
-    if doc.tags.is_empty() && doc.rating < 0 && doc.title.is_empty() {
-        return Ok(());
+    let fallback = catalog_exif(cat, stack_id);
+    crate::meta::stamp_export(
+        &dst.to_string_lossy(),
+        &src.to_string_lossy(),
+        &doc,
+        &fallback,
+    )
+}
+
+/// The catalog's shooting data as EXIF text, for an original that lacks it
+/// (or can't be read). Capture time is stored as if UTC, so formatting it
+/// as UTC gives back the camera's own local wall-clock time.
+fn catalog_exif(cat: &Catalog, stack_id: i64) -> Vec<crate::meta::ExifPair> {
+    let mut out = Vec::new();
+    let mut put = |key: &str, value: String| {
+        out.push(crate::meta::ExifPair {
+            key: key.to_string(),
+            value,
+        });
+    };
+    if let Some(e) = crate::exif::for_stack(cat, stack_id) {
+        if let Some(t) = e.captured {
+            let s = crate::exif::format_datetime(t).replace('-', ":");
+            put("Exif.Photo.DateTimeOriginal", s.clone());
+            put("Exif.Photo.DateTimeDigitized", s);
+        }
+        if !e.camera.is_empty() {
+            put("Exif.Image.Model", e.camera);
+        }
+        if !e.lens.is_empty() {
+            put("Exif.Photo.LensModel", e.lens);
+        }
+        if let Some(iso) = e.iso.filter(|&i| i > 0) {
+            put("Exif.Photo.ISOSpeedRatings", iso.to_string());
+        }
+        if let Some(f) = e.fnumber.filter(|&f| f > 0.0) {
+            put("Exif.Photo.FNumber", rational(f, 100));
+        }
+        if let Some(t) = e.exposure.filter(|&t| t > 0.0) {
+            let v = if t < 1.0 {
+                format!("1/{}", (1.0 / t).round() as i64)
+            } else {
+                rational(t, 10)
+            };
+            put("Exif.Photo.ExposureTime", v);
+        }
+        if let Some(f) = e.focal.filter(|&f| f > 0.0) {
+            put("Exif.Photo.FocalLength", rational(f, 10));
+        }
+        if let Some(b) = e.bias {
+            put("Exif.Photo.ExposureBiasValue", rational(b, 100));
+        }
     }
-    crate::meta::stamp_export(&dst.to_string_lossy(), &doc)
+    let serial: Option<String> = cat
+        .conn
+        .query_row(
+            "SELECT serial FROM file WHERE stack_id = ?1 AND serial IS NOT NULL
+             AND serial <> '' LIMIT 1",
+            [stack_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(s) = serial {
+        put("Exif.Photo.BodySerialNumber", s);
+    }
+    out
+}
+
+/// `x` as an EXIF rational over `den`: `rational(2.8, 100)` is `"280/100"`.
+fn rational(x: f64, den: i64) -> String {
+    format!("{}/{den}", (x * den as f64).round() as i64)
 }
 
 #[cfg(test)]
@@ -488,6 +613,83 @@ mod tests {
         let doc =
             crate::meta::read_sidecar(out.path().join("750_0001.jpg").to_str().unwrap()).unwrap();
         assert!(doc.tags.is_empty(), "--strip left tags on the copy");
+    }
+
+    /// The web export is a low-quality copy and must stay out of the
+    /// library; a preset may still write there (e.g. `export/color`).
+    #[test]
+    fn the_web_export_refuses_a_folder_inside_the_library() {
+        let (lib, cat, sid) = library();
+        let inside = lib.path().join("export/web");
+        let err = export(
+            &cat,
+            &[sid],
+            &inside,
+            lib.path(),
+            &Config::default(),
+            &opts(),
+        )
+        .map(|_| ())
+        .expect_err("a web export into the library went through");
+        assert!(err.to_string().contains("inside the library"), "{err}");
+        assert!(!inside.exists(), "refused, yet the folder was created");
+
+        // Not created yet, and reached through `..`: still inside.
+        assert!(check_web_target(&lib.path().join("2026/../web/new"), lib.path()).is_err());
+        // Reached through a symlink from outside: still inside.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = elsewhere.path().join("lib");
+        std::os::unix::fs::symlink(lib.path(), &link).unwrap();
+        assert!(check_web_target(&link.join("web"), lib.path()).is_err());
+
+        assert!(check_web_target(tempfile::tempdir().unwrap().path(), lib.path()).is_ok());
+        // Presets keep the looser rule.
+        assert!(check_target(&inside, lib.path(), &Config::default()).is_ok());
+    }
+
+    /// Where the original carries no EXIF, the catalog's shooting data goes
+    /// into the copy instead -- and no sidecar is written beside it.
+    #[test]
+    fn the_catalogs_exif_fills_in_for_an_original_without_any() {
+        let (lib, cat, sid) = library();
+        cat.conn
+            .execute(
+                "UPDATE file SET camera = 'NIKON D750', fnumber = 2.8, exposure = 0.004,
+                        iso = 400, focal = 50.0, capture_time = 1754737200
+                 WHERE stack_id = ?1",
+                [sid],
+            )
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        export(
+            &cat,
+            &[sid],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &opts(),
+        )
+        .unwrap();
+
+        let made = out.path().join("750_0001.jpg");
+        let m = crate::meta::read_meta(made.to_str().unwrap()).unwrap();
+        assert_eq!(m.camera, "NIKON D750");
+        assert!((m.fnumber - 2.8).abs() < 1e-4, "fnumber {}", m.fnumber);
+        assert!((m.exposure - 0.004).abs() < 1e-6, "exposure {}", m.exposure);
+        assert_eq!(m.iso, 400);
+        assert_eq!(m.capture_time, 1_754_737_200);
+        assert_eq!(m.orientation, 1);
+        assert_eq!(m.tags, vec!["beach".to_string()]);
+
+        let names: Vec<String> = std::fs::read_dir(out.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["750_0001.jpg".to_string()],
+            "only the JPEG, no sidecar"
+        );
     }
 
     /// The originals are not the point of export, but they are the point of

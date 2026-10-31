@@ -391,8 +391,43 @@ void write_sidecar(rust::Str xmp_path_, const SidecarDoc &doc) {
     out->writeMetadata(); // <-- one of exactly two writers; see shim.h
 }
 
-void stamp_export(rust::Str dest_path_, const SidecarDoc &doc) {
+namespace {
+
+// What of an original's EXIF travels to a web copy. The shooting data
+// (Exif.Photo, minus the maker note), GPS, and who/what made it. Not the
+// maker note (camera-private, often larger than a web JPEG's own pixels),
+// not the IFD1 thumbnail, and none of a NEF's TIFF structure tags -- those
+// describe the RAW's strips and subfiles, not this JPEG.
+bool keep_for_export(const Exiv2::Exifdatum &d) {
+    const std::string group = d.groupName();
+    const std::string tag = d.tagName();
+    if (group == "Photo") {
+        return tag != "MakerNote" && tag != "InteroperabilityTag";
+    }
+    if (group == "GPSInfo") return true;
+    if (group == "Image") {
+        return tag == "Make" || tag == "Model" || tag == "DateTime" || tag == "Artist" ||
+               tag == "Copyright" || tag == "Software" || tag == "ImageDescription";
+    }
+    return false;
+}
+
+// IPTC datasets have byte limits (64 for a keyword). Cut on a UTF-8
+// character boundary, never inside one.
+std::string iptc_cut(const std::string &s, size_t max) {
+    if (s.size() <= max) return s;
+    size_t n = max;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
+} // namespace
+
+void stamp_export(rust::Str dest_path_, rust::Str source_path_, const SidecarDoc &doc,
+                  rust::Slice<const ExifPair> fallback,
+                  rust::Slice<const uint8_t> xp_keywords) {
     const std::string path = to_std(dest_path_);
+    const std::string source = to_std(source_path_);
 
     auto image = Exiv2::ImageFactory::open(path);
     if (image.get() == nullptr) {
@@ -400,6 +435,54 @@ void stamp_export(rust::Str dest_path_, const SidecarDoc &doc) {
     }
     image->readMetadata();
 
+    // --- EXIF: the original's, then the catalog's for what it lacks -------
+    Exiv2::ExifData exif;
+    if (!source.empty()) {
+        try {
+            auto original = open_image(source); // read-only
+            for (const auto &d : original->exifData()) {
+                if (keep_for_export(d)) exif.add(d);
+            }
+        } catch (...) {
+            // Unreadable original: the catalog's values below still apply.
+        }
+    }
+    for (const auto &p : fallback) {
+        try {
+            Exiv2::ExifKey key(std::string(p.key));
+            if (exif.findKey(key) == exif.end()) exif[std::string(p.key)] = std::string(p.value);
+        } catch (...) {
+            // An unknown key or an unparsable value skips that one field.
+        }
+    }
+    // The pixels were rotated upright when rendered; a copied orientation
+    // would rotate them a second time.
+    exif["Exif.Image.Orientation"] = static_cast<uint16_t>(1);
+    exif["Exif.Photo.PixelXDimension"] = static_cast<uint32_t>(image->pixelWidth());
+    exif["Exif.Photo.PixelYDimension"] = static_cast<uint32_t>(image->pixelHeight());
+    if (!xp_keywords.empty()) {
+        Exiv2::DataValue v(Exiv2::unsignedByte);
+        v.read(xp_keywords.data(), static_cast<long>(xp_keywords.size()));
+        exif.add(Exiv2::ExifKey("Exif.Image.XPKeywords"), &v);
+    }
+    image->setExifData(exif);
+
+    // --- IPTC: what web galleries read for keywords ------------------------
+    Exiv2::IptcData iptc;
+    if (!doc.tags.empty() || !doc.title.empty() || !doc.description.empty()) {
+        iptc["Iptc.Envelope.CharacterSet"] = std::string("\033%G"); // UTF-8
+        for (const auto &t : doc.tags) {
+            Exiv2::StringValue v(iptc_cut(std::string(t), 64));
+            iptc.add(Exiv2::IptcKey("Iptc.Application2.Keywords"), &v);
+        }
+        if (!doc.title.empty())
+            iptc["Iptc.Application2.ObjectName"] = iptc_cut(std::string(doc.title), 64);
+        if (!doc.description.empty())
+            iptc["Iptc.Application2.Caption"] = iptc_cut(std::string(doc.description), 2000);
+    }
+    image->setIptcData(iptc);
+
+    // --- XMP, inside the JPEG ----------------------------------------------
     Exiv2::XmpData xmp = image->xmpData();
     erase_key(xmp, "Xmp.dc.subject");
     if (!doc.tags.empty()) {

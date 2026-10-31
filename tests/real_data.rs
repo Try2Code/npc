@@ -101,7 +101,7 @@ fn the_test_photographs_are_present() {
 
 /// Guarded tests in this file. If you add one, add it here -- the sentinel
 /// quotes this number when it explains what is not running.
-const REAL_DATA_TEST_COUNT: usize = 26;
+const REAL_DATA_TEST_COUNT: usize = 27;
 
 macro_rules! require_ground_truth {
     () => {
@@ -1406,4 +1406,130 @@ fn a_jpg_only_card_matches_the_library_jpg_by_identity() {
         "the card JPG is the library JPG, found by identity"
     );
     assert!(plans[0].already.iter().all(|a| !a.unread));
+}
+
+/// `exiftool`'s value for one tag, list items joined by `|`. Panics rather
+/// than skipping if exiftool is missing, like `exiftool` above.
+fn exiftool_value(path: &Path, tag: &str) -> String {
+    let out = std::process::Command::new("exiftool")
+        .args(["-s3", "-n", "-sep", "|", tag])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("exiftool not runnable ({e}); install it to run this test"));
+    assert!(out.status.success(), "exiftool {tag} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The web export carries the original's EXIF and every tag, in every place
+/// a viewer or gallery looks for them, and writes nothing but the JPEGs.
+/// One RAW stack (EXIF read from the NEF) and one JPG-only stack.
+#[test]
+fn a_web_export_carries_the_originals_exif_and_every_tag() {
+    require_ground_truth!();
+    let root = require_library!();
+    let mut cat = scanned().unwrap();
+    let ids: Vec<i64> = ["750_5744", "750_6338"]
+        .iter()
+        .map(|b| {
+            cat.conn
+                .query_row("SELECT id FROM stack WHERE base = ?1", [b], |r| r.get(0))
+                .unwrap()
+        })
+        .collect();
+    let long = "x".repeat(80);
+    let tags = ["beach".to_string(), "Köln".to_string(), long.clone()];
+    npc::edit::apply(
+        &mut cat,
+        &ids,
+        &[
+            npc::edit::Change::AddTags(tags.to_vec()),
+            npc::edit::Change::SetRating(Some(3)),
+        ],
+        &npc::config::Config::default(),
+    )
+    .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let opts = npc::export::Options {
+        long_edge: 2000,
+        quality: 75,
+        keep_structure: false,
+        strip: false,
+        preset: None,
+        dry_run: false,
+    };
+    let stats = npc::export::export(
+        &cat,
+        &ids,
+        out.path(),
+        &root,
+        &npc::config::Config::default(),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(stats.written, 2, "errors: {:?}", stats.errors);
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+
+    let mut sorted = tags.to_vec();
+    sorted.sort();
+    for (base, original) in [
+        ("750_5744", root.join("08/01/750_5744.NEF")),
+        ("750_6338", root.join("08/06/750_6338.JPG")),
+    ] {
+        let jpg = out.path().join(format!("{base}.jpg"));
+        let mut subject: Vec<String> = exiftool_value(&jpg, "-XMP-dc:Subject")
+            .split('|')
+            .map(str::to_string)
+            .collect();
+        subject.sort();
+        assert_eq!(subject, sorted, "{base}: XMP subject");
+
+        let mut keywords: Vec<String> = exiftool_value(&jpg, "-IPTC:Keywords")
+            .split('|')
+            .map(str::to_string)
+            .collect();
+        keywords.sort();
+        // IPTC caps a keyword at 64 bytes.
+        let mut expected: Vec<String> = vec!["beach".into(), "Köln".into(), "x".repeat(64)];
+        expected.sort();
+        assert_eq!(keywords, expected, "{base}: IPTC keywords");
+
+        let mut xp: Vec<String> = exiftool_value(&jpg, "-XPKeywords")
+            .split(';')
+            .map(str::to_string)
+            .collect();
+        xp.sort();
+        assert_eq!(xp, sorted, "{base}: XPKeywords");
+
+        for tag in [
+            "-EXIF:Make",
+            "-EXIF:Model",
+            "-EXIF:DateTimeOriginal",
+            "-EXIF:FNumber",
+            "-EXIF:ExposureTime",
+            "-EXIF:ISO",
+            "-EXIF:FocalLength",
+        ] {
+            let want = exiftool_value(&original, tag);
+            assert!(!want.is_empty(), "{base}: the original has no {tag}");
+            assert_eq!(exiftool_value(&jpg, tag), want, "{base}: {tag}");
+        }
+        assert_eq!(exiftool_value(&jpg, "-EXIF:Orientation"), "1", "{base}");
+        assert_eq!(exiftool_value(&jpg, "-XMP-xmp:Rating"), "3", "{base}");
+        assert!(
+            exiftool_value(&jpg, "-MakerNotes:all").is_empty(),
+            "{base}: the maker note came along"
+        );
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["750_5744.jpg", "750_6338.jpg"],
+        "only the JPEGs"
+    );
 }

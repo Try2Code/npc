@@ -15,6 +15,7 @@ namespace npc {
 struct FileMeta;
 struct SidecarDoc;
 struct PreviewBlob;
+struct ExifPair;
 
 // Exiv2's XMP layer wraps the Adobe SDK and is not thread-safe. These bracket
 // the process; the Rust side additionally serialises every call below behind a
@@ -33,9 +34,13 @@ PreviewBlob extract_preview(rust::Str path, uint32_t min_dim);
 // keys in place, never constructs a fresh XmpData and never calls clear().
 void write_sidecar(rust::Str xmp_path, const SidecarDoc &doc);
 
-// Writes tags and rating into a JPEG this tool just created under an export
-// target. Never sees a library path: the Rust side proves the destination is
+// Writes metadata into a JPEG this tool just created under an export target:
+// the original's EXIF (read-only, filtered), `fallback` for what it lacks, and
+// tags as IPTC Keywords, EXIF XPKeywords and XMP dc:subject. Never sees a
+// library path as its destination: the Rust side proves the destination is
 // outside every library and protected root before calling.
-void stamp_export(rust::Str dest_path, const SidecarDoc &doc);
+void stamp_export(rust::Str dest_path, rust::Str source_path, const SidecarDoc &doc,
+                  rust::Slice<const ExifPair> fallback,
+                  rust::Slice<const uint8_t> xp_keywords);
 
 } // namespace npc

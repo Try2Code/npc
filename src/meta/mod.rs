@@ -59,6 +59,15 @@ pub mod ffi {
         pub orientation: u16, // 0 = unset
     }
 
+    /// One EXIF value for an exported copy, as text Exiv2 parses into the
+    /// key's own type (`"28/10"` for a rational). Applied only where the
+    /// original has no value of its own.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ExifPair {
+        pub key: String,
+        pub value: String,
+    }
+
     #[derive(Debug, Clone, Default)]
     pub struct PreviewBlob {
         pub ok: bool,
@@ -80,11 +89,17 @@ pub mod ffi {
         fn extract_preview(path: &str, min_dim: u32) -> Result<PreviewBlob>;
 
         fn write_sidecar(xmp_path: &str, doc: &SidecarDoc) -> Result<()>;
-        fn stamp_export(dest_path: &str, doc: &SidecarDoc) -> Result<()>;
+        fn stamp_export(
+            dest_path: &str,
+            source_path: &str,
+            doc: &SidecarDoc,
+            fallback: &[ExifPair],
+            xp_keywords: &[u8],
+        ) -> Result<()>;
     }
 }
 
-pub use ffi::{FileMeta, PreviewBlob, SidecarDoc};
+pub use ffi::{ExifPair, FileMeta, PreviewBlob, SidecarDoc};
 
 fn lock() -> &'static Mutex<()> {
     static EXIV2: OnceLock<Mutex<()>> = OnceLock::new();
@@ -124,10 +139,47 @@ pub fn write_sidecar(xmp_path: &str, doc: &SidecarDoc) -> anyhow::Result<()> {
     guarded!(ffi::write_sidecar(xmp_path, doc).map_err(|e| anyhow::anyhow!("{xmp_path}: {e}")))
 }
 
-/// Stamp metadata onto an exported copy. The caller must already have proved
-/// the destination is outside every library and protected root -- see
+/// Stamp metadata onto an exported copy: `source_path`'s EXIF (opened
+/// read-only), `fallback` where it has none, and `doc`'s tags as IPTC
+/// Keywords, EXIF XPKeywords and XMP dc:subject. The caller must already have
+/// proved the destination is outside every library and protected root -- see
 /// `export::check_target`. This never touches an original, because the file it
 /// writes to is one this tool created moments earlier.
-pub fn stamp_export(dest_path: &str, doc: &SidecarDoc) -> anyhow::Result<()> {
-    guarded!(ffi::stamp_export(dest_path, doc).map_err(|e| anyhow::anyhow!("{dest_path}: {e}")))
+pub fn stamp_export(
+    dest_path: &str,
+    source_path: &str,
+    doc: &SidecarDoc,
+    fallback: &[ExifPair],
+) -> anyhow::Result<()> {
+    let xp = xp_keywords(&doc.tags);
+    guarded!(
+        ffi::stamp_export(dest_path, source_path, doc, fallback, &xp)
+            .map_err(|e| anyhow::anyhow!("{dest_path}: {e}"))
+    )
+}
+
+/// Windows' `XPKeywords`: UTF-16LE, `;`-separated, NUL-terminated. Empty for
+/// no tags, so the tag is left out rather than written blank.
+pub fn xp_keywords(tags: &[String]) -> Vec<u8> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    tags.join(";")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UTF-16LE, `;` between tags, one NUL at the end: what Windows reads.
+    #[test]
+    fn xp_keywords_are_utf16_and_nul_terminated() {
+        assert!(xp_keywords(&[]).is_empty());
+        let b = xp_keywords(&["a".to_string(), "Kö".to_string()]);
+        assert_eq!(b, vec![b'a', 0, b';', 0, b'K', 0, 0xF6, 0, 0, 0]);
+    }
 }

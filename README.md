@@ -101,10 +101,13 @@ of the agent's own tests and the human using the program. Every correction
 below came from *using* the program or from questioning the process — never
 from reading a diff.
 
-That does not make the human a tester. They were the designer: they brought
-the context the agent could not know, decided what the program should do and
-what it must never do, and chose between the options the agent laid out. The
-agent wrote every line; the human decided what the lines were for.
+That does not make the human a tester. They were the product designer: they
+brought the context the agent could not know, set what the program must do
+and what it must never do, chose between the options the agent laid out, and
+accepted or rejected the result. The agent was architect, implementer and
+debugger -- the Rust/C++ split, the catalog, the query language, how each
+rule is enforced -- and it framed most of the options the human chose from,
+which is influence too.
 
 That is the experiment, and everything else is a consequence of it.
 
@@ -221,16 +224,18 @@ wrote or read a line of code and never corrected a type error. What they did:
   rewriting JPGs in the same folders; a removable drive that is sometimes not
   there; which editors and film-emulation tools the photos go through next.
   None of it can be read out of a repository.
-- **Took the decisions.** The one rule itself, and protected roots. How an
-  imported file is recognised -- name and size from the catalog first,
-  camera serial and shutter count second -- the model that took planning
-  two cards from 35 minutes to 1.7 s. The catalog as the single record,
+- **Took the decisions.** The one rule itself: originals are never
+  written. How an imported file is recognised -- name and size from the
+  catalog first, camera serial and shutter count second; together with the
+  agent's fix for the bug behind the 35 minutes, it took planning two cards
+  to 1.7 s. The catalog as the single record,
   replacing per-card profiles. Web exports outside the library, with no
   sidecar and every tag inside the JPG. Full tool paths in the config
   rather than trusting `PATH`. What npcg shows, and what it leaves out.
-- **Diagnosed from use.** "This is too slow", "this is unusable", "saved,
+- **Noticed from use.** "This is too slow", "this is unusable", "saved,
   1 can't be written", "stack 8 seems missing", and — decisively — "let me
-  unplug the drive".
+  unplug the drive". The causes behind each were found by the agent; the
+  precise report is what made that quick.
 - **Set the working rules.** Answer before implementing, build last, ask for
   a path instead of searching the disk -- each said after the agent did the
   opposite.

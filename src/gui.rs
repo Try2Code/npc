@@ -1485,16 +1485,20 @@ impl GuiApp {
             });
 
             ui.separator();
-            self.draw_trash_button(ui, "move to trash");
+            self.draw_trash_button(ui, "Move to trash");
         });
     }
 
     /// Below the tag fields in both info panels. No confirmation: trashing
     /// moves files into `.trash/` and `npc untrash` puts them back.
-    fn draw_trash_button(&mut self, ui: &mut egui::Ui, label: &str) {
+    /// Just the icon; what it does is in the tooltip.
+    fn draw_trash_button(&mut self, ui: &mut egui::Ui, what: &str) {
         if ui
-            .add_enabled(self.online, egui::Button::new(format!("\u{1F5D1} {label}")))
-            .on_hover_text("Moves the files to the library's .trash/ folder. Nothing is deleted until `npc trash-empty`; `npc untrash <base>` restores.")
+            .add_enabled(self.online, egui::Button::new("\u{1F5D1}"))
+            .on_hover_text(format!(
+                "{what}. Nothing is deleted until `npc trash-empty`; \
+                 `npc untrash <base>` restores."
+            ))
             .on_disabled_hover_text("The library is not mounted")
             .clicked()
         {
@@ -1582,7 +1586,7 @@ impl GuiApp {
             });
 
             ui.separator();
-            self.draw_trash_button(ui, &format!("move {count} to trash"));
+            self.draw_trash_button(ui, &format!("Move {count} to trash"));
         });
     }
 

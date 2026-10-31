@@ -29,6 +29,7 @@ comes first.
   - [The structural fact](#the-structural-fact)
   - [What actually worked](#what-actually-worked)
   - [What failed](#what-failed)
+  - [Afterwards](#afterwards)
   - [Where the human time went](#where-the-human-time-went)
   - [The honest summary](#the-honest-summary)
 - [Why the next photo catalog](#why-the-next-photo-catalog)
@@ -37,6 +38,7 @@ comes first.
 - [Commands](#commands)
 - [The query language](#the-query-language)
 - [The browser](#the-browser)
+  - [npcg](#npcg)
 - [What it will not do](#what-it-will-not-do)
 - [Web export](#web-export)
 - [Trash](#trash)
@@ -54,30 +56,55 @@ This is first because it is the point. The application below is real and in
 use, but it exists to answer a question: can a working program be produced
 with no manual coding at all?
 
-Written end to end by Claude Opus 5 in Claude Code, in one sitting. Not a line
-was typed by hand. What follows is the honest account -- the numbers, what
+The first version was written by Claude Opus 5 in Claude Code, in one
+sitting. It has since been used and extended for twelve weeks -- by Claude
+Sonnet 5 from mid-August, by Claude Opus 5.5 from October. Not a line was
+typed by hand. What follows is the honest account -- the numbers, what
 failed, and what held -- for developers weighing that question. The
 photography is incidental.
 
-| | |
-|---|---|
-| Wall clock | **7 h 50 m** |
-| — of which planning | ~1 h 15 m before the first line of code |
-| API time | **2 h 10 m** — 28% of wall clock |
-| Commits | 36 |
-| Rust | ~10,800 lines incl. tests |
-| C++ | 447 lines (the Exiv2 shim) |
-| Tests | 177, 84% region / 86% line coverage |
+| | first sitting (2026-08-09) | now (0.5.13, 2026-10-31) |
+|---|---|---|
+| Wall clock | **7 h 50 m** | see below |
+| — of which planning | ~1 h 15 m before the first line of code | |
+| API time | **2 h 10 m** — 28% of wall clock | not recorded |
+| Commits | 36 | 156, on 22 days; 14 releases since 0.5.0 |
+| Rust | ~10,800 lines incl. tests | ~24,500 lines incl. tests |
+| C++ | 447 lines (the Exiv2 shim) | 590 lines |
+| Tests | 177, 84% region / 86% line coverage | 410, coverage not re-measured |
+| Library | 4,188 files | ~95,000 stacks, 176,000 files, on a USB drive |
 
-Token counts are omitted: not exposed to the agent, and inventing them would
-defeat the point.
+**Time and tokens.** Only one session's log survives: 2026-09-20 to
+2026-10-31, one continuous Claude Code session on 14 days, mostly Sonnet 5,
+Opus 5.5 from October. Counting only gaps under 15 minutes, it was active for
+**~23 h**, with ~250 prompts from the human and ~2,600 tool calls by the
+agent (1,860 of them shell commands). The sessions between mid-August and
+mid-September left no log, and commit timestamps are too irregular to stand
+in for one, so the total is not known -- somewhere above 30 hours.
+
+| that one session | requests | output tokens | input read from cache | input written to cache |
+|---|---|---|---|---|
+| Sonnet 5 | 2,202 | 0.96 M | 1,140 M | 7.5 M |
+| Opus 5.5 | 697 | 0.45 M | 191 M | 2.2 M |
+| total | 2,900 | **1.4 M** | **1,332 M** | 9.6 M |
+
+Nearly all of it is the conversation being read again on every request: an
+average of ~460,000 tokens of context per request, against ~490 tokens
+written. The conversation was compacted ten times. Uncached input was under
+6,000 tokens in total.
 
 ### The structural fact
 
-**No human read the code.** Not one review, not one line. ~10,800 lines were
-written, committed and pushed on the strength of the agent's own tests and the
-human running the binary. Every correction below came from *using* the program
-or from questioning the process — never from reading a diff.
+**No human read the code.** Not one review, not one line -- ~10,800 lines in
+the first sitting, ~24,500 now, written, committed and pushed on the strength
+of the agent's own tests and the human using the program. Every correction
+below came from *using* the program or from questioning the process — never
+from reading a diff.
+
+That does not make the human a tester. They were the designer: they brought
+the context the agent could not know, decided what the program should do and
+what it must never do, and chose between the options the agent laid out. The
+agent wrote every line; the human decided what the lines were for.
 
 That is the experiment, and everything else is a consequence of it.
 
@@ -138,13 +165,75 @@ list, all of it real:
 
 Roughly a third of the elapsed time went on rework of the agent's own output.
 
+### Afterwards
+
+Twelve weeks of daily use on the real library -- 95,000 photos on a USB
+drive, two cards per shoot, other programs sharing the folders -- found a
+second kind of failure: code that was correct on the test photographs and
+wrong at scale or among other software. Again a partial list:
+
+- **Importing one card read ~78 GB and took 35 minutes** to find nothing new.
+  A shot's identity mapped to one file (the RAW), so every card JPG missed
+  and was compared byte for byte. Now 1.7 s for two cards.
+- **New photos inherited ratings from old shoots** with the same recycled
+  file number -- `750_0001` had been rated in six past sessions.
+- **Each rating key cost ~200 ms**, writing the sidecar and reloading 95,000
+  rows. The catalog update itself takes 0.05 ms.
+- **`npc scan .` stored relative folder names**: 1,834 stacks whose edits
+  could never be written, reported only as `1 can't be written`.
+- **npcg's window took 10 s to open**, waiting for a file watcher to walk
+  2,951 folders with 187,262 stat calls. Now 0.015 s.
+- **A one-line change took 206 s to build**, because of link-time
+  optimisation that bought nothing measurable. Now 2-3 s.
+- **The action menu silently dropped configured programs** that weren't on
+  `PATH`, though the config gave their full path.
+- **`npc trash 750_2117._spektra` trashed `750_2117`**, a different, rated
+  photo: the path was cut at its last dot. The dry run printed only
+  `1 stack(s)`. Caught by checking the result, restored, fixed.
+- **Other programs' trash got cataloged**: the desktop's `.Trash-1000`,
+  digiKam's `.dtrash` (112 deleted photos back in the grid, 62 rated), and
+  npc's own `.trash` again under the spelling `.Trash` -- the drive is exFAT,
+  where case doesn't matter. Each showed up as photos that shouldn't be
+  there.
+- **The agent stated a fact about its own code wrongly**: it told the human a
+  scan would drop deleted photos from the catalog. A scan only marks them
+  missing. Corrected after reading the code, before anything was deleted.
+
+Most of these came from the human using the program and saying what looked
+wrong -- "saved, 1 can't be written", "the first view is slow", "stack 8
+seems missing" -- not from tests. The human also had to correct the agent's
+working habits, more than once: compiling and implementing before an answer
+was agreed ("implementing and building should be the very last step"), and
+looking around the filesystem instead of asking for a path.
+
+The one rule held throughout: nothing opens an original for writing, and
+the tests that enforce it never changed. Every repair to the catalog was
+preceded by a backup. (The tripwire checksums the test photographs on every
+`./check`; the real library has not been checksummed since the first
+sitting.)
+
 ### Where the human time went
 
-Almost all of it was *interaction design and diagnosis from running the
-program* — see the two lists below. The human never specified an algorithm,
-never corrected a type error, never touched the architecture after the initial
-planning hour. They said "this is too slow", "this is unusable", "this is
-inconsistent", and — decisively — "let me unplug the drive".
+Into design, and into diagnosis from running the program. The human never
+wrote or read a line of code and never corrected a type error. What they did:
+
+- **Gave the context.** RAW to one card and JPG to the other; Shotwell
+  rewriting JPGs in the same folders; a removable drive that is sometimes not
+  there; which editors and film-emulation tools the photos go through next.
+  None of it can be read out of a repository.
+- **Took the decisions.** The one rule itself, and protected roots. How an
+  imported file is recognised -- name and size from the catalog first,
+  camera serial and shutter count second -- the model that took planning
+  two cards from 35 minutes to 1.7 s. The catalog as the single record,
+  replacing per-card profiles. Web exports outside the library, with no
+  sidecar and every tag inside the JPG. Full tool paths in the config
+  rather than trusting `PATH`. What npcg shows, and what it leaves out.
+- **Diagnosed from use.** "This is too slow", "this is unusable", "saved,
+  1 can't be written", "stack 8 seems missing", and — decisively — "let me
+  unplug the drive".
+- **Set the working rules.** Answer before implementing, build last, ask for
+  a path instead of searching the disk -- each said after the agent did the
+  opposite.
 
 Two contributions changed the outcome disproportionately:
 
@@ -172,6 +261,8 @@ The mitigations that worked were structural, not attentional:
   and then detached
 
 That last one found more than every test in this repository combined.
+Twelve weeks later it still does: the scale bugs above existed on 95,000
+photos and on none of the test photographs.
 
 ## Why the next photo catalog
 
@@ -240,10 +331,13 @@ cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 |---|---|
 | `scan` `find` `tags` | build the catalog and query it |
 | `tag` `rate` `mark` `set` `rotate` | edit metadata, written to sidecars |
+| `rate-sync` | re-resolve rating and tags from the RAW's and JPG's own metadata |
 | `tui` / `npcg` | the browser (terminal / native GUI): list, grid, single-image |
-| `import` `dupes` `trash` `untrash` | ingest from a card, find copies, reversible delete |
+| `import` `dupes` | ingest from a card, find copies |
+| `trash` `untrash` `trash-list` `trash-empty` | reversible delete, see [Trash](#trash) |
 | `export` `exec` `thumbs` | resized copies, run an action, pre-warm thumbnails |
-| `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state |
+| `events` `doctor` `status` `sync` | shooting days, consistency check, catalog state, write pending sidecars |
+| `probe` `volume` `term` `completion` | inspect a file, a volume, the terminal; shell completion |
 
 `npc find --help-syntax` documents the query language.
 

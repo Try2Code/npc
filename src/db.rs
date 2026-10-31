@@ -363,6 +363,51 @@ impl Catalog {
             )
             .optional()?)
     }
+
+    /// The stack a command-line path names: `dir/base`, or one of the
+    /// stack's files (`dir/base.JPG`). Bases may hold dots of their own
+    /// (`750_2117._spektra`), so the last dot is cut only when what follows
+    /// is an extension a stack member can have -- `file_stem` read that name
+    /// as `750_2117` and trashed a different stack. When both readings
+    /// name a stack and they differ, refuse rather than pick one.
+    pub fn stack_for_path(&self, path: &Path) -> Result<Option<i64>> {
+        let path =
+            std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
+        let dir = path
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let exact = self.stack_id(&dir, &name)?;
+        let as_file = match crate::stack::classify(&name) {
+            Some(c) => self.stack_id(&dir, &c.base)?.map(|id| (id, c.base)),
+            None => None,
+        };
+        match (exact, as_file) {
+            (Some(a), Some((b, base))) if a != b => anyhow::bail!(
+                "{} is ambiguous: it names the stack `{name}` and a file of the stack \
+                 `{base}` in {dir}",
+                path.display()
+            ),
+            (Some(id), _) | (None, Some((id, _))) => Ok(Some(id)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// `dir/base` of a stack, for telling the user which stack a command
+    /// is about to act on.
+    pub fn stack_path(&self, id: i64) -> Result<String> {
+        let (dir, base): (String, String) =
+            self.conn
+                .query_row("SELECT dir, base FROM stack WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        Ok(format!("{dir}/{base}"))
+    }
 }
 
 /// A catalog, if any, already covering a root that nests inside (or
@@ -786,5 +831,48 @@ mod tests {
             .conn
             .execute("INSERT INTO tag (name) VALUES ('beach')", []);
         assert!(dup.is_err(), "tag uniqueness must ignore case");
+    }
+
+    fn stacks(cat: &Catalog, bases: &[&str]) -> Vec<i64> {
+        bases
+            .iter()
+            .map(|b| {
+                cat.conn
+                    .execute(
+                        "INSERT INTO stack (dir, base) VALUES ('/lib/export', ?1)",
+                        [b],
+                    )
+                    .unwrap();
+                cat.conn.last_insert_rowid()
+            })
+            .collect()
+    }
+
+    /// The stack this was written for: `npc trash .../750_2117._spektra`
+    /// trashed `750_2117`, because the path was cut at its last dot.
+    #[test]
+    fn a_dotted_base_names_its_own_stack_not_a_shorter_one() {
+        let cat = Catalog::open_memory().unwrap();
+        let ids = stacks(&cat, &["750_2117", "750_2117.", "750_2117._spektra"]);
+        let find = |p: &str| cat.stack_for_path(Path::new(p)).unwrap();
+
+        assert_eq!(find("/lib/export/750_2117._spektra"), Some(ids[2]));
+        assert_eq!(find("/lib/export/750_2117._spektra.jpg"), Some(ids[2]));
+        assert_eq!(find("/lib/export/750_2117."), Some(ids[1]));
+        assert_eq!(find("/lib/export/750_2117..jpg"), Some(ids[1]));
+        assert_eq!(find("/lib/export/750_2117"), Some(ids[0]));
+        assert_eq!(find("/lib/export/750_2117.JPG"), Some(ids[0]));
+        assert_eq!(find("/lib/export/750_2117.xmp"), Some(ids[0]));
+        assert_eq!(find("/lib/export/750_2117._other"), None);
+    }
+
+    #[test]
+    fn a_path_naming_two_different_stacks_is_refused() {
+        let cat = Catalog::open_memory().unwrap();
+        stacks(&cat, &["a", "a.jpg"]);
+        let err = cat
+            .stack_for_path(Path::new("/lib/export/a.jpg"))
+            .expect_err("two stacks fit: must not pick one");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 }

@@ -327,7 +327,7 @@ struct Target {
     /// Which stacks to act on, in the query language
     #[arg(short = 'q', long)]
     query: Option<String>,
-    /// Explicit stack paths (dir/base), if not using a query
+    /// Explicit stacks, as dir/base or one of their files (dir/base.JPG), if not using a query
     paths: Vec<String>,
     #[arg(long)]
     root: Option<PathBuf>,
@@ -364,21 +364,25 @@ fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
 
     let mut ids = Vec::new();
     for p in &t.paths {
-        let path = Path::new(p);
-        let dir = path
-            .parent()
-            .map(|d| d.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let base = path
-            .file_stem()
-            .map(|b| b.to_string_lossy().to_string())
-            .unwrap_or_default();
-        match cat.stack_id(&dir, &base)? {
+        match cat.stack_for_path(Path::new(p))? {
             Some(id) => ids.push(id),
             None => anyhow::bail!("no stack in the catalog for {p}"),
         }
     }
     Ok(ids)
+}
+
+/// Name the stacks a command acts on, not just how many: a count alone hid
+/// that `trash` had picked the wrong one.
+fn list_stacks(cat: &Catalog, ids: &[i64]) -> Result<()> {
+    const SHOWN: usize = 20;
+    for &id in ids.iter().take(SHOWN) {
+        println!("  {}", cat.stack_path(id)?);
+    }
+    if ids.len() > SHOWN {
+        println!("  ... and {} more", ids.len() - SHOWN);
+    }
+    Ok(())
 }
 
 /// `dir` must resolve to somewhere inside `root` -- checked before `npc scan
@@ -553,7 +557,8 @@ fn edit_and_flush(t: &Target, changes: &[npc::edit::Change], verb: &str) -> Resu
         return Ok(());
     }
     if t.dry_run {
-        println!("would {verb} {} stack(s)", ids.len());
+        println!("would {verb} {} stack(s):", ids.len());
+        list_stacks(&cat, &ids)?;
         return Ok(());
     }
 
@@ -1535,9 +1540,11 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if target.dry_run {
-                println!("would trash {} stack(s)", ids.len());
+                println!("would trash {} stack(s):", ids.len());
+                list_stacks(&cat, &ids)?;
                 return Ok(());
             }
+            list_stacks(&cat, &ids)?;
             let stats = npc::trash::trash(&mut cat, &root, &ids, &config)?;
             println!(
                 "trashed {} stack(s), {} files -> {}/.trash/",

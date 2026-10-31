@@ -25,7 +25,7 @@ use crate::exif;
 use crate::export;
 use crate::tui::{compute_timeline, Granularity, TimelineBucket, TrashView};
 use crate::watch;
-use crate::{query, thumbs, vol};
+use crate::{query, thumbs, trash, vol};
 use anyhow::{anyhow, Result};
 use eframe::egui;
 use rusqlite::OptionalExtension;
@@ -822,6 +822,63 @@ impl GuiApp {
         self.status = Some(format!("{verb} {} stack(s)", ids.len()));
     }
 
+    /// Move every target into the library's `.trash/` -- the same
+    /// `trash::trash` as `npc trash`, so reversible with `npc untrash` and
+    /// nothing deleted until `npc trash-empty`. Queued sidecars are written
+    /// first, so each `.xmp` moves with its latest edits in it.
+    fn trash_selected(&mut self) {
+        if !self.online {
+            self.status = Some("trash not available: the library is not mounted".into());
+            return;
+        }
+        let ids = self.targets();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = edit::flush(&mut self.cat, &self.config) {
+            self.status = Some(format!("trash: writing sidecars first: {e}"));
+            return;
+        }
+        let stats = match trash::trash(&mut self.cat, &self.root, &ids, &self.config) {
+            Ok(stats) => stats,
+            Err(e) => {
+                self.status = Some(format!("trash failed: {e}"));
+                return;
+            }
+        };
+
+        let trashed: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.cat
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM trashed WHERE stack_id = ?1",
+                        [id],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .is_ok_and(|hit| hit.is_some())
+            })
+            .collect();
+        self.rows.retain(|r| !trashed.contains(&r.id));
+        self.multi_selected.clear();
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.range_anchor = self.selected;
+        self.reload_sidebar();
+        self.reload_timeline();
+
+        let errors = match stats.errors.first() {
+            None => String::new(),
+            Some(e) => format!(" ({} failed: {e})", stats.errors.len()),
+        };
+        self.status = Some(format!(
+            "trashed {} stack(s) -> .trash/, restore with `npc untrash <base>`{errors}",
+            stats.stacks
+        ));
+    }
+
     fn refresh_rows(&mut self, ids: &[i64]) {
         for row in self.rows.iter_mut().filter(|r| ids.contains(&r.id)) {
             if let Ok((rating, flag, reject)) = self.cat.conn.query_row(
@@ -1426,7 +1483,23 @@ impl GuiApp {
                     self.tag_input.clear();
                 }
             });
+
+            ui.separator();
+            self.draw_trash_button(ui, "move to trash");
         });
+    }
+
+    /// Below the tag fields in both info panels. No confirmation: trashing
+    /// moves files into `.trash/` and `npc untrash` puts them back.
+    fn draw_trash_button(&mut self, ui: &mut egui::Ui, label: &str) {
+        if ui
+            .add_enabled(self.online, egui::Button::new(format!("\u{1F5D1} {label}")))
+            .on_hover_text("Moves the files to the library's .trash/ folder. Nothing is deleted until `npc trash-empty`; `npc untrash <base>` restores.")
+            .on_disabled_hover_text("The library is not mounted")
+            .clicked()
+        {
+            self.trash_selected();
+        }
     }
 
     /// The multi-select variant of the info panel: no single stack's EXIF or
@@ -1507,6 +1580,9 @@ impl GuiApp {
                     self.remove_tag_input.clear();
                 }
             });
+
+            ui.separator();
+            self.draw_trash_button(ui, &format!("move {count} to trash"));
         });
     }
 
@@ -3085,6 +3161,56 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some("Test Editor not launched: the library is not mounted")
+        );
+    }
+
+    #[test]
+    fn the_trash_button_moves_the_batch_and_drops_it_from_view() {
+        let (dir, mut app) = app();
+        let day = dir.path().join("2026/08/09");
+        let gone: Vec<i64> = app.rows.iter().take(2).map(|r| r.id).collect();
+        let kept = app.rows[2].id;
+        app.multi_selected = gone.iter().copied().collect();
+        app.selected = 2;
+        // Queued, not yet written: the sidecar has to be written before the
+        // stack moves, or the edit would land beside nothing.
+        app.rate_selected(Some(3));
+
+        app.trash_selected();
+
+        let trash_day = dir.path().join(".trash/2026/08/09");
+        let left: Vec<PathBuf> = std::fs::read_dir(&day)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "NEF"))
+            .collect();
+        assert_eq!(left.len(), 1, "only the unselected stack stays: {left:?}");
+        let moved = std::fs::read_dir(&trash_day).unwrap().count();
+        assert_eq!(moved, 4, "two NEFs and their two sidecars");
+        assert_eq!(app.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [kept]);
+        assert!(app.multi_selected.is_empty());
+        assert_eq!(app.selected, 0);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("trashed 2 stack(s)"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_trash_button_refuses_while_offline() {
+        let (dir, mut app) = app();
+        app.online = false;
+        let before = app.rows.len();
+        app.trash_selected();
+        assert_eq!(app.rows.len(), before);
+        assert!(!dir.path().join(".trash").exists());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("trash not available: the library is not mounted")
         );
     }
 

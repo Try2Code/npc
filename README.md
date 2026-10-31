@@ -329,8 +329,10 @@ supports normal line editing: arrow keys, Home/End, and readline's
 `npcg` covers the same ground with the mouse: a sidebar (events, tags,
 folders) to filter by, five rating checkboxes instead of typing
 `rating>=N`, a clickable timeline bar in place of the TUI's keyboard-driven
-one, and the same configured action menu. Not ported: RAW/JPG member
-cycling and undo -- those stay TUI-only.
+one, and the same configured action menu. Its info panel also has a
+"move to trash" button for the photo or the selection, the same reversible
+move as `npc trash`. Not ported: RAW/JPG member cycling and undo -- those
+stay TUI-only.
 
 ## What it will not do
 

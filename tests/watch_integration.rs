@@ -4,7 +4,7 @@
 
 use npc::config::{Config, Watch};
 use npc::db::Catalog;
-use npc::watch::Watcher;
+use npc::watch::{WatchEvent, Watcher};
 use std::fs;
 use std::time::Duration;
 
@@ -24,6 +24,26 @@ fn fast_config() -> Config {
 /// tightly bound timing-sensitive things" practice.
 const WAIT: Duration = Duration::from_secs(5);
 
+/// Spawn returns before the watches are placed; wait for `Ready` and return
+/// how many top-level folders it watches.
+fn ready(watcher: &Watcher) -> usize {
+    match watcher.changed.recv_timeout(WAIT) {
+        Ok(WatchEvent::Ready { dirs }) => dirs,
+        other => panic!("expected Ready first, got {other:?}"),
+    }
+}
+
+/// Wait past any `Scanning` for the next `Rescanned`.
+fn next_rescan(watcher: &Watcher) -> std::path::PathBuf {
+    loop {
+        match watcher.changed.recv_timeout(WAIT) {
+            Ok(WatchEvent::Scanning(_)) => {}
+            Ok(WatchEvent::Rescanned(dir)) => return dir,
+            other => panic!("expected a rescan, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_new_file_outside_the_dated_tree_is_cataloged_without_manual_intervention() {
     let store = tempfile::tempdir().unwrap();
@@ -35,17 +55,11 @@ fn a_new_file_outside_the_dated_tree_is_cataloged_without_manual_intervention() 
     let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &config)
         .unwrap()
         .expect("watch.enabled is true");
+    assert_eq!(ready(&watcher), 1, "export/");
 
     fs::write(staging.join("750_1234.JPG"), b"not a real jpeg, just bytes").unwrap();
 
-    let event = watcher
-        .changed
-        .recv_timeout(WAIT)
-        .expect("the watcher should have reacted to the new file");
-    match event {
-        npc::watch::WatchEvent::Rescanned(dir) => assert_eq!(dir, staging),
-        npc::watch::WatchEvent::Error(e) => panic!("unexpected watch error: {e}"),
-    }
+    assert_eq!(next_rescan(&watcher), staging);
 
     let (cat, _online) = Catalog::open_for_root_in(store.path(), library.path()).unwrap();
     let id = cat
@@ -73,6 +87,7 @@ fn a_subdirectory_created_after_the_watcher_starts_is_still_caught() {
     let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &config)
         .unwrap()
         .expect("watch.enabled is true");
+    ready(&watcher);
 
     let fresh_dir = library.path().join("export/new-session");
     fs::create_dir_all(&fresh_dir).unwrap();
@@ -91,8 +106,9 @@ fn a_subdirectory_created_after_the_watcher_starts_is_still_caught() {
             "timed out waiting for the catalog to catch up"
         );
         match watcher.changed.recv_timeout(remaining) {
-            Ok(npc::watch::WatchEvent::Error(e)) => panic!("unexpected watch error: {e}"),
-            Ok(npc::watch::WatchEvent::Rescanned(_)) => {}
+            Ok(WatchEvent::Error(e)) => panic!("unexpected watch error: {e}"),
+            Ok(WatchEvent::Rescanned(_) | WatchEvent::Scanning(_)) => {}
+            Ok(WatchEvent::Ready { .. }) => panic!("Ready twice"),
             Err(e) => panic!("timed out waiting for a rescan: {e}"),
         }
         if cat
@@ -121,6 +137,11 @@ fn files_in_the_dated_tree_and_trash_are_ignored() {
     let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &config)
         .unwrap()
         .expect("watch.enabled is true");
+    assert_eq!(
+        ready(&watcher),
+        0,
+        "neither the dated tree nor .trash is watched"
+    );
 
     fs::write(dated.join("750_1111.JPG"), b"x").unwrap();
     fs::write(trash.join("750_2222.JPG"), b"x").unwrap();
@@ -149,4 +170,68 @@ fn watching_is_skipped_entirely_when_disabled_in_config() {
 
     let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &config).unwrap();
     assert!(watcher.is_none());
+}
+
+/// Only the root and the top-level folders the watcher acts on are watched
+/// -- not the dated tree, whose recursive watch cost npcg ~10 s at startup.
+/// A top-level folder that appears later gets its own watch, and files in
+/// it are cataloged.
+#[test]
+fn a_top_level_folder_created_after_the_watcher_starts_is_watched() {
+    let store = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+    for d in ["2026/08/09", ".trash", "export", "family"] {
+        fs::create_dir_all(library.path().join(d)).unwrap();
+    }
+    let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &fast_config())
+        .unwrap()
+        .expect("watch.enabled is true");
+    assert_eq!(ready(&watcher), 2, "export/ and family/ only");
+
+    let fresh = library.path().join("holiday");
+    fs::create_dir(&fresh).unwrap();
+    // Let the root's create event arrive and the new watch be placed
+    // before writing inside -- the very race the rescan of a new folder
+    // also covers, so either way the file must end up cataloged.
+    std::thread::sleep(Duration::from_millis(300));
+    let sub = fresh.join("day1");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("750_4242.JPG"), b"bytes").unwrap();
+
+    let (cat, _online) = Catalog::open_for_root_in(store.path(), library.path()).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while cat
+        .stack_id(&sub.to_string_lossy(), "750_4242")
+        .unwrap()
+        .is_none()
+    {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "the file in holiday/day1 was never cataloged"
+        );
+        let _ = watcher.changed.recv_timeout(remaining);
+    }
+}
+
+/// Spawning must not wait for the watches: that wait was npcg's ~10 s
+/// startup. Even a slow setup returns at once; `Ready` follows.
+#[test]
+fn spawning_returns_before_the_watches_are_placed() {
+    let store = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+    let export = library.path().join("export");
+    for i in 0..300 {
+        fs::create_dir_all(export.join(format!("d{i}/e"))).unwrap();
+    }
+    let started = std::time::Instant::now();
+    let watcher = Watcher::spawn_in(store.path(), library.path().to_path_buf(), &fast_config())
+        .unwrap()
+        .expect("watch.enabled is true");
+    let spawn_took = started.elapsed();
+    assert_eq!(ready(&watcher), 1);
+    assert!(
+        spawn_took < Duration::from_millis(50),
+        "spawn blocked for {spawn_took:?}"
+    );
 }

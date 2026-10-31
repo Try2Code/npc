@@ -424,6 +424,8 @@ struct GuiApp {
     /// config or failed to start -- either way, just "no automatic
     /// cataloging this session," never fatal to launching the GUI.
     watcher: Option<watch::Watcher>,
+    /// What the watcher is doing, for the eye in the query bar.
+    watch_state: WatchState,
     /// Writes queued sidecars while input pauses; see `edit::Writer`.
     writer: edit::Writer,
     /// The window was asked to close while sidecars were still queued: keep
@@ -480,6 +482,11 @@ impl GuiApp {
             query: String::new(),
             query_error: None,
             status: None,
+            watch_state: if watcher.is_some() {
+                WatchState::Starting
+            } else {
+                WatchState::Off
+            },
             watcher,
             writer: edit::Writer::default(),
             closing: false,
@@ -1036,6 +1043,7 @@ impl GuiApp {
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
                 self.draw_write_state(ui);
+                self.draw_watch_eye(ui);
                 ui.separator();
                 ui.label("query:");
                 // Neither documented "submit on Enter" idiom actually works
@@ -2142,11 +2150,35 @@ impl GuiApp {
         let mut rescanned = false;
         loop {
             match watcher.changed.try_recv() {
-                Ok(watch::WatchEvent::Rescanned(_)) => rescanned = true,
+                Ok(watch::WatchEvent::Ready { dirs }) => {
+                    self.watch_state = WatchState::Watching { dirs };
+                }
+                Ok(watch::WatchEvent::Scanning(dir)) => {
+                    self.watch_state = WatchState::Scanning {
+                        dirs: self.watch_state.dirs(),
+                        dir,
+                    };
+                }
+                Ok(watch::WatchEvent::Rescanned(_)) => {
+                    rescanned = true;
+                    self.watch_state = WatchState::Watching {
+                        dirs: self.watch_state.dirs(),
+                    };
+                }
                 Ok(watch::WatchEvent::Error(e)) => {
+                    // During setup an error means the watcher never started.
+                    if self.watch_state == WatchState::Starting {
+                        self.watch_state = WatchState::Failed(e.clone());
+                    }
                     self.status = Some(format!("watch: {e}"));
                 }
-                Err(_) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if !matches!(self.watch_state, WatchState::Failed(_)) {
+                        self.watch_state = WatchState::Failed("the watcher stopped".into());
+                    }
+                    break;
+                }
             }
         }
         if rescanned {
@@ -2220,6 +2252,34 @@ impl eframe::App for GuiApp {
         self.evict_textures(TEXTURE_BUDGET);
         // Last, so an edit made this frame already counts as "not idle".
         self.drive_writer(ui.ctx());
+    }
+}
+
+/// What the library watcher is doing, as the eye in the query bar shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchState {
+    /// Switched off in config, or the drive is offline: nothing to watch.
+    Off,
+    /// Placing its watches, which walks every watched folder.
+    Starting,
+    Watching {
+        dirs: usize,
+    },
+    /// Cataloging a folder that just changed.
+    Scanning {
+        dirs: usize,
+        dir: PathBuf,
+    },
+    Failed(String),
+}
+
+impl WatchState {
+    /// Folders watched, once known.
+    fn dirs(&self) -> usize {
+        match self {
+            WatchState::Watching { dirs } | WatchState::Scanning { dirs, .. } => *dirs,
+            _ => 0,
+        }
     }
 }
 
@@ -2299,6 +2359,127 @@ impl GuiApp {
                  the catalog; editing one tries it again, `npc sync` retries all.",
                 );
         }
+    }
+
+    /// The watcher as a little eye beside the saved/writing badge: drowsy
+    /// while it sets up, open and blinking now and then while it watches,
+    /// pupil following the pointer, pupil circling while a folder is being
+    /// cataloged, asleep when there's nothing to watch, a red cross when it
+    /// failed. Following the pointer is free -- pointer moves repaint
+    /// anyway -- and the blink costs a few frames every few seconds.
+    fn draw_watch_eye(&self, ui: &mut egui::Ui) {
+        use egui::{pos2, vec2, Color32, Shape, Stroke};
+        let (rect, response) = ui.allocate_exact_size(vec2(26.0, 18.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect.expand(3.0));
+        let centre = rect.center();
+        let radius = vec2(10.0, 6.5);
+        let ink = ui.visuals().text_color();
+        let line = Stroke::new(1.4, ink);
+        let sclera = if ui.visuals().dark_mode {
+            Color32::from_gray(225)
+        } else {
+            Color32::WHITE
+        };
+        let time = ui.input(|i| i.time);
+        let ctx = ui.ctx().clone();
+
+        // A closed lid: the lower half of the eye's outline, with lashes.
+        let closed = |painter: &egui::Painter, stroke: Stroke| {
+            let pts: Vec<egui::Pos2> = (0..=12)
+                .map(|i| {
+                    let angle = std::f32::consts::PI * i as f32 / 12.0;
+                    pos2(
+                        centre.x + radius.x * angle.cos(),
+                        centre.y + 1.5 + radius.y * 0.55 * angle.sin(),
+                    )
+                })
+                .collect();
+            painter.add(Shape::line(pts, stroke));
+            for (dx, len) in [(-5.0, 3.0), (0.0, 3.5), (5.0, 3.0)] {
+                let base = pos2(
+                    centre.x + dx,
+                    centre.y + 1.5 + radius.y * 0.55 * (1.0 - (dx / radius.x).powi(2)).sqrt(),
+                );
+                painter.line_segment([base, base + vec2(dx * 0.15, len)], stroke);
+            }
+        };
+        // An open eye with the iris at `look` (offset from centre).
+        let open = |painter: &egui::Painter, iris: Color32, look: egui::Vec2, lid: f32| {
+            let er = vec2(radius.x, radius.y * lid);
+            painter.add(Shape::ellipse_filled(centre, er, sclera));
+            let ic = centre + vec2(look.x.clamp(-4.5, 4.5), (look.y * lid).clamp(-2.0, 2.0));
+            painter.circle_filled(ic, 4.2 * lid.max(0.6), iris);
+            painter.circle_filled(ic, 2.0 * lid.max(0.6), Color32::from_gray(20));
+            painter.circle_filled(ic + vec2(-1.2, -1.3), 0.9, Color32::WHITE);
+            painter.add(Shape::ellipse_stroke(centre, er, line));
+        };
+        let green = Color32::from_rgb(90, 170, 90);
+        let amber = Color32::from_rgb(230, 170, 40);
+        let blue = Color32::from_rgb(80, 150, 230);
+        let red = Color32::from_rgb(220, 80, 60);
+
+        let tip = match &self.watch_state {
+            WatchState::Off => {
+                closed(&painter, Stroke::new(1.4, ink.gamma_multiply(0.5)));
+                painter.text(
+                    rect.right_top() + vec2(-1.0, -2.0),
+                    egui::Align2::RIGHT_TOP,
+                    "z",
+                    egui::FontId::proportional(9.0),
+                    ink.gamma_multiply(0.6),
+                );
+                if self.online {
+                    "Not watching the library: switched off ([watch] enabled = false, \
+                     or --no-watch)."
+                        .to_string()
+                } else {
+                    "Not watching: the library drive isn't mounted.".to_string()
+                }
+            }
+            WatchState::Starting => {
+                // Drowsy: half-open, the lid slowly breathing.
+                let lid = 0.45 + 0.1 * (time as f32 * 2.5).sin();
+                open(&painter, amber, vec2(0.0, 1.0), lid);
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                "Waking up: placing watches on the library's folders.".to_string()
+            }
+            WatchState::Watching { dirs } => {
+                const PERIOD: f64 = 4.7;
+                const BLINK: f64 = 0.14;
+                let phase = time % PERIOD;
+                if phase < BLINK {
+                    closed(&painter, line);
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(BLINK - phase));
+                } else {
+                    let look = ctx
+                        .pointer_latest_pos()
+                        .map_or(egui::Vec2::ZERO, |pointer| {
+                            let delta = pointer - centre;
+                            delta.normalized() * (delta.length() / 60.0).min(1.0) * 4.5
+                        });
+                    open(&painter, green, look, 1.0);
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(PERIOD - phase));
+                }
+                format!(
+                    "Watching {dirs} folder(s) outside the dated import tree: \
+                     new files there are cataloged on their own."
+                )
+            }
+            WatchState::Scanning { dir, .. } => {
+                let angle = time as f32 * 7.0;
+                open(&painter, blue, vec2(angle.cos(), angle.sin()) * 3.5, 1.0);
+                ctx.request_repaint();
+                format!("Cataloging {}", dir.display())
+            }
+            WatchState::Failed(e) => {
+                closed(&painter, Stroke::new(1.4, ink.gamma_multiply(0.5)));
+                let cross = Stroke::new(2.0, red);
+                painter.line_segment([centre + vec2(-4.0, -5.0), centre + vec2(4.0, 3.0)], cross);
+                painter.line_segment([centre + vec2(4.0, -5.0), centre + vec2(-4.0, 3.0)], cross);
+                format!("The library watcher stopped: {e}")
+            }
+        };
+        response.on_hover_text(tip);
     }
 
     /// Sidecars the writer could still write: queued, drive mounted, and not
@@ -3106,5 +3287,101 @@ mod tests {
 
         app.prefetch_neighbours(&ctx, thumbs::Size::View);
         assert!(app.textures.contains_key(&prev));
+    }
+
+    /// The eye follows what the watcher reports: drowsy until `Ready`,
+    /// watching, cataloging while it rescans, then watching again; an error
+    /// during setup or a vanished thread shows as failed.
+    #[test]
+    fn the_watch_eye_follows_the_watchers_events() {
+        let (_dir, mut app) = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.watcher = Some(watch::Watcher::from_channel(rx));
+        app.watch_state = WatchState::Starting;
+
+        app.poll_watcher();
+        assert_eq!(
+            app.watch_state,
+            WatchState::Starting,
+            "nothing reported yet"
+        );
+
+        tx.send(watch::WatchEvent::Ready { dirs: 7 }).unwrap();
+        app.poll_watcher();
+        assert_eq!(app.watch_state, WatchState::Watching { dirs: 7 });
+
+        let dir = PathBuf::from("/lib/export/bw");
+        tx.send(watch::WatchEvent::Scanning(dir.clone())).unwrap();
+        app.poll_watcher();
+        assert_eq!(
+            app.watch_state,
+            WatchState::Scanning {
+                dirs: 7,
+                dir: dir.clone()
+            }
+        );
+
+        tx.send(watch::WatchEvent::Rescanned(dir)).unwrap();
+        app.poll_watcher();
+        assert_eq!(app.watch_state, WatchState::Watching { dirs: 7 });
+
+        // A runtime error is reported but doesn't stop the watching.
+        tx.send(watch::WatchEvent::Error("one folder vanished".into()))
+            .unwrap();
+        app.poll_watcher();
+        assert_eq!(app.watch_state, WatchState::Watching { dirs: 7 });
+
+        drop(tx);
+        app.poll_watcher();
+        assert!(
+            matches!(app.watch_state, WatchState::Failed(_)),
+            "thread gone"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.watcher = Some(watch::Watcher::from_channel(rx));
+        app.watch_state = WatchState::Starting;
+        tx.send(watch::WatchEvent::Error("watching /lib: denied".into()))
+            .unwrap();
+        app.poll_watcher();
+        assert_eq!(
+            app.watch_state,
+            WatchState::Failed("watching /lib: denied".into())
+        );
+    }
+
+    /// Every state of the eye draws, in both themes, at any time of the
+    /// blink cycle, without panicking.
+    #[test]
+    fn the_watch_eye_draws_in_every_state() {
+        let (_dir, mut app) = app();
+        let ctx = egui::Context::default();
+        let states = [
+            WatchState::Off,
+            WatchState::Starting,
+            WatchState::Watching { dirs: 3 },
+            WatchState::Scanning {
+                dirs: 3,
+                dir: PathBuf::from("/lib/export"),
+            },
+            WatchState::Failed("x".into()),
+        ];
+        for dark in [true, false] {
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            for state in &states {
+                app.watch_state = state.clone();
+                for time in [0.0, 0.05, 2.0] {
+                    let input = egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    };
+                    let _ = ctx.run_ui(input, |ui| app.draw_watch_eye(ui));
+                }
+            }
+        }
     }
 }

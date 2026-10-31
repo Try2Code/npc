@@ -59,7 +59,7 @@ and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
-Currently 400 tests. Coverage was ~84% region / 86% line at 177 tests and
+Currently 404 tests. Coverage was ~84% region / 86% line at 177 tests and
 has not been re-measured since.
 
 ## Layout
@@ -128,6 +128,12 @@ is the wrong one in each case:
   textures are capped at 512 MB, least recently drawn first — unbounded,
   1,000 photos held ~7 GB. Most of the library (72k of 94k stacks) is
   JPG-only, so that path is the common one, not the RAW.
+- **The watcher sets itself up off the UI thread, and skips the dated
+  tree.** A recursive watch on the whole library walked 2,951 folders with
+  187,262 stat calls on the USB drive, and npcg's window waited 9.5-10.4 s
+  for it. Now: root non-recursive plus each non-reserved top-level folder
+  recursive (566 watches, 22k stats), on the watcher's own thread -- window
+  at 0.015 s, watcher ready at 0.9 s.
 - **Release builds: no LTO, incremental on.** With thin LTO and no
   incremental a one-line edit rebuilt in 206 s; now 2-3 s. Exporting the
   test photos takes 2.7 s either way -- the heavy work is C/C++ and SIMD,

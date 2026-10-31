@@ -2661,6 +2661,7 @@ pub fn run(root: PathBuf, trash_view: TrashView, no_watch: bool) -> Result<()> {
                     match watcher.changed.try_recv() {
                         Ok(watch::WatchEvent::Rescanned(_)) => rescanned = true,
                         Ok(watch::WatchEvent::Error(e)) => app.status = format!("watch: {e}"),
+                        Ok(watch::WatchEvent::Ready { .. } | watch::WatchEvent::Scanning(_)) => {}
                         Err(_) => break,
                     }
                 }

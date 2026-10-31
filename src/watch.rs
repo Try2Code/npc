@@ -21,31 +21,49 @@ use crate::stack::{classify, Role};
 use anyhow::{Context, Result};
 use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-/// A directory just rescanned, or an error worth surfacing -- drained by the
-/// TUI/GUI main loop the same way `thumbs::Cache::done` already is.
+/// What the watcher thread reports -- drained by the TUI/GUI main loop the
+/// same way `thumbs::Cache::done` already is.
 #[derive(Debug)]
 pub enum WatchEvent {
+    /// Watches are in place, on this many top-level folders. Until then
+    /// nothing is seen; setting up walks every watched folder.
+    Ready {
+        dirs: usize,
+    },
+    /// A settled directory is being rescanned now.
+    Scanning(PathBuf),
     Rescanned(PathBuf),
     Error(String),
 }
 
 pub struct Watcher {
-    /// Kept alive only so the watch isn't dropped; nothing reads it again.
-    /// `notify` stops watching when its `Watcher` impl is dropped.
-    _inner: RecommendedWatcher,
     pub changed: mpsc::Receiver<WatchEvent>,
+    /// Set on drop; the thread checks it at least every 200 ms and exits,
+    /// releasing its inotify watches with it.
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Watcher {
-    /// Spawn a background thread watching `library_root` recursively for
-    /// files worth cataloging. Returns `Ok(None)` (not an error) when
-    /// `config.watch.enabled` is false, so callers can treat "disabled" and
-    /// "failed to start" differently if they ever want to.
+    /// Start watching `library_root` for files worth cataloging. Returns at
+    /// once: the watches are set up on the watcher's own thread, which says
+    /// `WatchEvent::Ready` when done. Set up inline, npcg's window waited
+    /// ~10 s for it on a 1,500-folder library on a USB drive.
+    ///
+    /// Returns `Ok(None)` (not an error) when `config.watch.enabled` is
+    /// false, so callers can treat "disabled" and "failed to start"
+    /// differently if they ever want to.
     pub fn spawn(library_root: PathBuf, config: &Config) -> Result<Option<Self>> {
         Self::spawn_in(&Catalog::store(), library_root, config)
     }
@@ -58,29 +76,105 @@ impl Watcher {
             return Ok(None);
         }
 
-        let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<Event>>();
-        let mut inner = notify::recommended_watcher(move |res| {
-            let _ = raw_tx.send(res);
-        })
-        .context("creating filesystem watcher")?;
-        notify::Watcher::watch(&mut inner, &library_root, RecursiveMode::Recursive)
-            .with_context(|| format!("watching {}", library_root.display()))?;
-
         let (changed_tx, changed_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
         let debounce = Duration::from_millis(config.watch.debounce_ms);
         let exclude = config.watch.exclude.clone();
-        let cat = Catalog::open_for_root_in(store, &library_root)
-            .context("opening a catalog connection for the watcher")?
-            .0;
+        let store = store.to_path_buf();
+        let thread_stop = stop.clone();
 
         std::thread::spawn(move || {
-            run_loop(&library_root, cat, &raw_rx, &changed_tx, debounce, &exclude);
+            let started = (|| -> Result<_> {
+                let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<Event>>();
+                let mut inner = notify::recommended_watcher(move |res| {
+                    let _ = raw_tx.send(res);
+                })
+                .context("creating filesystem watcher")?;
+                let watched = add_watches(&mut inner, &library_root, &exclude)?;
+                let cat = Catalog::open_for_root_in(&store, &library_root)
+                    .context("opening a catalog connection for the watcher")?
+                    .0;
+                Ok((inner, raw_rx, watched, cat))
+            })();
+            match started {
+                Ok((mut inner, raw_rx, mut watched, cat)) => {
+                    let _ = changed_tx.send(WatchEvent::Ready {
+                        dirs: watched.len(),
+                    });
+                    let ctx = Loop {
+                        library_root: &library_root,
+                        raw_rx: &raw_rx,
+                        changed_tx: &changed_tx,
+                        debounce,
+                        exclude: &exclude,
+                        stop: &thread_stop,
+                    };
+                    run_loop(&ctx, &mut inner, &mut watched, cat);
+                }
+                Err(e) => {
+                    let _ = changed_tx.send(WatchEvent::Error(format!("{e:#}")));
+                }
+            }
         });
 
         Ok(Some(Self {
-            _inner: inner,
             changed: changed_rx,
+            stop,
         }))
+    }
+
+    /// A watcher fed by hand, for tests of what consumes its events.
+    #[cfg(test)]
+    pub(crate) fn from_channel(changed: mpsc::Receiver<WatchEvent>) -> Self {
+        Self {
+            changed,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Watch the library root itself (not recursively: new files and folders
+/// at the top), and each top-level folder the watcher acts on, recursively.
+/// Not the dated tree or the trash: their events are ignored anyway, and
+/// placing a recursive watch walks and stats every file below it -- 187,262
+/// stat calls for the whole library, 92% of them in the dated tree.
+fn add_watches(
+    inner: &mut RecommendedWatcher,
+    library_root: &Path,
+    exclude: &[String],
+) -> Result<HashSet<PathBuf>> {
+    notify::Watcher::watch(inner, library_root, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", library_root.display()))?;
+    let mut watched = HashSet::new();
+    let entries = std::fs::read_dir(library_root)
+        .with_context(|| format!("listing {}", library_root.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        watch_top_level(inner, library_root, &path, exclude, &mut watched);
+    }
+    Ok(watched)
+}
+
+/// Watch `path` recursively if it is a top-level folder of the library the
+/// watcher acts on and isn't watched yet. A folder that can't be watched
+/// (permissions, gone already) is skipped; the rest still work.
+fn watch_top_level(
+    inner: &mut RecommendedWatcher,
+    library_root: &Path,
+    path: &Path,
+    exclude: &[String],
+    watched: &mut HashSet<PathBuf>,
+) {
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if !is_dir
+        || path.parent() != Some(library_root)
+        || is_excluded(library_root, path, exclude)
+        || watched.contains(path)
+    {
+        return;
+    }
+    if notify::Watcher::watch(inner, path, RecursiveMode::Recursive).is_ok() {
+        watched.insert(path.to_path_buf());
     }
 }
 
@@ -168,25 +262,55 @@ fn qualifying_dir(library_root: &Path, event: &Event, exclude: &[String]) -> Opt
 /// The debounce loop: waits for either the next raw filesystem event or the
 /// nearest pending directory's deadline, whichever comes first, and rescans
 /// a directory once it's gone quiet for `debounce`.
-fn run_loop(
-    library_root: &Path,
-    mut cat: Catalog,
-    raw_rx: &mpsc::Receiver<notify::Result<Event>>,
-    changed_tx: &mpsc::Sender<WatchEvent>,
+/// What `run_loop` works with, bundled so its signature stays readable.
+struct Loop<'a> {
+    library_root: &'a Path,
+    raw_rx: &'a mpsc::Receiver<notify::Result<Event>>,
+    changed_tx: &'a mpsc::Sender<WatchEvent>,
     debounce: Duration,
-    exclude: &[String],
+    exclude: &'a [String],
+    stop: &'a AtomicBool,
+}
+
+fn run_loop(
+    ctx: &Loop,
+    inner: &mut RecommendedWatcher,
+    watched: &mut HashSet<PathBuf>,
+    mut cat: Catalog,
 ) {
+    let Loop {
+        library_root,
+        raw_rx,
+        changed_tx,
+        debounce,
+        exclude,
+        stop,
+    } = *ctx;
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         let timeout = pending
             .values()
             .map(|&armed_at| debounce.saturating_sub(armed_at.elapsed()))
             .min()
-            .unwrap_or(Duration::from_millis(200));
+            .unwrap_or(Duration::from_millis(200))
+            .min(Duration::from_millis(200));
 
         match raw_rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
+                // A folder new at the top of the library (created, or moved
+                // in) gets its own recursive watch; only the root is
+                // watched above it.
+                // One deleted and recreated is watched afresh.
+                for path in &event.paths {
+                    if watched.contains(path) && !path.exists() {
+                        watched.remove(path);
+                    }
+                    watch_top_level(inner, library_root, path, exclude, watched);
+                }
                 if let Some(dir) = qualifying_dir(library_root, &event, exclude) {
                     pending.insert(dir, Instant::now());
                 }
@@ -209,6 +333,9 @@ fn run_loop(
             .collect();
         for dir in ready {
             pending.remove(&dir);
+            if changed_tx.send(WatchEvent::Scanning(dir.clone())).is_err() {
+                return;
+            }
             let result = crate::scan::scan(&mut cat, &dir, false);
             let event = match result {
                 Ok(_) => WatchEvent::Rescanned(dir),

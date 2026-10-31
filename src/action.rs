@@ -93,7 +93,19 @@ pub fn load() -> Vec<Action> {
     } else {
         configured
     };
-    list.into_iter().filter(|a| on_path(&a.cmd[0])).collect()
+    let config = crate::config::Config::load().unwrap_or_default();
+    list.into_iter()
+        .filter(|a| available(&a.cmd[0], &config))
+        .collect()
+}
+
+/// Whether an action's program can be started: through `[tools]` first,
+/// exactly as `run` resolves it, then `PATH`. Checking `PATH` alone hid
+/// every `[tools]` program from an npcg started from the desktop, whose
+/// `PATH` lacks `~/local/bin` -- the Spektra actions vanished from its menu
+/// although they would have run fine.
+fn available(program: &str, config: &crate::config::Config) -> bool {
+    on_path(config.resolve_tool(program).as_ref())
 }
 
 fn on_path(program: &str) -> bool {
@@ -299,6 +311,29 @@ mod tests {
             current: files.first().map(std::string::ToString::to_string),
             ..Default::default()
         }
+    }
+
+    /// A `[tools]` entry makes a program available even when `PATH` can't
+    /// find it -- the desktop-launched npcg case.
+    #[test]
+    fn a_configured_tool_counts_as_available_without_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("spektra-gui");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let name = "npc-test-not-on-any-path";
+        let mut config = crate::config::Config::default();
+        assert!(!available(name, &config));
+        config
+            .tools
+            .insert(name.to_string(), tool.to_string_lossy().to_string());
+        assert!(available(name, &config));
+        config
+            .tools
+            .insert(name.to_string(), "/nonexistent/x".into());
+        assert!(
+            !available(name, &config),
+            "a configured path that isn't there"
+        );
     }
 
     /// The property this module exists for. A filename that looks like shell

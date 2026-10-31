@@ -7,10 +7,10 @@
 //! page redraw is `ratatui-image`'s Kitty encoder writing raw, uncompressed
 //! RGBA pixel data to the terminal -- not npc's own decode or resize work.)
 //!
-//! Not ported from the TUI: the timeline bar chart, pan/zoom-drag-crop in
-//! the single view, RAW/JPG member cycling, undo, and real tagging (the tag
-//! list here is read-only). All real features, all explicitly out of scope
-//! for this pass -- see the plan this was built from.
+//! Since ported: the timeline (a clickable bar), single-view zoom and pan
+//! (wheel at the cursor, drag), tagging, rating, flag/reject, the action and
+//! export menus, trash. Still TUI-only: the list view, RAW/JPG member
+//! cycling and undo. README's "npcg" section compares the two.
 
 // Tile-columns-per-row is a UI layout count derived from a pixel width; an
 // available width beyond `usize::MAX` tiles, or negative, is not a case this

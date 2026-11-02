@@ -43,6 +43,7 @@ comes first.
   - [npcg](#npcg)
 - [What it will not do](#what-it-will-not-do)
 - [Web export](#web-export)
+- [RawTherapee presets](#rawtherapee-presets)
 - [Trash](#trash)
 - [Watching and scanning](#watching-and-scanning)
 - [Saving](#saving)
@@ -526,6 +527,85 @@ one, otherwise the camera JPG. `raw` and `jpg` are only ever that file: a
 stack without it is skipped and counted, e.g. `skipped 3 (no RAW)`, in the
 CLI and in npcg's status line alike. A preset that develops RAWs wants
 `source = "raw"`, or a JPG-only stack reaches it as a JPG.
+
+## RawTherapee presets
+
+A look made once in RawTherapee can become an export: `rawtherapee-cli`
+applies a saved processing profile (`.pp3`) to every selected photo. The
+`tmax` and `tmax-jpg` presets (Kodak T-Max 400, black and white) were made
+this way.
+
+**1. Make the profile.** Edit one photo in RawTherapee until it looks
+right, then save the profile: either the save button of the editor's
+processing-profile bar, or the `.out.pp3` RawTherapee writes beside an
+exported image when saving the profile with the output is enabled
+(`tmax400.pp3` started as `750_6789_modified_modified_1-1.jpg.out.pp3`).
+
+Before using it on many photos, open it in a text editor and check the
+sections that belong to the one photo rather than to the look:
+
+| Section | Usually wanted | Why |
+|---|---|---|
+| `[Crop]` | `Enabled=false` | A crop is one picture's framing; applied to all, it cuts every photo at the same place |
+| `[Resize]` | `Enabled=false`, or on to get small copies | Off renders full size |
+| `[White Balance]` | `Setting=Camera` | A fixed temperature fits only the light it was set for |
+| `[Rotation]`, `[Perspective]` | `0` | Corrections for one photo |
+| `[Film Simulation]` | as made | `ClutFilename` is relative to RawTherapee's own CLUT folder (its preferences); the CLI uses the same setting |
+
+**2. Keep it outside the project and the library**, e.g.
+`~/.config/npc/rt/<name>.pp3`.
+
+**3. Add one or two presets** to `~/.config/npc/config.toml`:
+
+```toml
+[[export]]
+name   = "tmax"                     # from the RAW; JPG-only stacks skipped
+source = "raw"
+cmd    = ["rawtherapee-cli", "-o", "{dst}", "-p", "/home/me/.config/npc/rt/tmax400.pp3",
+          "-j95", "-Y", "-c", "{src}"]
+
+[[export]]
+name   = "tmax-jpg"                 # from the camera JPG; RAW-only stacks skipped
+source = "jpg"
+cmd    = ["rawtherapee-cli", "-o", "{dst}", "-p", "/home/me/.config/npc/rt/tmax400.pp3",
+          "-j95", "-Y", "-c", "{src}"]
+```
+
+For a new look, copy these, change `name` and the `.pp3` path, and nothing
+else. The arguments:
+
+- `-o {dst}` the output file npc chose; `-j95` JPEG quality 95.
+- `-p <file>` the profile. **Absolute path**: npc does not expand `~` in
+  arguments, only in `[tools]`.
+- `-Y` overwrite an earlier output. Without it a re-export keeps the old file.
+- `-c {src}` the input. **Must be last**: RawTherapee reads everything after
+  `-c` as input files.
+- Not `-s`/`-S`: those take a `.pp3` lying beside the original instead, so
+  the result would depend on whatever another program left there.
+
+`source = "raw"` versus `"jpg"`: a RAW gives the look more to work with, but
+a profile made on a JPG was tuned against the camera's rendering, so the same
+numbers land somewhat differently on a RAW. Most of this library (72k of 94k
+stacks) is JPG-only; a `raw` preset skips those, which is why the pair exists.
+
+**4. Test on one photo, into a scratch folder:**
+
+```
+npc export --list-presets                          # both show, marked (RAW only) / (camera JPG only)
+npc export --preset tmax --dry-run -q 'path~2026/08/08/750_6789'
+npc export --preset tmax -q 'path~2026/08/08/750_6789' -o /tmp/try
+```
+
+Narrow the query by folder: camera numbers repeat, and `path~750_6789` alone
+matched 13 stacks here. A RAW takes ~2 s.
+
+**5. Use it**, `npc export --preset tmax --keep-structure -q 'rating>=4'`, or
+from npcg's export menu (`e`), which lists every preset and reports skips in
+the status line. `--keep-structure` avoids one `750_0001.jpg` overwriting
+another; npcg's menu exports flat into `export_dir/<preset name>/`.
+
+RawTherapee only reads the originals. Exporting `750_6789.NEF` and the
+`2025/08/14` JPGs left their folders unchanged, `.pp3` sidecars included.
 
 ## Trash
 

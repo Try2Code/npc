@@ -2837,7 +2837,7 @@ mod tests {
         )
         .unwrap();
         let cache = thumbs::Cache::new("gui-test-rating-filter").unwrap();
-        let app = GuiApp::new(
+        let mut app = GuiApp::new(
             cat,
             cache,
             Config::default(),
@@ -2845,6 +2845,10 @@ mod tests {
             dir.path().to_path_buf(),
             true,
         );
+        // `new` reads both from the user's real config.toml; a test must not
+        // change meaning when someone adds an export preset there.
+        app.export_presets = Vec::new();
+        app.actions = Vec::new();
         (dir, app)
     }
 

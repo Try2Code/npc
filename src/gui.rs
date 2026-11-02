@@ -3201,6 +3201,7 @@ mod tests {
             name: "copy".into(),
             cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
             ext: "jpg".into(),
+            source: export::Source::Best,
         }];
         app.run_export(1);
         assert!(

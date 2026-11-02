@@ -38,6 +38,20 @@ pub struct Preset {
     /// Output extension, so `{dst}` is named sensibly. Defaults to jpg.
     #[serde(default = "default_ext")]
     pub ext: String,
+    /// Which member `{src}` is. `best` (the default) prefers the RAW, as the
+    /// built-in export does; `jpg` is only ever the camera JPG, so a
+    /// `cp {src} {dst}` preset copies JPGs out byte for byte and a stack
+    /// without one is skipped -- never a NEF under a `.jpg` name.
+    #[serde(default)]
+    pub source: Source,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    #[default]
+    Best,
+    Jpg,
 }
 
 fn default_ext() -> String {
@@ -75,15 +89,16 @@ pub struct ExportStats {
 /// Source path, whether it needs Exiv2 extraction, orientation, stack base.
 type ExportSource = (PathBuf, bool, u16, String);
 
-fn source_for(cat: &Catalog, stack_id: i64) -> Result<Option<ExportSource>> {
+fn source_for(cat: &Catalog, stack_id: i64, source: Source) -> Result<Option<ExportSource>> {
     let row = cat.conn.query_row(
         "SELECT s.dir || '/' || f.name, f.role, s.base,
                 COALESCE(s.orientation, f.exif_orientation, 1)
          FROM file f JOIN stack s ON s.id = f.stack_id
          WHERE f.stack_id = ?1 AND f.present = 1 AND f.role IN ('raw','oocjpg','derived')
+           AND (?2 = 0 OR f.role = 'oocjpg')
          ORDER BY CASE f.role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END
          LIMIT 1",
-        [stack_id],
+        rusqlite::params![stack_id, source == Source::Jpg],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -142,7 +157,8 @@ pub fn check_target(target: &Path, library: &Path, config: &Config) -> Result<()
 
 /// The built-in web export is deliberately low quality, so it must never
 /// land in the library: the watcher would catalog it as photos in their own
-/// right, sidecars and all. Presets keep `check_target`'s looser rule.
+/// right, sidecars and all. A `source = "jpg"` preset (a byte copy of the
+/// original) is held to it too; other presets keep `check_target`'s looser rule.
 pub fn check_web_target(target: &Path, library: &Path) -> Result<()> {
     let t = resolve_as_far_as_exists(target);
     let l = library
@@ -151,8 +167,8 @@ pub fn check_web_target(target: &Path, library: &Path) -> Result<()> {
     if t.starts_with(&l) {
         bail!(
             "refusing to export into {} -- it is inside the library {}.\n\
-             The web export is a low-quality copy and is kept out of the \
-             library; set export_dir in {} to a folder outside it.",
+             A copy there would be cataloged as a photo of its own; \
+             set export_dir in {} to a folder outside it.",
             target.display(),
             library.display(),
             Config::path().display()
@@ -210,13 +226,17 @@ pub fn export(
     opts: &Options,
 ) -> Result<ExportStats> {
     check_target(target, library, config)?;
-    if opts.preset.is_none() {
+    // A camera-JPG copy is the original's bytes again: inside the library
+    // it would be cataloged as a second stack of the same shot.
+    if opts.preset.is_none_or(|p| p.source == Source::Jpg) {
         check_web_target(target, library)?;
     }
     let mut stats = ExportStats::default();
 
     for &sid in stack_ids {
-        let Some((src, embedded, orientation, base)) = source_for(cat, sid)? else {
+        let Some((src, embedded, orientation, base)) =
+            source_for(cat, sid, opts.preset.map_or(Source::Best, |p| p.source))?
+        else {
             stats.skipped += 1;
             continue;
         };
@@ -493,6 +513,7 @@ mod tests {
             name: "t".into(),
             cmd: vec!["echo".into(), "{src}".into(), "-q".into(), "{dst}".into()],
             ext: "jpg".into(),
+            source: Source::Best,
         };
         let src = PathBuf::from(r#"/lib/DSC 01'23"; rm -rf x.NEF"#);
         let dst = PathBuf::from("/out/a.jpg");
@@ -747,6 +768,7 @@ mod tests {
             name: "copy".into(),
             cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
             ext: "jpg".into(),
+            source: Source::Best,
         };
         let mut o = opts();
         o.preset = Some(&preset);
@@ -759,6 +781,7 @@ mod tests {
             name: "noop".into(),
             cmd: vec!["true".into(), "{src}".into(), "{dst}".into()],
             ext: "tif".into(),
+            source: Source::Best,
         };
         let mut o2 = opts();
         o2.preset = Some(&broken);
@@ -773,6 +796,88 @@ mod tests {
         .unwrap();
         assert_eq!(stats.written, 0);
         assert_eq!(stats.errors.len(), 1);
+    }
+
+    /// `source = "jpg"` hands a preset the camera JPG even beside a RAW, so
+    /// `cp` makes a byte-identical copy; a RAW-only stack is skipped rather
+    /// than copied under a `.jpg` name. The default still prefers the RAW.
+    #[test]
+    fn a_jpg_source_preset_copies_the_camera_jpg_byte_for_byte() {
+        let (lib, mut cat, sid) = library();
+        let day = lib.path().join("2026/08/09");
+        std::fs::write(day.join("750_0001.NEF"), b"stand-in raw").unwrap();
+        std::fs::write(day.join("750_0002.NEF"), b"raw only").unwrap();
+        crate::scan::scan(&mut cat, lib.path(), true).unwrap();
+        let raw_only = cat
+            .stack_id(day.to_str().unwrap(), "750_0002")
+            .unwrap()
+            .unwrap();
+
+        let copy = |source| Preset {
+            name: "copy".into(),
+            cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
+            ext: "jpg".into(),
+            source,
+        };
+        let jpgs = copy(Source::Jpg);
+        let out = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.preset = Some(&jpgs);
+        let stats = export(
+            &cat,
+            &[sid, raw_only],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &o,
+        )
+        .unwrap();
+        assert_eq!((stats.written, stats.skipped), (1, 1), "{:?}", stats.errors);
+        assert_eq!(
+            std::fs::read(out.path().join("750_0001.jpg")).unwrap(),
+            std::fs::read(day.join("750_0001.JPG")).unwrap()
+        );
+        assert!(!out.path().join("750_0002.jpg").exists());
+        assert!(
+            export(
+                &cat,
+                &[sid],
+                &lib.path().join("copies"),
+                lib.path(),
+                &Config::default(),
+                &o
+            )
+            .is_err(),
+            "a camera-JPG copy must land outside the library"
+        );
+
+        let best = copy(Source::Best);
+        let out = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.preset = Some(&best);
+        export(&cat, &[sid], out.path(), lib.path(), &Config::default(), &o).unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("750_0001.jpg")).unwrap(),
+            b"stand-in raw"
+        );
+    }
+
+    #[test]
+    fn a_preset_source_parses_and_defaults_to_best() {
+        let c: PresetConfig = toml::from_str(
+            r#"
+            [[export]]
+            name = "jpgs"
+            source = "jpg"
+            cmd = ["cp", "{src}", "{dst}"]
+            [[export]]
+            name = "web"
+            cmd = ["convert", "{src}", "{dst}"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.presets[0].source, Source::Jpg);
+        assert_eq!(c.presets[1].source, Source::Best);
     }
 
     /// `[tools]` is exactly for a name that doesn't resolve via `PATH` on
@@ -805,6 +910,7 @@ mod tests {
                 "{dst}".into(),
             ],
             ext: "jpg".into(),
+            source: Source::Best,
         };
         let mut tools = std::collections::HashMap::new();
         tools.insert("definitely-not-a-real-binary-xyz".to_string(), cp);

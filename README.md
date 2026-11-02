@@ -505,6 +505,22 @@ It refuses any folder inside the library: it is a low-quality copy, not a
 photo to catalog. Presets may still write into the library. To check a copy:
 `exiftool -IPTC:Keywords -XMP-dc:Subject -XPKeywords copy.jpg`.
 
+To copy the camera JPGs out unchanged, give a preset `source = "jpg"`:
+
+```toml
+[[export]]
+name   = "jpgs"
+source = "jpg"          # {src} is the camera JPG, never the RAW
+cmd    = ["cp", "--preserve=timestamps", "{src}", "{dst}"]
+```
+
+Then `npc export --preset jpgs --keep-structure -q 'rating>=4'`, or pick
+"jpgs" in npcg's export menu. The copies are byte-identical -- no tags or
+rating written into them. Stacks without a JPG are skipped, and, like the web
+export, the target must be outside the library. Camera numbers repeat across
+shoots, so a flat folder overwrites one `750_0001.jpg` with another:
+`--keep-structure` avoids that; npcg's menu always exports flat.
+
 ## Trash
 
 `npc trash` (or npcg's trash-can button) moves a stack's files -- RAW, JPG,

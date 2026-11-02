@@ -160,3 +160,13 @@ mode = "detach"
 [[export]]
 name = "web"
 cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
+
+# The camera JPGs themselves, byte for byte. `source = "jpg"` makes {src} the
+# camera JPG even when the stack has a RAW (the default, "best", prefers the
+# RAW); stacks without a JPG are skipped. Like the built-in web export it
+# refuses a target inside the library. Add --keep-structure: camera numbers
+# repeat across shoots, and a flat folder would overwrite one with another.
+#[[export]]
+#name   = "jpgs"
+#source = "jpg"
+#cmd    = ["cp", "--preserve=timestamps", "{src}", "{dst}"]

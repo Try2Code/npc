@@ -1805,7 +1805,11 @@ fn main() -> Result<()> {
                 } else {
                     println!();
                     for p in &available {
-                        println!("  {:<12} .{:<4} {}", p.name, p.ext, p.cmd.join(" "));
+                        let from = match p.source {
+                            npc::export::Source::Best => "",
+                            npc::export::Source::Jpg => "  (camera JPG only)",
+                        };
+                        println!("  {:<12} .{:<4} {}{from}", p.name, p.ext, p.cmd.join(" "));
                     }
                 }
                 return Ok(());
@@ -1860,7 +1864,12 @@ fn main() -> Result<()> {
                 None => println!("  {size}px long edge, quality {quality}"),
             }
             if stats.skipped > 0 {
-                println!("  skipped   {} (no image member)", stats.skipped);
+                let why = if chosen.is_some_and(|p| p.source == npc::export::Source::Jpg) {
+                    "no camera JPG"
+                } else {
+                    "no image member"
+                };
+                println!("  skipped   {} ({why})", stats.skipped);
             }
             for e in stats.errors.iter().take(10) {
                 eprintln!("  error: {e}");

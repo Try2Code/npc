@@ -521,6 +521,12 @@ export, the target must be outside the library. Camera numbers repeat across
 shoots, so a flat folder overwrites one `750_0001.jpg` with another:
 `--keep-structure` avoids that; npcg's menu always exports flat.
 
+`source` takes three values. `best` (the default) is the RAW where there is
+one, otherwise the camera JPG. `raw` and `jpg` are only ever that file: a
+stack without it is skipped and counted, e.g. `skipped 3 (no RAW)`, in the
+CLI and in npcg's status line alike. A preset that develops RAWs wants
+`source = "raw"`, or a JPG-only stack reaches it as a JPG.
+
 ## Trash
 
 `npc trash` (or npcg's trash-can button) moves a stack's files -- RAW, JPG,

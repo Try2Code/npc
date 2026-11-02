@@ -1807,6 +1807,7 @@ fn main() -> Result<()> {
                     for p in &available {
                         let from = match p.source {
                             npc::export::Source::Best => "",
+                            npc::export::Source::Raw => "  (RAW only)",
                             npc::export::Source::Jpg => "  (camera JPG only)",
                         };
                         println!("  {:<12} .{:<4} {}{from}", p.name, p.ext, p.cmd.join(" "));
@@ -1864,12 +1865,8 @@ fn main() -> Result<()> {
                 None => println!("  {size}px long edge, quality {quality}"),
             }
             if stats.skipped > 0 {
-                let why = if chosen.is_some_and(|p| p.source == npc::export::Source::Jpg) {
-                    "no camera JPG"
-                } else {
-                    "no image member"
-                };
-                println!("  skipped   {} ({why})", stats.skipped);
+                let why = chosen.map_or(npc::export::Source::Best, |p| p.source);
+                println!("  skipped   {} ({})", stats.skipped, why.skip_reason());
             }
             for e in stats.errors.iter().take(10) {
                 eprintln!("  error: {e}");

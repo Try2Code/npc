@@ -39,9 +39,9 @@ pub struct Preset {
     #[serde(default = "default_ext")]
     pub ext: String,
     /// Which member `{src}` is. `best` (the default) prefers the RAW, as the
-    /// built-in export does; `jpg` is only ever the camera JPG, so a
-    /// `cp {src} {dst}` preset copies JPGs out byte for byte and a stack
-    /// without one is skipped -- never a NEF under a `.jpg` name.
+    /// built-in export does; `raw` and `jpg` are only ever that member, and a
+    /// stack without it is skipped -- a RAW preset is never handed a JPG, and
+    /// a `cp {src} {dst}` JPG preset never copies a NEF under a `.jpg` name.
     #[serde(default)]
     pub source: Source,
 }
@@ -51,7 +51,28 @@ pub struct Preset {
 pub enum Source {
     #[default]
     Best,
+    Raw,
     Jpg,
+}
+
+impl Source {
+    /// The one role `{src}` must have, if restricted.
+    fn role(self) -> Option<&'static str> {
+        match self {
+            Self::Best => None,
+            Self::Raw => Some("raw"),
+            Self::Jpg => Some("oocjpg"),
+        }
+    }
+
+    /// Why a stack was skipped, for the CLI and npcg alike.
+    pub fn skip_reason(self) -> &'static str {
+        match self {
+            Self::Best => "no image member",
+            Self::Raw => "no RAW",
+            Self::Jpg => "no camera JPG",
+        }
+    }
 }
 
 fn default_ext() -> String {
@@ -95,10 +116,10 @@ fn source_for(cat: &Catalog, stack_id: i64, source: Source) -> Result<Option<Exp
                 COALESCE(s.orientation, f.exif_orientation, 1)
          FROM file f JOIN stack s ON s.id = f.stack_id
          WHERE f.stack_id = ?1 AND f.present = 1 AND f.role IN ('raw','oocjpg','derived')
-           AND (?2 = 0 OR f.role = 'oocjpg')
+           AND (?2 IS NULL OR f.role = ?2)
          ORDER BY CASE f.role WHEN 'raw' THEN 0 WHEN 'oocjpg' THEN 1 ELSE 2 END
          LIMIT 1",
-        rusqlite::params![stack_id, source == Source::Jpg],
+        rusqlite::params![stack_id, source.role()],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -862,6 +883,46 @@ mod tests {
         );
     }
 
+    /// `source = "raw"` mirrors `jpg`: the NEF even where a JPG exists, and
+    /// a JPG-only stack is skipped -- a RAW preset is never handed a JPG.
+    #[test]
+    fn a_raw_source_preset_gets_the_raw_and_skips_jpg_only_stacks() {
+        let (lib, mut cat, jpg_only) = library();
+        let day = lib.path().join("2026/08/09");
+        std::fs::write(day.join("750_0002.NEF"), b"stand-in raw").unwrap();
+        std::fs::write(day.join("750_0002.JPG"), b"camera jpg").unwrap();
+        crate::scan::scan(&mut cat, lib.path(), true).unwrap();
+        let both = cat
+            .stack_id(day.to_str().unwrap(), "750_0002")
+            .unwrap()
+            .unwrap();
+
+        let raws = Preset {
+            name: "raws".into(),
+            cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
+            ext: "jpg".into(),
+            source: Source::Raw,
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.preset = Some(&raws);
+        let stats = export(
+            &cat,
+            &[jpg_only, both],
+            out.path(),
+            lib.path(),
+            &Config::default(),
+            &o,
+        )
+        .unwrap();
+        assert_eq!((stats.written, stats.skipped), (1, 1), "{:?}", stats.errors);
+        assert_eq!(
+            std::fs::read(out.path().join("750_0002.jpg")).unwrap(),
+            b"stand-in raw"
+        );
+        assert!(!out.path().join("750_0001.jpg").exists());
+    }
+
     #[test]
     fn a_preset_source_parses_and_defaults_to_best() {
         let c: PresetConfig = toml::from_str(
@@ -873,11 +934,16 @@ mod tests {
             [[export]]
             name = "web"
             cmd = ["convert", "{src}", "{dst}"]
+            [[export]]
+            name = "film"
+            source = "raw"
+            cmd = ["spektra", "{src}", "{dst}"]
             "#,
         )
         .unwrap();
         assert_eq!(c.presets[0].source, Source::Jpg);
         assert_eq!(c.presets[1].source, Source::Best);
+        assert_eq!(c.presets[2].source, Source::Raw);
     }
 
     /// `[tools]` is exactly for a name that doesn't resolve via `PATH` on

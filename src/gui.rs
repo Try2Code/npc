@@ -841,8 +841,16 @@ impl GuiApp {
                     } else {
                         format!(" ({} error(s))", stats.errors.len())
                     };
+                    // Said, not left to arithmetic: 10 selected, "exported 7"
+                    // alone hides that 3 had no RAW for a RAW preset.
+                    let skipped = if stats.skipped == 0 {
+                        String::new()
+                    } else {
+                        let why = preset.map_or(export::Source::Best, |p| p.source);
+                        format!(", skipped {} ({})", stats.skipped, why.skip_reason())
+                    };
                     format!(
-                        "exported {} stack(s) -> {}{errors}",
+                        "exported {} stack(s){skipped} -> {}{errors}",
                         stats.written,
                         target.display()
                     )
@@ -3213,6 +3221,28 @@ mod tests {
             app.status
         );
         assert!(out.path().join("copy/750_0001.jpg").exists());
+    }
+
+    /// The fixture is RAW-only: a JPG preset skips both selected stacks
+    /// and the status line says so, rather than a bare "exported 0".
+    #[test]
+    fn a_preset_export_reports_what_it_skipped_and_why() {
+        let (_d, mut app) = app();
+        let out = tempfile::tempdir().unwrap();
+        app.config.export_dir = Some(out.path().to_path_buf());
+        app.multi_selected = app.rows.iter().take(2).map(|r| r.id).collect();
+        app.export_presets = vec![export::Preset {
+            name: "jpgs".into(),
+            cmd: vec!["cp".into(), "{src}".into(), "{dst}".into()],
+            ext: "jpg".into(),
+            source: export::Source::Jpg,
+        }];
+        app.run_export(1);
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("exported 0 stack(s), skipped 2 (no camera JPG) -> "),
+            "got {status:?}"
+        );
     }
 
     #[test]

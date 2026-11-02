@@ -161,9 +161,12 @@ mode = "detach"
 name = "web"
 cmd  = ["convert", "{src}", "-resize", "2000x2000>", "-quality", "95", "{dst}"]
 
+# `source` picks what {src} is: "best" (default) the RAW where there is one,
+# else the camera JPG; "raw" or "jpg" only that file, skipping (and counting)
+# stacks without it. A preset that develops RAWs wants source = "raw".
+#
 # The camera JPGs themselves, byte for byte. `source = "jpg"` makes {src} the
-# camera JPG even when the stack has a RAW (the default, "best", prefers the
-# RAW); stacks without a JPG are skipped. Like the built-in web export it
+# camera JPG even when the stack has a RAW; stacks without a JPG are skipped. Like the built-in web export it
 # refuses a target inside the library. Add --keep-structure: camera numbers
 # repeat across shoots, and a flat folder would overwrite one with another.
 #[[export]]

@@ -61,6 +61,17 @@ pub struct PlannedStack {
     /// rating or tags after the file was first imported. Carries what the
     /// library's catalog entry would gain if merged.
     pub metadata_merge: Option<crate::metadata_merge::MetadataMerge>,
+    /// Card files of a shot deleted from the library earlier (`trash-empty`),
+    /// left on the card. Not copied, and not in `already`.
+    pub deleted: Vec<PathBuf>,
+}
+
+impl PlannedStack {
+    /// Every card file of this shot was deleted from the library earlier:
+    /// nothing to copy, and nothing in the library to point at.
+    pub fn deleted_earlier(&self) -> bool {
+        self.members.is_empty() && self.duplicate_of.is_none() && !self.deleted.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +122,8 @@ pub struct ImportStats {
     pub files_copied: usize,
     pub bytes_copied: u64,
     pub duplicates_skipped: usize,
+    /// Stacks whose every card file was deleted from the library earlier.
+    pub deleted_skipped: usize,
     /// How many stacks carried a metadata merge that was actually applied to
     /// the library's catalog entry. Zero under `--dry-run`, since nothing is
     /// written then.
@@ -149,6 +162,22 @@ pub fn plan(
     library: &Path,
     verify_content: bool,
     deep: bool,
+) -> Result<Vec<PlannedStack>> {
+    plan_with(cat, source, library, verify_content, deep, false)
+}
+
+/// [`plan`], with `include_deleted` to copy back shots that `trash-empty`
+/// deleted -- otherwise skipped, matched by the same keys as the library:
+/// card stat, name and size, then serial and shutter count. A deleted shot
+/// is skipped in every role, so its RAW stays out even if only its JPG had
+/// been imported when it was deleted.
+pub fn plan_with(
+    cat: &Catalog,
+    source: &Path,
+    library: &Path,
+    verify_content: bool,
+    deep: bool,
+    include_deleted: bool,
 ) -> Result<Vec<PlannedStack>> {
     if !source.is_dir() {
         bail!("import source {} is not a directory", source.display());
@@ -219,6 +248,11 @@ pub fn plan(
     let by_role = known_shots_by_role(cat)?;
     let known_content = known_by_content(cat)?;
     let known_time = known_by_time(cat)?;
+    let gone = if include_deleted {
+        DeletedFiles::default()
+    } else {
+        deleted_files(cat)?
+    };
 
     let mut plans = Vec::new();
     let mut claimed: HashSet<PathBuf> = HashSet::new();
@@ -236,9 +270,11 @@ pub fn plan(
         }
         let base = key.1.clone();
 
-        // Level 1.
+        // Level 1. The library first: a shot deleted once and imported
+        // again since is in the library, not gone.
         let mut already = Vec::new();
         let mut unresolved = Vec::new();
+        let mut deleted = Vec::new();
         for m in members {
             match on_disk.find(m) {
                 Some(library) => already.push(Already {
@@ -248,6 +284,7 @@ pub fn plan(
                     library,
                     unread: true,
                 }),
+                None if gone.has_file(m) => deleted.push(m.0.clone()),
                 None => unresolved.push(m),
             }
         }
@@ -333,6 +370,10 @@ pub fn plan(
                         });
                         continue;
                     }
+                }
+                if ident.as_ref().is_some_and(|i| gone.shots.contains(i)) {
+                    deleted.push(path.clone());
+                    continue;
                 }
                 to_copy.push(m);
             }
@@ -422,6 +463,7 @@ pub fn plan(
             duplicate_of,
             near_miss,
             metadata_merge,
+            deleted,
         });
     }
 
@@ -462,7 +504,10 @@ pub fn execute(
     on_event: &mut dyn FnMut(ImportEvent),
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
-    let total = plans.iter().filter(|p| p.duplicate_of.is_none()).count();
+    let total = plans
+        .iter()
+        .filter(|p| p.duplicate_of.is_none() && !p.deleted_earlier())
+        .count();
     let mut index = 0;
 
     for stack in plans {
@@ -493,6 +538,10 @@ pub fn execute(
         if stack.duplicate_of.is_some() {
             stats.duplicates_skipped += 1;
             on_event(ImportEvent::Skipped(stack));
+            continue;
+        }
+        if stack.deleted_earlier() {
+            stats.deleted_skipped += 1;
             continue;
         }
 
@@ -730,6 +779,62 @@ fn library_files(cat: &Catalog) -> Result<LibraryFiles> {
         }
     }
     Ok(files)
+}
+
+/// What `trash-empty` deleted, keyed as `LibraryFiles` is plus the shot.
+#[derive(Default)]
+struct DeletedFiles {
+    by_src: HashSet<(String, i64, i64)>,
+    by_name: HashSet<(String, i64)>,
+    /// `(serial, shutter_count)`: the shot, whatever role was deleted.
+    shots: HashSet<(String, u32)>,
+}
+
+impl DeletedFiles {
+    /// Level 1: the card file itself, by card stat or by name and size.
+    fn has_file(&self, (path, _, size, mtime): &SourceFile) -> bool {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return false;
+        };
+        let Ok(size) = i64::try_from(*size) else {
+            return false;
+        };
+        self.by_src.contains(&(name.clone(), size, *mtime)) || self.by_name.contains(&(name, size))
+    }
+}
+
+fn deleted_files(cat: &Catalog) -> Result<DeletedFiles> {
+    let mut stmt = cat.conn.prepare(
+        "SELECT name, size, src_name, src_size, src_mtime_ns, serial, shutter_count
+         FROM deleted",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut gone = DeletedFiles::default();
+    for row in rows {
+        let (name, size, src_name, src_size, src_mtime, serial, count) = row?;
+        if let (Some(n), Some(s), Some(m)) = (src_name, src_size, src_mtime) {
+            gone.by_src.insert((n, s, m));
+        }
+        if let Some(size) = size {
+            gone.by_name.insert((name, size));
+        }
+        if let (Some(serial), Some(count)) = (serial, count.and_then(|c| u32::try_from(c).ok())) {
+            if !serial.is_empty() && count != 0 {
+                gone.shots.insert((serial, count));
+            }
+        }
+    }
+    Ok(gone)
 }
 
 /// A library file's folder and stack base.

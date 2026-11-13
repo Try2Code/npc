@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS volume (
@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS trashed (
     orig_dir   TEXT,
     trashed_at INTEGER
 );
+
+-- Every RAW and JPG `trash-empty` has deleted, so `import` doesn't copy them
+-- back in from a card that still holds them (the user keeps cards as a
+-- second backup). The same keys import matches the library by: card stat,
+-- name and size, and the camera's serial and shutter count.
+CREATE TABLE IF NOT EXISTS deleted (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    size          INTEGER,
+    src_name      TEXT,
+    src_size      INTEGER,
+    src_mtime_ns  INTEGER,
+    serial        TEXT,
+    shutter_count INTEGER,
+    orig_dir      TEXT,
+    deleted_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deleted_shot ON deleted(serial, shutter_count);
 
 -- Orphans: a profile or sidecar whose image members are all gone. Recorded
 -- rather than ignored so `npc doctor` can report them.
@@ -529,6 +548,11 @@ fn migrate(conn: &Connection, from: i64, path: &Path) -> Result<()> {
         }
     }
 
+    // v6 -> v7: the `deleted` table, created by SCHEMA above. Nothing to
+    // backfill: photos emptied from the trash before v7 left no record. The
+    // version moves anyway so an older build -- which would empty the trash
+    // without recording anything -- refuses this catalog.
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -610,6 +634,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("750_0001.JPG".to_string(), 42, None));
+    }
+
+    /// Every real catalog is v6 before this: it gains an empty `deleted`
+    /// table and keeps its stacks.
+    #[test]
+    fn a_v6_catalog_gains_an_empty_deleted_table() {
+        let cat = Catalog::open_memory().unwrap();
+        cat.conn
+            .execute_batch(
+                "DROP TABLE deleted;
+                 INSERT INTO stack (dir, base) VALUES ('/lib', '750_0001');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        // As `open` does: the schema first, which creates the table.
+        cat.conn.execute_batch(SCHEMA).unwrap();
+        migrate(&cat.conn, 6, Path::new(":memory:")).unwrap();
+
+        let deleted: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM deleted", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(cat.stack_count().unwrap(), 1);
+        let version: i64 = cat
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
     }
 
     #[test]

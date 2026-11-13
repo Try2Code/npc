@@ -48,10 +48,11 @@ cargo cov-summary            coverage numbers only
 
 If `~/.cargo/bin` is not on PATH, export it first. `check` must stay
 executable — rewriting it with a script drops the bit. Its tests build under
-the `release-nolto` profile -- now the same settings as release (no LTO,
-incremental), kept separate so test and release builds don't invalidate each
-other. LTO is paid at link time per test binary and once took a full
-`./check` from 48 s to 4m38s.
+the release profile, in the same `target/release` as the binaries. A separate
+test profile was measured and dropped: the two builds never invalidated each
+other (one crate rebuilt either way), and sharing made `./check` 16.6 s
+instead of 35.6 s and `target/` ~11 GB smaller. Keep LTO off: it is paid at
+link time per test binary and once took a full `./check` from 48 s to 4m38s.
 
 The library to operate on comes from `library` in the config, or from the root
 given on the command line. Every subcommand accepts `--root`; `scan`, `status`
@@ -59,7 +60,7 @@ and `tui` also take it positionally.
 There are no hardcoded paths in the binary; adding one breaks it for every
 machine but the author's.
 
-Currently 418 tests. Coverage was ~84% region / 86% line at 177 tests and
+Currently 423 tests. Coverage was ~84% region / 86% line at 177 tests and
 has not been re-measured since.
 
 ## Layout
@@ -203,9 +204,12 @@ has caused a bug here.
   ratings: Shotwell embeds, npc uses sidecars. `doctor` reports originals whose
   size or mtime has moved. Import copes (card stats in `file.src_*`, metadata
   merge at level 2), but the library copies are no longer the camera's bytes.
-- **The catalog is at schema 6** (since 0.5.1). A build older than that refuses
+- **The catalog is at schema 7** (since 0.5.18: the `deleted` table, which
+  `trash-empty` fills and `import` checks). A build older than that refuses
   to open it — update `npc` and `npcg` together. Rows imported before 0.5.0
-  have no card stats until a card holding them is imported again.
+  have no card stats until a card holding them is imported again. Photos
+  emptied from the trash before 0.5.18 left no record and will be imported
+  again from a card that still holds them.
 - **Licensed GPL-3.0-or-later** (`LICENSE`, since 0.5.14), because Exiv2 is
   GPL-2.0-or-later. Keep new dependencies GPL-3-compatible.
 - Branch is `master`.

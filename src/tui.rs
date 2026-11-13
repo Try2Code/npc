@@ -107,7 +107,7 @@ impl TrashView {
     /// (`"s.id"`, `"f.stack_id"`, `"st.stack_id"`, ...). `Include` needs no
     /// clause at all, since `1=1` would otherwise force every caller to
     /// special-case "no filter" separately.
-    pub(crate) fn clause(self, col: &str) -> String {
+    pub fn clause(self, col: &str) -> String {
         match self {
             TrashView::Exclude => format!("{col} NOT IN (SELECT stack_id FROM trashed)"),
             TrashView::Include => "1=1".to_string(),
@@ -418,7 +418,14 @@ impl App {
         let mut app = Self {
             cat,
             config: {
-                let c = Config::load()?;
+                // Under test, never the user's real config.toml: its
+                // `grid_px = 500` went into thumbs' global sizes while a
+                // thumbs test ran in parallel, and failed it at random.
+                let c = if cfg!(test) {
+                    Config::default()
+                } else {
+                    Config::load()?
+                };
                 thumbs::configure(&c.thumbs);
                 c
             },

@@ -1533,3 +1533,60 @@ fn a_web_export_carries_the_originals_exif_and_every_tag() {
         "only the JPEGs"
     );
 }
+
+/// A photo deleted with `trash-empty` stays deleted when its card -- kept as
+/// a second backup -- is imported again: by the card file itself, and by
+/// shutter count when the card's file name no longer matches. Before the
+/// `deleted` table, emptying the trash forgot the shot entirely and the next
+/// import copied it back in.
+#[test]
+fn a_photo_deleted_with_trash_empty_is_not_imported_again_from_its_card() {
+    let root = require_library!();
+    let config = npc::config::Config::default();
+    let card = tempfile::tempdir().unwrap();
+    for name in ["750_6278.NEF", "750_6278.JPG"] {
+        std::fs::copy(root.join("08/01").join(name), card.path().join(name)).unwrap();
+    }
+    let lib = tempfile::tempdir().unwrap();
+    let mut cat = Catalog::open_memory().unwrap();
+
+    // Import as `npc import` does: copy, catalog the copies, record card stats.
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
+    let stats = npc::import::execute(&plans, &mut cat, &config, false, &mut |_| {}).unwrap();
+    assert_eq!(stats.files_copied, 2);
+    scan::scan(&mut cat, lib.path(), true).unwrap();
+    npc::import::record_sources(&mut cat, &stats.sources).unwrap();
+
+    let ids: Vec<i64> = cat
+        .conn
+        .prepare("SELECT id FROM stack")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    npc::trash::trash(&mut cat, lib.path(), &ids, &config).unwrap();
+    npc::trash::empty(&mut cat, lib.path(), &config).unwrap();
+    assert_eq!(cat.stack_count().unwrap(), 0);
+
+    let plans = npc::import::plan(&cat, card.path(), lib.path(), false, false).unwrap();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(plans[0].deleted_earlier(), "{plans:?}");
+    assert_eq!(plans[0].deleted.len(), 2);
+    let again = npc::import::execute(&plans, &mut cat, &config, true, &mut |_| {}).unwrap();
+    assert_eq!((again.files_copied, again.deleted_skipped), (0, 1));
+
+    // Renamed on another card: no name match, but the same shutter count.
+    let other = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        root.join("08/01/750_6278.JPG"),
+        other.path().join("DSC_6278.JPG"),
+    )
+    .unwrap();
+    let plans = npc::import::plan(&cat, other.path(), lib.path(), false, false).unwrap();
+    assert!(plans[0].deleted_earlier(), "{plans:?}");
+
+    // On purpose, it comes back.
+    let plans = npc::import::plan_with(&cat, card.path(), lib.path(), false, false, true).unwrap();
+    assert_eq!(plans[0].members.len(), 2);
+}

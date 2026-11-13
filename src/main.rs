@@ -89,6 +89,12 @@ enum Cmd {
         /// Print the query language reference and exit
         #[arg(long)]
         help_syntax: bool,
+        /// Include trashed stacks (left out by default, as in the browsers)
+        #[arg(long, conflicts_with = "trash")]
+        all: bool,
+        /// Search only the trash
+        #[arg(long)]
+        trash: bool,
     },
     /// List tags with counts.
     Tags {
@@ -272,6 +278,11 @@ enum Cmd {
         /// counts as imported without being read.
         #[arg(long)]
         deep: bool,
+        /// Copy back photos deleted earlier with `npc trash-empty`. By
+        /// default a card file of a deleted shot is skipped, so a card kept
+        /// as a backup doesn't bring back what was thrown away.
+        #[arg(long)]
+        include_deleted: bool,
     },
     /// List shooting days, and give them names.
     Events {
@@ -339,10 +350,14 @@ struct Target {
 /// Resolve a target to stack ids. A query and explicit paths are mutually
 /// exclusive; requiring one of them prevents an unqualified command from
 /// silently matching the entire library.
+/// A query never selects trashed stacks, as in the browsers: `trash -q
+/// rejected` run twice once moved the first run's stacks into
+/// `.trash/.trash/`. Explicit paths are taken as given; `trash` itself
+/// skips anything already in the trash.
 fn resolve(cat: &Catalog, t: &Target) -> Result<Vec<i64>> {
     if let Some(q) = &t.query {
         let compiled = npc::query::compile(q)?;
-        let stmt = compiled.select_stacks(None);
+        let stmt = compiled.select_stacks_and(None, &npc::tui::TrashView::Exclude.clause("s.id"));
         let mut prepared = cat.conn.prepare(&stmt)?;
         let params: Vec<&dyn rusqlite::ToSql> = compiled
             .params
@@ -747,13 +762,20 @@ fn main() -> Result<()> {
             limit,
             explain,
             help_syntax,
+            all,
+            trash,
         } => {
             if help_syntax {
                 println!("{}", npc::query::SYNTAX);
                 return Ok(());
             }
             let compiled = npc::query::compile(&query)?;
-            let stmt = compiled.select_stacks(limit);
+            let view = match (all, trash) {
+                (_, true) => npc::tui::TrashView::Only,
+                (true, false) => npc::tui::TrashView::Include,
+                (false, false) => npc::tui::TrashView::Exclude,
+            };
+            let stmt = compiled.select_stacks_and(limit, &view.clause("s.id"));
 
             if explain {
                 println!("{stmt}");
@@ -1092,6 +1114,7 @@ fn main() -> Result<()> {
             verify_content,
             rescan,
             deep,
+            include_deleted,
         } => {
             let root = library(library_arg.as_deref())?;
             let config = npc::config::Config::load()?;
@@ -1144,9 +1167,17 @@ fn main() -> Result<()> {
                 std::collections::HashSet::new();
             for source in &sources {
                 println!("scanning {}...", source.display());
-                let plans = npc::import::plan(&cat, source, &root, verify_content, deep)?;
+                let plans = npc::import::plan_with(
+                    &cat,
+                    source,
+                    &root,
+                    verify_content,
+                    deep,
+                    include_deleted,
+                )?;
                 let dupes = plans.iter().filter(|p| p.duplicate_of.is_some()).count();
-                let fresh = plans.len() - dupes;
+                let gone = plans.iter().filter(|p| p.deleted_earlier()).count();
+                let fresh = plans.len() - dupes - gone;
                 let unread = plans
                     .iter()
                     .filter(|p| p.duplicate_of.is_some() && p.already.iter().all(|a| a.unread))
@@ -1162,6 +1193,12 @@ fn main() -> Result<()> {
                          (--deep reads them)"
                     );
                 }
+                if gone > 0 {
+                    println!(
+                        "  deleted earlier   {gone}  (trash-empty; not copied back, \
+                         --include-deleted would)"
+                    );
+                }
                 println!("  to copy           {fresh}");
                 if joining > 0 {
                     println!("    of which {joining} add a missing RAW/JPG to a stack already in the library");
@@ -1169,7 +1206,10 @@ fn main() -> Result<()> {
 
                 let mut by_day: std::collections::BTreeMap<String, usize> =
                     std::collections::BTreeMap::default();
-                for p in plans.iter().filter(|p| p.duplicate_of.is_none()) {
+                for p in plans
+                    .iter()
+                    .filter(|p| p.duplicate_of.is_none() && !p.deleted_earlier())
+                {
                     *by_day
                         .entry(
                             p.dest_dir
@@ -1298,6 +1338,9 @@ fn main() -> Result<()> {
                     if stats.duplicates_skipped > 0 {
                         println!("skipped {} duplicate(s)", stats.duplicates_skipped);
                     }
+                    if stats.deleted_skipped > 0 {
+                        println!("skipped {} deleted earlier", stats.deleted_skipped);
+                    }
                     if stats.merges_applied > 0 {
                         println!("merged metadata into {} stack(s)", stats.merges_applied);
                     }
@@ -1329,6 +1372,7 @@ fn main() -> Result<()> {
                 totals.files_copied += stats.files_copied;
                 totals.bytes_copied += stats.bytes_copied;
                 totals.duplicates_skipped += stats.duplicates_skipped;
+                totals.deleted_skipped += stats.deleted_skipped;
                 totals.merges_applied += stats.merges_applied;
                 totals.errors.extend(stats.errors);
             }
@@ -1403,11 +1447,13 @@ fn main() -> Result<()> {
             }
             if sources.len() > 1 {
                 println!(
-                    "\ntotals: {} stacks, {} files, {:.1} GB, {} duplicate(s) skipped",
+                    "\ntotals: {} stacks, {} files, {:.1} GB, {} duplicate(s) skipped, \
+                     {} deleted earlier",
                     totals.stacks_copied,
                     totals.files_copied,
                     totals.bytes_copied as f64 / 1e9,
-                    totals.duplicates_skipped
+                    totals.duplicates_skipped,
+                    totals.deleted_skipped
                 );
             }
         }
@@ -1552,6 +1598,9 @@ fn main() -> Result<()> {
                 stats.files,
                 root.display()
             );
+            if stats.skipped > 0 {
+                println!("skipped {} already in the trash", stats.skipped);
+            }
             println!("restore with `npc untrash <base>`; nothing was deleted");
             for e in &stats.errors {
                 eprintln!("error: {e}");

@@ -621,6 +621,19 @@ npc trash-empty --yes                # the only real delete; also removes
                                      # folders the trash left empty
 ```
 
+A query never selects what is already in the trash, so `npc trash -q
+rejected` can be run again without emptying in between; `trash` itself also
+skips any stack already there and says how many. `npc find` leaves the trash
+out too: `--all` includes it, `--trash` searches only it. On a full drive
+`trash` stops at the first failure with one message.
+
+**Deleted stays deleted.** `trash-empty` remembers every RAW and JPG it
+deletes -- card name, size and date, and the camera's serial and shutter
+count -- and `npc import` skips them, so a card kept as a backup doesn't
+bring back what was thrown away. The import plan counts them as "deleted
+earlier"; `npc import --include-deleted` copies them back on purpose.
+Photos emptied before 0.5.18 left no record and are imported again once.
+
 Trash folders are never cataloged, whatever their case (the drive may be
 exFAT, where `.Trash` is `.trash`): npc's own `.trash`, the desktop's
 `.Trash-<uid>`, macOS's `.Trashes`, and digiKam's `.dtrash`.

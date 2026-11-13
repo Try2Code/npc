@@ -24,7 +24,23 @@ pub struct TrashStats {
     pub files: usize,
     /// Empty folders removed from under `.trash/` afterwards.
     pub dirs: usize,
+    /// Stacks asked for that were in the trash already, left where they are.
+    pub skipped: usize,
     pub errors: Vec<String>,
+}
+
+/// A full drive fails every following stack the same way; one message
+/// says it, where a run on a full drive once printed 86 identical errors.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull
+}
+
+fn disk_full(path: &Path, done: usize, total: usize) -> String {
+    format!(
+        "{}: no space left on the drive; stopped after {done} of {total} stack(s). \
+         Trashing only moves files, but a new trash folder needs a little room.",
+        path.display()
+    )
 }
 
 fn trash_root(library: &Path) -> PathBuf {
@@ -85,11 +101,29 @@ pub fn trash(
     }
 
     for &sid in stack_ids {
+        // Trashing it again would move it a level deeper, `.trash/.trash/`,
+        // and overwrite the record of where it came from.
+        let in_trash: bool = cat.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM trashed WHERE stack_id = ?1)",
+            params![sid],
+            |r| r.get(0),
+        )?;
+        if in_trash {
+            stats.skipped += 1;
+            continue;
+        }
+
         let (dir, base, paths) = members_on_disk(cat, sid)?;
 
         let relative = dir.strip_prefix(library).unwrap_or(Path::new(""));
         let target_dir = trash_root(library).join(relative);
         if let Err(e) = std::fs::create_dir_all(&target_dir) {
+            if is_disk_full(&e) {
+                stats
+                    .errors
+                    .push(disk_full(&target_dir, stats.stacks, stack_ids.len()));
+                break;
+            }
             stats.errors.push(format!("{}: {e}", target_dir.display()));
             continue;
         }
@@ -102,19 +136,26 @@ pub fn trash(
             match std::fs::rename(src, &dst) {
                 Ok(()) => moved.push((src.clone(), dst)),
                 Err(e) => {
-                    failed = Some(format!("{}: {e}", src.display()));
+                    failed = Some(if is_disk_full(&e) {
+                        (disk_full(src, stats.stacks, stack_ids.len()), true)
+                    } else {
+                        (format!("{}: {e}", src.display()), false)
+                    });
                     break;
                 }
             }
         }
 
-        if let Some(err) = failed {
+        if let Some((err, full)) = failed {
             // Put back whatever already moved: a stack split across the trash
             // boundary is the one state worse than not trashing it at all.
             for (orig, now) in moved.iter().rev() {
                 let _ = std::fs::rename(now, orig);
             }
             stats.errors.push(err);
+            if full {
+                break;
+            }
             continue;
         }
 
@@ -216,6 +257,16 @@ pub fn empty(cat: &mut Catalog, library: &Path, config: &Config) -> Result<Trash
                 Err(err) => stats.errors.push(format!("{}: {err}", p.display())),
             }
         }
+        // Remembered before the rows go, so `import` won't copy these back
+        // from a card that still holds them.
+        cat.conn.execute(
+            "INSERT INTO deleted (name, role, size, src_name, src_size, src_mtime_ns,
+                                  serial, shutter_count, orig_dir, deleted_at)
+             SELECT name, role, size, src_name, src_size, src_mtime_ns,
+                    serial, shutter_count, ?2, ?3
+             FROM file WHERE stack_id = ?1 AND role IN ('raw', 'oocjpg')",
+            params![e.stack_id, e.orig_dir, now_secs()],
+        )?;
         cat.conn
             .execute("DELETE FROM stack WHERE id = ?1", params![e.stack_id])?;
         stats.stacks += 1;
@@ -314,6 +365,50 @@ mod tests {
                 "{name} did not arrive in the trash"
             );
         }
+    }
+
+    /// `trash -q rejected` twice without emptying in between once moved the
+    /// first run's stacks into `.trash/.trash/` and recorded `.trash/...` as
+    /// where they came from, so `untrash` could no longer put them back.
+    #[test]
+    fn trashing_a_trashed_stack_again_leaves_it_and_its_origin_alone() {
+        let (dir, mut cat, sid) = library();
+        let day = dir.path().join("2026/08/09");
+        trash(&mut cat, dir.path(), &[sid], &Config::default()).unwrap();
+
+        let again = trash(&mut cat, dir.path(), &[sid], &Config::default()).unwrap();
+        assert_eq!((again.stacks, again.files, again.skipped), (0, 0, 1));
+        assert!(!dir.path().join(".trash/.trash").exists());
+        assert_eq!(
+            list(&cat).unwrap()[0].orig_dir,
+            day.to_string_lossy(),
+            "the origin must still be the library folder"
+        );
+        restore(&mut cat, sid, &Config::default()).unwrap();
+        assert!(day.join("750_0001.NEF").exists());
+    }
+
+    /// What `npc find` and every `-q` command select by default: a query
+    /// leaves the trash out unless asked for it, as the browsers do.
+    #[test]
+    fn a_query_leaves_out_the_trash_unless_asked() {
+        use crate::tui::TrashView;
+        let (dir, mut cat, sid) = library();
+        trash(&mut cat, dir.path(), &[sid], &Config::default()).unwrap();
+
+        let compiled = crate::query::compile("").unwrap();
+        let ids = |view: TrashView| -> Vec<i64> {
+            cat.conn
+                .prepare(&compiled.select_stacks_and(None, &view.clause("s.id")))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(ids(TrashView::Exclude).is_empty());
+        assert_eq!(ids(TrashView::Include), vec![sid]);
+        assert_eq!(ids(TrashView::Only), vec![sid]);
     }
 
     #[test]

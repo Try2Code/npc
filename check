@@ -46,16 +46,14 @@ if [ "$MODE" != quick ] && [ ! -d "$LIBRARY" ]; then
 fi
 
 step "tests"
-# `release-nolto` profile (Cargo.toml): same opt-level as release -- real-library
-# tests need that decode speed -- but no LTO, which release pays for at
-# *link* time, once per test binary, on every single run regardless of how
-# small the edit was. Worth nothing for a test binary about to be thrown
-# away; only `cargo build --release` (the binary someone actually installs)
-# wants it.
+# The release profile: real-library tests need its decode speed, and sharing
+# it with `cargo build --release` shares the dependencies too. Measured
+# against a separate test profile: no mutual invalidation (one crate rebuilt
+# either way), ./check 16.6 s instead of 35.6 s, ~11 GB less in target/.
 if [ "$MODE" = quick ]; then
-  cargo test --profile release-nolto --lib --test invariant && ok "unit + invariant" || bad "tests"
+  cargo test --release --lib --test invariant && ok "unit + invariant" || bad "tests"
 else
-  cargo test --profile release-nolto && ok "full suite" || bad "tests"
+  cargo test --release && ok "full suite" || bad "tests"
 fi
 
 # The tripwire: the library must be byte-identical after everything above.

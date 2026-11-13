@@ -283,6 +283,16 @@ enum Cmd {
         /// as a backup doesn't bring back what was thrown away.
         #[arg(long)]
         include_deleted: bool,
+        /// Copy nothing; record the card files that would be copied, shot
+        /// before `--before`, as deleted, so imports skip them from now on.
+        /// For photos deleted before `trash-empty` kept a record (0.5.18)
+        /// that a card still holds. Use with --dry-run first.
+        #[arg(long, requires = "before")]
+        mark_deleted: bool,
+        /// With --mark-deleted: only shots captured before this day
+        /// (YYYY-MM-DD); that day and later are left to import normally.
+        #[arg(long, requires = "mark_deleted")]
+        before: Option<String>,
     },
     /// List shooting days, and give them names.
     Events {
@@ -1115,7 +1125,22 @@ fn main() -> Result<()> {
             rescan,
             deep,
             include_deleted,
+            mark_deleted,
+            before,
         } => {
+            if let Some(day) = &before {
+                let ok = day.len() == 10
+                    && day.char_indices().all(|(i, c)| {
+                        if i == 4 || i == 7 {
+                            c == '-'
+                        } else {
+                            c.is_ascii_digit()
+                        }
+                    });
+                if !ok {
+                    anyhow::bail!("--before wants a day as YYYY-MM-DD, got `{day}`");
+                }
+            }
             let root = library(library_arg.as_deref())?;
             let config = npc::config::Config::load()?;
             config.ensure_mutable(&root)?;
@@ -1235,6 +1260,42 @@ fn main() -> Result<()> {
                             nm.source, nm.candidate, nm.diff_bytes, nm.first_diff_offset
                         );
                     }
+                }
+
+                if mark_deleted {
+                    let before = before.as_deref().unwrap_or_default();
+                    let mut chosen = Vec::new();
+                    let mut by_day: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
+                    let (mut kept, mut undated) = (0, 0);
+                    for p in plans.iter().filter(|p| !p.members.is_empty()) {
+                        match npc::import::capture_day(p) {
+                            Some(day) if day.as_str() < before => {
+                                *by_day.entry(day).or_default() += 1;
+                                chosen.push(p);
+                            }
+                            Some(_) => kept += 1,
+                            None => undated += 1,
+                        }
+                    }
+                    println!("\nmark as deleted (shot before {before}), nothing is copied:");
+                    for (day, n) in &by_day {
+                        println!("    {day}     {n} stack(s)");
+                    }
+                    println!("  left to import    {kept} (from {before} on)");
+                    if undated > 0 {
+                        println!("  left alone        {undated} undated");
+                    }
+                    if dry_run {
+                        println!("would mark {} stack(s) as deleted\n", chosen.len());
+                    } else {
+                        let n = npc::import::mark_deleted(&mut cat, &chosen)?;
+                        println!(
+                            "marked {} stack(s), {n} card file(s), as deleted\n",
+                            chosen.len()
+                        );
+                    }
+                    continue;
                 }
 
                 let total_bytes: u64 = plans

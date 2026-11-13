@@ -781,6 +781,46 @@ fn library_files(cat: &Catalog) -> Result<LibraryFiles> {
     Ok(files)
 }
 
+/// The capture day a plan files a stack under, as `YYYY-MM-DD` -- the same
+/// day as its `YYYY/MM/DD` folder. `None` for an undated stack.
+pub fn capture_day(stack: &PlannedStack) -> Option<String> {
+    let t = stack.capture_time?;
+    Some(date_path(t).to_string_lossy().replace('/', "-"))
+}
+
+/// Record the card files a plan would copy as deleted, copying nothing, so
+/// `import` skips them from now on. For shots deleted before `trash-empty`
+/// kept a record (0.5.18): their cards still hold them, and without this
+/// every import would offer them again. Keyed by card name, size and mtime
+/// -- the card file itself. Returns how many files were recorded.
+pub fn mark_deleted(cat: &mut Catalog, stacks: &[&PlannedStack]) -> Result<usize> {
+    let tx = cat.conn.transaction()?;
+    let mut n = 0;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO deleted (name, role, size, src_name, src_size, src_mtime_ns,
+                                  orig_dir, deleted_at)
+             VALUES (?1, ?2, ?3, ?1, ?3, ?4, ?5, ?6)",
+        )?;
+        for stack in stacks {
+            for m in &stack.members {
+                let name = m.src.file_name().unwrap_or_default().to_string_lossy();
+                insert.execute(rusqlite::params![
+                    name,
+                    m.role.as_str(),
+                    i64::try_from(m.size).unwrap_or(i64::MAX),
+                    m.src_mtime_ns,
+                    stack.dest_dir.to_string_lossy(),
+                    crate::db::now_secs(),
+                ])?;
+                n += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
 /// What `trash-empty` deleted, keyed as `LibraryFiles` is plus the shot.
 #[derive(Default)]
 struct DeletedFiles {
@@ -2056,6 +2096,26 @@ mod safety_tests {
 
     fn card_mtime(path: &Path) -> i64 {
         mtime_ns(&std::fs::metadata(path).unwrap())
+    }
+
+    /// Shots deleted before `trash-empty` kept a record are marked from the
+    /// card once; from then on the card offers nothing to copy.
+    #[test]
+    fn card_files_marked_deleted_are_skipped_from_then_on() {
+        let card = card();
+        let lib = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open_memory().unwrap();
+
+        let plans = plan(&cat, card.path(), lib.path(), false, false).unwrap();
+        assert_eq!(plans[0].members.len(), 2);
+        let chosen: Vec<&PlannedStack> = plans.iter().collect();
+        assert_eq!(mark_deleted(&mut cat, &chosen).unwrap(), 2);
+
+        let plans = plan(&cat, card.path(), lib.path(), false, false).unwrap();
+        assert!(plans[0].deleted_earlier(), "{plans:?}");
+        let stats = execute(&plans, &mut cat, &Config::default(), false, &mut |_| {}).unwrap();
+        assert_eq!((stats.files_copied, stats.deleted_skipped), (0, 1));
+        assert!(std::fs::read_dir(lib.path()).unwrap().next().is_none());
     }
 
     /// Level 1 for everything imported before card stats were recorded:

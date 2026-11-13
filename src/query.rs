@@ -65,13 +65,20 @@ pub struct Compiled {
 impl Compiled {
     /// Full statement selecting matching stacks, newest capture first.
     pub fn select_stacks(&self, limit: Option<usize>) -> String {
+        self.select_stacks_and(limit, "1=1")
+    }
+
+    /// [`select_stacks`](Self::select_stacks) narrowed by `extra`, a fixed
+    /// clause over `s` written by the caller (never user text) -- e.g. the
+    /// trash filter, which the query language has no word for.
+    pub fn select_stacks_and(&self, limit: Option<usize>, extra: &str) -> String {
         let lim = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
         format!(
             "SELECT s.id, s.dir, s.base, s.rating, s.flag, s.reject,
                     (SELECT MIN(f.capture_time) FROM file f
                       WHERE f.stack_id = s.id AND f.capture_time IS NOT NULL) AS captured
              FROM stack s
-             WHERE {}
+             WHERE ({}) AND {extra}
              ORDER BY captured IS NULL, captured DESC, s.dir, s.base{lim}",
             self.where_sql
         )
@@ -168,17 +175,16 @@ fn tokenize(input: &str) -> Result<Vec<Tok>> {
             i += 1;
             continue;
         }
-        // `-tag` is shorthand for `not tag`, but only leading and only when it
-        // starts a term -- a hyphen inside a word is part of the name.
+        // `-term` is shorthand for `not term` wherever a term starts -- after
+        // another term too, since adjacency is `and`. A hyphen inside a word
+        // never gets here: `read_word` takes it as part of the name. Once
+        // this applied only at the start or after and/or/not/`(`, so
+        // `unrated -flagged` searched for a tag named "-flagged" and matched
+        // nothing.
         if c == '-' && i + 1 < chars.len() && !chars[i + 1].is_whitespace() {
-            let starts_term = out
-                .last()
-                .is_none_or(|t| matches!(t, Tok::LParen | Tok::And | Tok::Or | Tok::Not));
-            if starts_term {
-                out.push(Tok::Not);
-                i += 1;
-                continue;
-            }
+            out.push(Tok::Not);
+            i += 1;
+            continue;
         }
 
         // A bare word, a quoted string, or key<op>value.
@@ -604,6 +610,25 @@ mod tests {
         assert!(sql("-private").contains("NOT"));
         let p = params("well-known");
         assert_eq!(p[0], Value::Text("well-known".into()));
+    }
+
+    /// After another term, `-x` is still `not x`: `unrated -flagged` once
+    /// became a search for a tag named "-flagged" and matched nothing.
+    #[test]
+    fn a_hyphen_after_a_term_negates_like_not() {
+        for (short, long) in [
+            ("unrated -flagged", "unrated not flagged"),
+            ("beach rating>=4 -private", "beach rating>=4 not private"),
+            ("(a or b) -c", "(a or b) not c"),
+            ("year=2026 -rejected", "year=2026 and not rejected"),
+        ] {
+            assert_eq!(sql(short), sql(long), "{short}");
+            assert_eq!(params(short), params(long), "{short}");
+        }
+        assert!(
+            params("unrated -flagged").is_empty(),
+            "no tag named -flagged"
+        );
     }
 
     #[test]
